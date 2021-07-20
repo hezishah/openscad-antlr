@@ -8,7 +8,7 @@ moduleprefix : 'module';
 expr:	expr WS* ('*'|'/') WS* expr
     |	expr WS* ('+'|'-') WS* expr
     |	'(' WS* expr WS* ')'
-    |	'[' WS* expr WS* ','* WS* ']'
+    |	'[' WS* expr WS* ']'
     |	WS* ('*'|'/') WS* expr
     |	WS* ('+'|'-') WS* expr
     |	NUMBER
@@ -40,8 +40,8 @@ STR  : [a-z_]+
 WS      : (' ' | '\t' | NEW_LINE)+ -> skip;
 
 transparent : '#';
-bodyLine : (transparent WS)* (expr WS*)+ ';';
-assignmentLine : STR WS* '=' WS* (expr WS* ','* WS*)+ ';';
+operation : (transparent WS)* '(' WS* (expr WS*)+ WS* moduleBody+;
+assignmentLine : STR WS* '=' WS* el+=expr (WS* ',' WS* el+=expr)+ WS* ';';
 
 scope   : moduleCall
     |     module;
@@ -49,7 +49,7 @@ scope   : moduleCall
 COMMENT:            '//' ( ~[/\r\n] ~[\r\n]* )? -> skip;
 
 body    : assignmentLine
-    |     bodyLine
+    |     operation
     |     COMMENT;
 
 moduleBody: '{' (WS* body WS*)+ '}';
