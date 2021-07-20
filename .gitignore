@@ -1,3 +1,7 @@
+.vscode/
+scad/
+scad_py/
+
 # Compiled class file
 *.class
 
