@@ -26,101 +26,41 @@
  THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-/** SCAD grammar by Hezi Shahmoon based on: */
 /** C 2011 grammar built from the C11 Spec */
 grammar scad;
 
-prog:	compilationUnit* EOF;
-
-WS : (Whitespace | Newline | BlockComment | LineComment) -> skip;
-
-module: WS* 'module' WS* expression WS* compoundStatement WS*;
-
-showtransparent
-    :   '#' WS*;
-
-primitiveInit
-    : (primaryExpression WS* ('=' WS* primitiveInit WS*)?)
-      |
-      (',' WS* primitiveInit )
-      |
-      ('[' WS* primitiveInit WS* ']' WS* (',' WS* '[' WS* primitiveInit WS* ']' WS*)*)
-      |
-      (',' WS*)
-;
-
-primitive: showtransparent? primaryExpression WS* 
-    '(' WS* 
-    (
-        primitiveInit
-    )*
-    WS* ')' WS* 
-    ('{' (WS* primitive WS* ';'? )+ WS* '}') 
-    | 
-    ';' WS*;
 
 primaryExpression
     :   Identifier
     |   Constant
-    |   (StringLiteral WS*)+
-    |   '(' WS* expression WS* ')'
-    |   '[' WS* expression WS* ']'
-    |   genericSelection
-    |   '__extension__'? WS* '(' WS* compoundStatement WS* ')' // Blocks (GCC extension)
-    |   '__builtin_va_arg' WS* '(' WS* unaryExpression WS* ',' WS* typeName WS* ')'
-    |   '__builtin_offsetof' WS* '(' WS* typeName WS* ',' WS* unaryExpression WS* ')'
-    ;
-
-genericSelection
-    :   '_Generic' '(' assignmentExpression ',' genericAssocList ')'
-    ;
-
-genericAssocList
-    :   genericAssociation (',' genericAssociation)*
-    ;
-
-genericAssociation
-    :   (typeName | 'default') ':' assignmentExpression
+    |   StringLiteral+
+    |   unaryOperator primaryExpression
     ;
 
 postfixExpression
-    :
-    (   primaryExpression
-    |   '__extension__'? '(' typeName ')' '{' initializerList ','? '}'
-    )
-    ('[' expression ']'
-    | '(' argumentExpressionList? ')'
-    | ('.' | '->') Identifier
-    | ('++' | '--')
-    )*
+    :   primaryExpression
     ;
 
 argumentExpressionList
-    :   assignmentExpression (',' assignmentExpression)*
+    :   unaryExpression '[' argumentExpressionList ']'
+    |   argumentExpressionList (',' argumentExpressionList) ','?
+    |   '[' argumentExpressionList (',' argumentExpressionList)* ','? ']'
+    |   unaryExpression assignmentOperator argumentExpressionList
+    |   logicalOrExpression (',' logicalOrExpression)* ','?
     ;
 
 unaryExpression
     :
-    ('++' |  '--' |  'sizeof')*
-    (postfixExpression
-    |   unaryOperator castExpression
-    |   ('sizeof' | '_Alignof') '(' typeName ')'
-    |   '&&' Identifier // GCC extension address of label
-    )
+    postfixExpression
     ;
 
 unaryOperator
     :   '&' | '*' | '+' | '-' | '~' | '!'
     ;
 
-castExpression
-    :   '__extension__'? '(' typeName ')' castExpression
-    |   unaryExpression
-    |   DigitSequence // for
-    ;
 
 multiplicativeExpression
-    :   castExpression (('*'|'/'|'%') castExpression)*
+    :   expression (('*'|'/'|'%') expression)*
     ;
 
 additiveExpression
@@ -159,13 +99,9 @@ logicalOrExpression
     :   logicalAndExpression ( '||' logicalAndExpression)*
     ;
 
-conditionalExpression
-    :   logicalOrExpression ('?' expression ':' conditionalExpression)?
-    ;
-
 assignmentExpression
-    :   conditionalExpression
-    |   unaryExpression assignmentOperator assignmentExpression
+    :   unaryExpression assignmentOperator logicalOrExpression
+    |   unaryExpression
     |   DigitSequence // for
     ;
 
@@ -174,181 +110,31 @@ assignmentOperator
     ;
 
 expression
-    :   assignmentExpression (',' assignmentExpression)*
-    ;
-
-constantExpression
-    :   conditionalExpression
+    :   unaryExpression
     ;
 
 declaration
-    :   declarationSpecifiers initDeclaratorList? ';'
-    |   staticAssertDeclaration
-    ;
-
-declarationSpecifiers
-    :   declarationSpecifier+
-    ;
-
-declarationSpecifiers2
-    :   declarationSpecifier+
-    ;
-
-declarationSpecifier
-    :   storageClassSpecifier
-    |   typeSpecifier
-    |   typeQualifier
-    |   functionSpecifier
-    |   alignmentSpecifier
-    ;
+    :   initDeclaratorList ';';
 
 initDeclaratorList
-    :   initDeclarator (',' initDeclarator)*
+    :   initDeclarator (',' initDeclarator)* ','?
     ;
 
 initDeclarator
     :   declarator ('=' initializer)?
     ;
 
-storageClassSpecifier
-    :   'typedef'
-    |   'extern'
-    |   'static'
-    |   '_Thread_local'
-    |   'auto'
-    |   'register'
-    ;
-
-typeSpecifier
-    :   ('void'
-    |   'char'
-    |   'short'
-    |   'int'
-    |   'long'
-    |   'float'
-    |   'double'
-    |   'signed'
-    |   'unsigned'
-    |   '_Bool'
-    |   '_Complex'
-    |   '__m128'
-    |   '__m128d'
-    |   '__m128i')
-    |   '__extension__' '(' ('__m128' | '__m128d' | '__m128i') ')'
-    |   atomicTypeSpecifier
-    |   structOrUnionSpecifier
-    |   enumSpecifier
-    |   typedefName
-    |   '__typeof__' '(' constantExpression ')' // GCC extension
-    |   typeSpecifier pointer
-    ;
-
-structOrUnionSpecifier
-    :   structOrUnion Identifier? '{' structDeclarationList '}'
-    |   structOrUnion Identifier
-    ;
-
-structOrUnion
-    :   'struct'
-    |   'union'
-    ;
-
-structDeclarationList
-    :   structDeclaration+
-    ;
-
-structDeclaration
-    :   specifierQualifierList structDeclaratorList? ';'
-    |   staticAssertDeclaration
-    ;
-
-specifierQualifierList
-    :   (typeSpecifier| typeQualifier) specifierQualifierList?
-    ;
-
-structDeclaratorList
-    :   structDeclarator (',' structDeclarator)*
-    ;
-
-structDeclarator
-    :   declarator
-    |   declarator? ':' constantExpression
-    ;
-
-enumSpecifier
-    :   'enum' Identifier? '{' enumeratorList ','? '}'
-    |   'enum' Identifier
-    ;
-
-enumeratorList
-    :   enumerator (',' enumerator)*
-    ;
-
-enumerator
-    :   enumerationConstant ('=' constantExpression)?
-    ;
-
-enumerationConstant
-    :   Identifier
-    ;
-
-atomicTypeSpecifier
-    :   '_Atomic' '(' typeName ')'
-    ;
-
-typeQualifier
-    :   'const'
-    |   'restrict'
-    |   'volatile'
-    |   '_Atomic'
-    ;
-
-functionSpecifier
-    :   ('inline'
-    |   '_Noreturn'
-    |   '__inline__' // GCC extension
-    |   '__stdcall')
-    |   gccAttributeSpecifier
-    |   '__declspec' '(' Identifier ')'
-    ;
-
-alignmentSpecifier
-    :   '_Alignas' '(' (typeName | constantExpression) ')'
-    ;
-
 declarator
-    :   pointer? directDeclarator gccDeclaratorExtension*
+    :   directDeclarator
     ;
+
+WS : (Whitespace | Newline) -> skip;
+
+primitiveArgs : argumentExpressionList;
 
 directDeclarator
     :   Identifier
-    |   '(' declarator ')'
-    |   directDeclarator '[' typeQualifierList? assignmentExpression? ']'
-    |   directDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
-    |   directDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
-    |   directDeclarator '[' typeQualifierList? '*' ']'
-    |   directDeclarator '(' parameterTypeList ')'
-    |   directDeclarator '(' identifierList? ')'
-    |   Identifier ':' DigitSequence  // bit field
-    |   '(' typeSpecifier? pointer directDeclarator ')' // function pointer like: (__cdecl *f)
-    ;
-
-gccDeclaratorExtension
-    :   '__asm' '(' StringLiteral+ ')'
-    |   gccAttributeSpecifier
-    ;
-
-gccAttributeSpecifier
-    :   '__attribute__' '(' '(' gccAttributeList ')' ')'
-    ;
-
-gccAttributeList
-    :   gccAttribute? (',' gccAttribute?)*
-    ;
-
-gccAttribute
-    :   ~(',' | '(' | ')') // relaxed def for "identifier or reserved word"
-        ('(' argumentExpressionList? ')')?
+    |   assignmentExpression
     ;
 
 nestedParenthesesBlock
@@ -357,52 +143,8 @@ nestedParenthesesBlock
         )*
     ;
 
-pointer
-    :  (('*'|'^') typeQualifierList?)+ // ^ - Blocks language extension
-    ;
-
-typeQualifierList
-    :   typeQualifier+
-    ;
-
-parameterTypeList
-    :   parameterList (',' '...')?
-    ;
-
-parameterList
-    :   parameterDeclaration (',' parameterDeclaration)*
-    ;
-
-parameterDeclaration
-    :   declarationSpecifiers declarator
-    |   declarationSpecifiers2 abstractDeclarator?
-    ;
-
 identifierList
-    :   Identifier (',' Identifier)*
-    ;
-
-typeName
-    :   specifierQualifierList abstractDeclarator?
-    ;
-
-abstractDeclarator
-    :   pointer
-    |   pointer? directAbstractDeclarator gccDeclaratorExtension*
-    ;
-
-directAbstractDeclarator
-    :   '(' abstractDeclarator ')' gccDeclaratorExtension*
-    |   '[' typeQualifierList? assignmentExpression? ']'
-    |   '[' 'static' typeQualifierList? assignmentExpression ']'
-    |   '[' typeQualifierList 'static' assignmentExpression ']'
-    |   '[' '*' ']'
-    |   '(' parameterTypeList? ')' gccDeclaratorExtension*
-    |   directAbstractDeclarator '[' typeQualifierList? assignmentExpression? ']'
-    |   directAbstractDeclarator '[' 'static' typeQualifierList? assignmentExpression ']'
-    |   directAbstractDeclarator '[' typeQualifierList 'static' assignmentExpression ']'
-    |   directAbstractDeclarator '[' '*' ']'
-    |   directAbstractDeclarator '(' parameterTypeList? ')' gccDeclaratorExtension*
+    :   Identifier (',' Identifier)* ','?
     ;
 
 typedefName
@@ -410,62 +152,36 @@ typedefName
     ;
 
 initializer
-    :   assignmentExpression
-    |   '{' WS* initializerList WS* ','? WS* '}'
+    :   blockItem
     ;
 
 initializerList
-    :   designation? initializer (',' designation? initializer)*
-    ;
-
-designation
-    :   designatorList '='
-    ;
-
-designatorList
-    :   designator+
-    ;
-
-designator
-    :   '[' constantExpression ']'
-    |   '.' Identifier
-    ;
-
-staticAssertDeclaration
-    :   '_Static_assert' '(' constantExpression ',' StringLiteral+ ')' ';'
+    :   initializer (',' initializer)* ','?
     ;
 
 statement
-    :   labeledStatement
-    |   compoundStatement
-    |   expressionStatement
+    :   expressionStatement
     |   selectionStatement
     |   iterationStatement
-    |   jumpStatement
-    |   ('__asm' | '__asm__') ('volatile' | '__volatile__') '(' (logicalOrExpression (',' logicalOrExpression)*)? (':' (logicalOrExpression (',' logicalOrExpression)*)?)* ')' ';'
     ;
 
-labeledStatement
-    :   Identifier ':' statement
-    |   'case' constantExpression ':' statement
-    |   'default' ':' statement
-    ;
 
 compoundStatement
-    :   '{' WS* blockItemList+ WS* '}'
+    :   '{' blockItemList* '}'
     ;
 
 blockItemList
-    :   (primitive | blockItem)+
+    :   blockItem+
     ;
 
 blockItem
-    :   statement
+    :   primitive
+    |   statement
     |   declaration
     ;
 
 expressionStatement
-    :   expression? ';'
+    :   expression ';'
     ;
 
 selectionStatement
@@ -475,20 +191,16 @@ selectionStatement
 
 iterationStatement
     :   While '(' expression ')' statement
-    |   Do statement While '(' expression ')' ';'
+    |   Do statement While '(' expression ')' ';'?
     |   For '(' forCondition ')' statement
     ;
 
-//    |   'for' '(' expression? ';' expression?  ';' forUpdate? ')' statement
-//    |   For '(' declaration  expression? ';' expression? ')' statement
+//    |   'for' '(' expression? ';'? expression?  ';'? forUpdate? ')' statement
+//    |   For '(' declaration  expression? ';'? expression? ')' statement
 
 forCondition
-	:   (forDeclaration | expression?) ';' forExpression? ';' forExpression?
+	:   expression ';'? forExpression? ';'? forExpression?
 	;
-
-forDeclaration
-    :   declarationSpecifiers initDeclaratorList?
-    ;
 
 forExpression
     :   assignmentExpression (',' assignmentExpression)*
@@ -500,25 +212,36 @@ jumpStatement
     |   'return' expression?
     |   'goto' unaryExpression // GCC extension
     )
-    ';'
+    ';'?
     ;
 
 compilationUnit
-    :   (WS | module | translationUnit)+
+    :   translationUnit? EOF
     ;
-
 translationUnit
     :   externalDeclaration+
     ;
 
 externalDeclaration
-    :   functionDefinition
+    :   primitive
+    |   module
+    |   function
     |   declaration
+    |   blockItem
     |   ';' // stray ;
     ;
 
-functionDefinition
-    :   declarationSpecifiers? declarator declarationList? compoundStatement?
+isTransparent : '#';
+
+primitive
+    : isTransparent? unaryExpression '(' primitiveArgs? ')' (('{' primitive+ '}') | ';');
+
+module
+    :   'module' unaryExpression '(' argumentExpressionList? ')' compoundStatement
+    ;
+
+function
+    :   'function' unaryExpression '(' argumentExpressionList? ')' '=' argumentExpressionList
     ;
 
 declarationList
@@ -862,18 +585,6 @@ SChar
     |   EscapeSequence
     |   '\\\n'   // Added line
     |   '\\\r\n' // Added line
-    ;
-
-// ignore the following asm blocks:
-/*
-    asm
-    {
-        mfspr x, 286;
-    }
- */
-AsmBlock
-    :   'asm' ~'{'* '{' ~'}'* '}'
-	-> skip
     ;
 
 Whitespace
