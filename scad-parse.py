@@ -20,7 +20,7 @@ class KeyPrinter(scadListener):
         # Enter a parse tree produced by scadParser#module.
 
     def enterModule(self, ctx:scadParser.ModuleContext):
-        self.contextStr = "def "+ctx.children[1].start.text+"():\n"
+        self.contextStr = "def "+ctx.children[1].symbol.text+"():\n"
         self.ident += 1
         self.insideModule = True
     def exitModule(self, ctx:scadParser.ModuleContext):
@@ -37,7 +37,7 @@ class KeyPrinter(scadListener):
             self.contextStr += self.identStr() + self.primitiveName + "(\n"
             self.ident += 1
         else:
-            self.primitiveName = ctx.children[1].start.text
+            self.primitiveName = ctx.children[1].symbol.text
     def exitIsTransparent(self, ctx: scadParser.IsTransparentContext):
         self.transparent = True
         self.contextStr += self.identStr() + self.primitiveName + "(\n"
@@ -62,13 +62,22 @@ class KeyPrinter(scadListener):
         self.insideArgs -= 1
         t = ctx.getText()
         if len(t) and t!=',':
-            t = t.replace('=true', '=True')
-            t = t.replace('=false', '=False')
             self.contextStr += self.identStr() + t.replace(';','') + ",\n"
-    def exitInitDeclarator(self, ctx: scadParser.AssignmentExpressionContext):
+    def exitAssignment(self, ctx: scadParser.AssignmentContext):
         t = ctx.getText()
+        t = t.replace('true', 'True')
+        t = t.replace('false', 'False')
         if not self.insideArgs:
             self.contextStr += self.identStr() + t.replace(';','') + "\n"
+    def exitArgs(self, ctx: scadParser.ArgsContext):
+        t = ctx.getText()
+        t = t.replace('true', 'True')
+        t = t.replace('false', 'False')
+        self.contextStr += self.identStr() + t
+        if not t.endswith('='):
+            self.contextStr += ",\n"
+        else:
+            self.contextStr += "\n"
 def main(argv):
     input_stream = FileStream(argv[1])
     lexer = scadLexer(input_stream)
