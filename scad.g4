@@ -45,6 +45,7 @@ initializerList
 
 compoundStatement
     :   '{' blockItemList* '}'
+    |   blockItemList
     ;
 
 blockItemList
@@ -79,6 +80,7 @@ externalDeclaration
         module
     |   primitive
     |   function
+    |   assignment
     |   blockItemList
     |   ';' // stray ;
     ;
@@ -145,7 +147,8 @@ comparison: expr (comp_op expr)*;
 // <> isn't actually a valid comparison operator in Python. It's here for the
 // sake of a __future__ import described in PEP 401 (which really works :-)
 comp_op: '<'|'>'|'=='|'>='|'<='|'<>'|'!='|'in'|'not' 'in'|'is'|'is' 'not';
-expr: xor_expr ('|' xor_expr)*;
+expr: xor_expr ('|' xor_expr)*
+    | expr '[' expr ']';
 xor_expr: and_expr ('^' and_expr)*;
 and_expr: shift_expr ('&' shift_expr)*;
 shift_expr: arith_expr (('<<'|'>>') arith_expr)*;

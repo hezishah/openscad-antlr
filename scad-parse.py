@@ -31,6 +31,19 @@ class KeyPrinter(scadListener):
             self.insideModule = False
         else:
             print("Error - Ident incorrect")
+    def enterFunction(self, ctx:scadParser.FunctionContext):
+        self.contextStr = "def "+ctx.children[1].symbol.text+"():\n"
+        self.ident += 1
+        self.contextStr += self.identStr() + "return \n"
+        self.insideModule = True
+    def exitFunction(self, ctx:scadParser.FunctionContext):
+        if(self.ident > 0):
+            self.ident -= 1
+            self.modules.append(self.contextStr)
+            self.contextStr = ""
+            self.insideModule = False
+        else:
+            print("Error - Ident incorrect")
     def enterPrimitive(self, ctx: scadParser.PrimitiveContext):
         if not ctx.start.text.startswith('#'):
             self.primitiveName = ctx.start.text
@@ -67,7 +80,7 @@ class KeyPrinter(scadListener):
         t = ctx.getText()
         t = t.replace('true', 'True')
         t = t.replace('false', 'False')
-        if not self.insideArgs:
+        if True: #not self.insideArgs:
             self.contextStr += self.identStr() + t.replace(';','') + "\n"
     def exitArgs(self, ctx: scadParser.ArgsContext):
         t = ctx.getText()
