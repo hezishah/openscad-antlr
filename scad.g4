@@ -1,191 +1,262 @@
-/*
- [The "BSD licence"]
- Copyright (c) 2013 Sam Harwell
- All rights reserved.
 
- Redistribution and use in source and binary forms, with or without
- modification, are permitted provided that the following conditions
- are met:
- 1. Redistributions of source code must retain the above copyright
-    notice, this list of conditions and the following disclaimer.
- 2. Redistributions in binary form must reproduce the above copyright
-    notice, this list of conditions and the following disclaimer in the
-    documentation and/or other materials provided with the distribution.
- 3. The name of the author may not be used to endorse or promote products
-    derived from this software without specific prior written permission.
-
- THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
-
-/** C 2011 grammar built from the C11 Spec */
 grammar scad;
 
-primitiveArgs : parameters (',' parameters) ','?;
 
-directDeclarator
-    :   typedargslist
-    ;
+TOK_IF : IF;
+TOK_ELSE : ELSE;
+TOK_FOR : FOR;
 
-initializer
-    :   blockItem
-    ;
 
-initializerList
-    :   initializer (',' initializer)* ','?
-    ;
 
-compoundStatement
-    :   '{' blockItemList* '}'
-    |   blockItemList
-    ;
+TOK_NUMBER : NUMBER;
+TOK_STRING : STRING;
+TOK_ID: NAME;
 
-blockItemList
-    :   blockItem+
-    ;
+TOK_EOT : '\u0003';
+TOK_MODULE :'module' SPACES;
+TOK_FUNCTION : 'function' SPACES;
+TOK_LET : 'let';
+TOK_ASSERT : ASSERT;
+TOK_ECHO : 'echo';
+TOK_EACH : 'each';
+TOK_TRUE : 'true';
+TOK_FALSE : 'false';
+TOK_UNDEF : 'undef';
 
-args :
-        (expr '=')? typedargslist (',' (expr '=')? typedargslist)* ','?
-    |   '[' args ']';
+LE : LT_EQ;
+GE : GT_EQ;
+EQ : EQUALS;
+NE : NOT_EQ_2;
 
-assignment :
-    expr '=' typedargslist ';'
-    ;
+parse: lines* EOF;
 
-blockItem
-    :   primitive
-    |   args
-    |   assignment
-    |   typedargslist
-    |   compound_stmt
-    ;
+internal_vars : '$' statement;
 
-compilationUnit
-    :   translationUnit? EOF
-    ;
-translationUnit
-    :   externalDeclaration+
-    ;
+lines
+        : statement
+        ;
+statement
+        : 
+          ';'
+        | '{' inner_input '}'
+        | internal_vars
+        | for_loop
+        | module
+        | assignment
+        | TOK_FUNCTION TOK_ID '(' parameters optional_commas ')' '=' expr ';'
+        | TOK_EOT
+        ;
 
-externalDeclaration
-    :
-        module
-    |   primitive
-    |   function
-    |   assignment
-    |   blockItemList
-    |   ';' // stray ;
-    ;
+inner_input
+        : /* empty */
+        | inner_input statement
+        ;
 
-isTransparent : '#';
+FNASSIGN :
+        '$fn';
 
-primitive
-    : isTransparent? NAME '(' blockItemList? ')' (compoundStatement | ';')
-    ;
+FAASSIGN :
+        '$fa';
+
+FSASSIGN :
+        '$fs';
+
+assignment:
+          TOK_ID '=' expr ';'
+        ;
 
 module
-    :   'module' NAME '(' blockItemList? ')' compoundStatement
-    ;
+        : '!' module
+        | '#' module
+        | '%' module
+        | '*' module
+        | TOK_MODULE TOK_ID '(' parameters optional_commas ')' statement
+        | single_module_instantiation child_statement
+        | ifelse_statement
+        ;
 
-function
-    :   'function' NAME '(' blockItemList? ')' '=' parameters
-    ;
+ifelse_statement
+        : if_statement else_statement?;
 
-parameters: typedargslist
-    ;
-typedargslist: (tfpdef ('=')? (',' tfpdef ('=')?)* (',' (
-        '*' (tfpdef)? (',' tfpdef ('=')?)* (',' ('**' tfpdef (',')?)?)?
-      | '**' tfpdef (',')?)?)?
-  | '*' (tfpdef)? (',' tfpdef ('=')?)* (',' ('**' tfpdef (',')?)?)?
-  | '**' tfpdef (',')?);
-tfpdef:  expr ;
+if_statement
+        : TOK_IF '(' expr ')'
+          child_statement
+        ;
 
-stmt: simple_stmt | compound_stmt;
-simple_stmt: small_stmt (';' small_stmt)* (';')? NEWLINE;
-small_stmt: (expr_stmt | flow_stmt |
-             import_stmt | global_stmt | nonlocal_stmt | assert_stmt);
-expr_stmt: annassign | augassign;
-annassign: ':' ('=')?;
-augassign: ('+=' | '-=' | '*=' | '@=' | '/=' | '%=' | '&=' | '|=' | '^=' |
-            '<<=' | '>>=' | '**=' | '//=');
-// For normal and annotated assignments, additional restrictions enforced by the interpreter
-pass_stmt: 'pass';
-flow_stmt: break_stmt | continue_stmt | raise_stmt;
-break_stmt: 'break';
-continue_stmt: 'continue';
-raise_stmt: 'raise' ('from')?;
-import_stmt: import_name | import_from;
-import_name: 'import' dotted_as_names;
-// note below: the ('.' | '...') is necessary because '...' is tokenized as ELLIPSIS
-import_from: ('from' (('.' | '...')* dotted_name | ('.' | '...')+)
-              'import' ('*' | '(' import_as_names ')' | import_as_names));
-import_as_name: NAME ('as' NAME)?;
-dotted_as_name: dotted_name ('as' NAME)?;
-import_as_names: import_as_name (',' import_as_name)* (',')?;
-dotted_as_names: dotted_as_name (',' dotted_as_name)*;
-dotted_name: NAME ('.' NAME)*;
-global_stmt: 'global' NAME (',' NAME)*;
-nonlocal_stmt: 'nonlocal' NAME (',' NAME)*;
-assert_stmt: 'assert' (',')?;
+else_statement
+        : TOK_ELSE child_statement
+        ;
 
-compound_stmt: if_stmt | while_stmt | for_stmt ;
-if_stmt: 'if' ':' suite ('elif' ':' suite)* ('else' ':' suite)?;
-while_stmt: 'while' ':' suite ('else' ':' suite)?;
-for_stmt: 'for' '(' expr '=' typedargslist ')' compoundStatement;
-// NB compile.c makes sure that the default except clause is last
-suite: simple_stmt | NEWLINE stmt+;
+child_statements
+        : /* empty */
+        | child_statements child_statement
+        | child_statements assignment
+        ;
 
-comparison: expr (comp_op expr)*;
-// <> isn't actually a valid comparison operator in Python. It's here for the
-// sake of a __future__ import described in PEP 401 (which really works :-)
-comp_op: '<'|'>'|'=='|'>='|'<='|'<>'|'!='|'in'|'not' 'in'|'is'|'is' 'not';
-expr: xor_expr ('|' xor_expr)*
-    | expr '[' expr ']';
-xor_expr: and_expr ('^' and_expr)*;
-and_expr: shift_expr ('&' shift_expr)*;
-shift_expr: arith_expr (('<<'|'>>') arith_expr)*;
-arith_expr: term (('+'|'-') term)*;
-term: factor (('*'|'@'|'/'|'%'|'//') factor)*;
-factor: ('+'|'-'|'~') factor | power;
-power: atom_expr ('**' factor)?;
-atom_expr: (AWAIT)? atom;
-atom: ('(' testlist_comp? ')' |
-       '[' (testlist_comp)? ']' |
-       NAME | NUMBER | STRING+ | '...' | 'None' | 'True' | 'False');
-testlist_comp: expr (',' (expr))* (',')?;
+child_statement
+        : ';'
+        | module
+        | '{' child_statements '}'
+        ;
+
+// "for", "let" and "each" are valid module identifiers
+module_id
+        : TOK_ID
+        | TOK_LET
+        | TOK_ASSERT
+        | TOK_ECHO
+        | TOK_EACH
+        ;
+
+single_module_instantiation
+        : module_id '(' arguments ')' |
+          single_module_instantiation single_module_instantiation
+        ;
+
+for_loop
+        : TOK_FOR '(' TOK_ID '=' vector_expr ')' child_statement
+        ;
+
+expr
+        : logic_or
+        | TOK_FUNCTION '(' parameters optional_commas ')' expr
+        | logic_or '?' expr ':' expr
+        | TOK_LET '(' arguments ')' expr
+        | TOK_ASSERT '(' arguments ')' expr_or_empty
+        | TOK_ECHO '(' arguments ')' expr_or_empty
+        ;
+
+logic_or
+        : logic_and
+        | logic_or OR logic_and
+		;
+
+logic_and
+        : equality
+        | logic_and AND equality
+		;
+
+equality
+        : comparison
+        | equality EQ comparison
+        | equality NE comparison
+		;
+
+comparison
+        : addition
+        | comparison '>' addition
+        | comparison GE addition
+        | comparison '<' addition
+        | comparison LE addition
+		;
+
+addition
+        : multiplication
+        | addition '+' multiplication
+        | addition '-' multiplication
+		;
+
+multiplication
+        : unary
+        | multiplication '*' unary
+        | multiplication '/' unary
+        | multiplication '%' unary
+		;
 
 
-arglist: argument (',' argument)*  (',')?;
+unary
+        : exponent
+        | '+' unary
+        | '-' unary
+        | '!' unary
+		;
 
-// The reason that keywords are nodes instead of NAME is that using NAME
-// results in an ambiguity. ast.c makes sure it's a NAME.
-// "test '='" is really "keyword '='", but we have no such token.
-// These need to be in a single rule to avoid grammar that is ambiguous
-// to our LL(1) parser. Even though 'test' includes '*expr' in star_expr,
-// we explicitly match '*' here, too, to give it proper precedence.
-// Illegal combinations and orderings are blocked in ast.c:
-// multiple (test comp_for) arguments are blocked; keyword unpackings
-// that precede iterable unpackings are blocked; etc.
-argument: ( (expr)? |
-            '=' |
-            '**' |
-            '*' );
+exponent
+       : call
+       | call '^' unary
+       ;
 
+call
+        : primary
+        | call '(' arguments ')'
+        | call '[' expr ']'
+        | call '.' TOK_ID
+		;
 
-// not used in grammar, but may appear in "node" passed from Parser to Compiler
-encoding_decl: NAME;
+primary
+        : TOK_TRUE
+        | TOK_FALSE
+        | TOK_UNDEF
+        | TOK_NUMBER
+        | TOK_STRING
+        | TOK_ID
+        | '(' expr ')'
+        | '[' expr ':' expr ']'
+        | '[' expr ':' expr ':' expr ']'
+        | '[' optional_commas ']'
+        | '[' vector_expr optional_commas ']'
+		;
 
-/*
- * lexer rules
- */
+expr_or_empty
+        : 
+        | expr
+        ;
+
+/* The last set element may not be a "let" (as that would instead
+   be parsed as an expression) */
+list_comprehension_elements
+        : TOK_LET '(' arguments ')' list_comprehension_elements_p
+        | TOK_EACH list_comprehension_elements_or_expr
+        | TOK_FOR '(' arguments ')' list_comprehension_elements_or_expr
+        | TOK_FOR '(' arguments ';' expr ';' arguments ')' list_comprehension_elements_or_expr
+        | TOK_IF '(' expr ')' list_comprehension_elements_or_expr (TOK_ELSE list_comprehension_elements_or_expr)?
+        ;
+
+// list_comprehension_elements with optional parenthesis
+list_comprehension_elements_p
+        : list_comprehension_elements
+        | '(' list_comprehension_elements ')'
+        ;
+
+list_comprehension_elements_or_expr
+        : list_comprehension_elements_p
+        | expr
+        ;
+
+optional_commas
+        : /* empty */
+		| ',' optional_commas
+        ;
+
+vector_expr
+        : expr
+        |  list_comprehension_elements
+        | vector_expr ',' optional_commas list_comprehension_elements_or_expr
+        ;
+
+parameters
+        : /* empty */
+        | parameter
+        | parameters ',' optional_commas parameter
+        ;
+
+parameter
+        : TOK_ID
+        | TOK_ID '=' expr
+        ;
+
+arguments
+        : 
+        | argument
+        | arguments ',' optional_commas argument
+        ;
+
+argument
+        : 
+         (FNASSIGN | FAASSIGN | FSASSIGN) '=' expr
+        | expr
+        | TOK_ID '=' expr
+        ;
 
 STRING
  : STRING_LITERAL
@@ -480,8 +551,12 @@ fragment SPACES
  ;
 
 fragment COMMENT
- : '//' ~[\r\n\f]*
+ : '//' ~[\r\n\f]* NEWLINE
  ;
+
+BlockComment
+    :   '/*' .*? '*/'
+        -> skip;
 
 fragment LINE_JOINING
  : '\\' SPACES? ( '\r'? '\n' | '\r' | '\f' )

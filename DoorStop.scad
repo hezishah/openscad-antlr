@@ -38,7 +38,7 @@ module door_stopper_simple() {
 
     // top inset
     translate([ -1 * borders, 0, top_z ]) {
-#cube([ top_cube_length,
+      #cube([ top_cube_length,
                      top_cube_width,
 		     top_cube_height],
 		    center=true) ;
@@ -46,7 +46,7 @@ module door_stopper_simple() {
     // cut of the tip a bit
 
     translate([ tip_cut_pos, 0, 0 ]) {
-#cube([ 20,
+      #cube([ 20,
                      width + 1,
 		     height],
 		    center=true) ;

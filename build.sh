@@ -6,6 +6,6 @@ pushd $(pwd)
 cd scad
 javac -classpath $(which antlr| echo $(dirname $(which antlr))/$(dirname $(xargs readlink))/../antlr-4.9.2-complete.jar) scad*.java
 #echo "module hezi () \n { \n }" | grun scad prog -gui
-grun scad prog -gui < ../DoorStop.scad
+grun scad parse -gui < ../Cube.scad
 popd
-python3 scad-parse.py DoorStop.scad
+python3 scad-parse.py Cube.scad
