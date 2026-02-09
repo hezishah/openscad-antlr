@@ -63,6 +63,9 @@ FSASSIGN :
 
 assignment:
           TOK_ID '=' expr ';'
+        | FNASSIGN '=' expr ';'
+        | FAASSIGN '=' expr ';'
+        | FSASSIGN '=' expr ';'
         ;
 
 module

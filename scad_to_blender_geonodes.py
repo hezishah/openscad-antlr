@@ -122,54 +122,114 @@ class SCADtoASTBuilder(scadListener):
         self.current_module = None
         self.variables = {}
         self.modules = []
+        self._handled_modules = set()  # track module ctx ids we handle via single_module_instantiation
 
     def enterModule(self, ctx: scadParser.ModuleContext):
         text = ctx.getText()
 
-        # Handle module declaration
+        # Handle module declaration (e.g. "module foo(...) { ... }")
         if text.startswith('module'):
             module_name = ctx.children[1].getText()
             params = ctx.children[3].getText() if len(ctx.children) > 3 else ""
             self.current_module = ModuleNode(module_name, params)
             self.ast_stack.append(self.current_module)
+
+        # Module instantiations are handled by enterSingle_module_instantiation
+
+    def enterSingle_module_instantiation(self, ctx: scadParser.Single_module_instantiationContext):
+        """Handle a single module instantiation like cube(10), translate([1,2,3]), etc.
+
+        The grammar rule is:
+            single_module_instantiation
+                : module_id '(' arguments ')'
+                | single_module_instantiation single_module_instantiation
+
+        For chained calls like rotate([0,90,0]) holeObject(), ANTLR builds
+        a left-recursive tree.  We extract only the module_id and arguments
+        from THIS node, ignoring any chained child instantiations (which will
+        get their own enterSingle_module_instantiation call).
+        """
+        # Get module name from the module_id child
+        module_id_ctx = ctx.module_id()
+        if module_id_ctx is None:
+            # This is the chaining rule (single_module_instantiation single_module_instantiation)
+            # The children will be handled by their own enter calls
+            return
+
+        module_name = module_id_ctx.getText()
+
+        # Get arguments text from the arguments child
+        args_ctx = ctx.arguments()
+        args_text = args_ctx.getText() if args_ctx else ""
+
+        # Create the appropriate AST node
+        if module_name in ['cube', 'sphere', 'cylinder', 'polyhedron',
+                           'circle', 'square', 'polygon', 'text',
+                           'surface', 'import', 'projection']:
+            node = PrimitiveNode(module_name, self._parse_args(args_text))
+            self.ast_stack.append(node)
+        elif module_name in ['translate', 'rotate', 'scale', 'mirror',
+                             'color', 'offset', 'hull', 'minkowski',
+                             'resize', 'multmatrix']:
+            node = TransformNode(module_name, self._parse_params(args_text))
+            self.ast_stack.append(node)
+        elif module_name in ['linear_extrude', 'rotate_extrude']:
+            node = ExtrudeNode(module_name, self._parse_args(args_text))
+            self.ast_stack.append(node)
+        elif module_name in ['difference', 'union', 'intersection']:
+            node = BooleanOpNode(module_name)
+            self.ast_stack.append(node)
         else:
-            # Handle module instantiation (primitives, transforms, boolean ops)
-            if ctx.children:
-                first_child = ctx.children[0]
-                module_text = first_child.getText()
+            # Custom module call
+            node = PrimitiveNode(module_name, self._parse_args(args_text))
+            self.ast_stack.append(node)
 
-                # Parse the module name and arguments
-                if '(' in module_text:
-                    module_name = module_text.split('(')[0]
-                    args_text = module_text.split('(', 1)[1].rsplit(')', 1)[0] if ')' in module_text else ""
+        # Mark the parent module context as handled so exitModule
+        # knows this instantiation created a node
+        parent = ctx.parentCtx
+        while parent and not isinstance(parent, scadParser.ModuleContext):
+            parent = parent.parentCtx
+        if parent:
+            self._handled_modules.add(id(parent))
 
-                    # Determine node type based on module name
-                    if module_name in ['cube', 'sphere', 'cylinder', 'polyhedron',
-                                       'circle', 'square', 'polygon', 'text',
-                                       'surface', 'import', 'projection']:
-                        node = PrimitiveNode(module_name, self._parse_args(args_text))
-                        self.ast_stack.append(node)
-                    elif module_name in ['translate', 'rotate', 'scale', 'mirror',
-                                         'color', 'offset', 'hull', 'minkowski',
-                                         'resize', 'multmatrix']:
-                        node = TransformNode(module_name, self._parse_params(args_text))
-                        self.ast_stack.append(node)
-                    elif module_name in ['linear_extrude', 'rotate_extrude']:
-                        node = ExtrudeNode(module_name, self._parse_args(args_text))
-                        self.ast_stack.append(node)
-                    elif module_name in ['difference', 'union', 'intersection']:
-                        node = BooleanOpNode(module_name)
-                        self.ast_stack.append(node)
-                    else:
-                        # Custom module call
-                        node = PrimitiveNode(module_name, self._parse_args(args_text))
-                        self.ast_stack.append(node)
+    def exitSingle_module_instantiation(self, ctx: scadParser.Single_module_instantiationContext):
+        """Pop chained inner instantiations and attach as child of the outer one.
+
+        For a chain like `rotate(...) cube(...)`, the grammar is:
+            single_module_instantiation  (chain)
+              single_module_instantiation  (rotate — has module_id)
+              single_module_instantiation  (cube — has module_id)
+
+        Both rotate and cube are pushed.  When we exit cube's context, its
+        parent is the chain context (also a single_module_instantiation).
+        When we exit rotate, its parent is also the chain.  In that case
+        we pop and attach as a child of whatever is on the stack.
+
+        But when the single_module_instantiation is the direct child of
+        a `module` rule, exitModule handles the pop.
+        """
+        module_id_ctx = ctx.module_id()
+        if module_id_ctx is None:
+            # Chaining rule — nothing was pushed
+            return
+
+        # If our parent is another single_module_instantiation (chaining),
+        # pop now and attach as child of whatever is on the stack.
+        parent = ctx.parentCtx
+        if isinstance(parent, scadParser.Single_module_instantiationContext):
+            if self.ast_stack:
+                node = self.ast_stack.pop()
+                if self.ast_stack:
+                    self.ast_stack[-1].children.append(node)
+                else:
+                    self.modules.append(node)
+        # Otherwise, exitModule will handle the pop
 
     def exitModule(self, ctx: scadParser.ModuleContext):
+        """Pop the node pushed by either enterModule (module declaration)
+        or enterSingle_module_instantiation (module instantiation)."""
         if self.ast_stack:
             node = self.ast_stack.pop()
-
-            # Add to parent or to modules list
             if self.ast_stack:
                 self.ast_stack[-1].children.append(node)
             else:
@@ -177,7 +237,15 @@ class SCADtoASTBuilder(scadListener):
 
     def exitAssignment(self, ctx: scadParser.AssignmentContext):
         var_name = ctx.children[0].getText()
+        # The expression is at index 2 (after '=')
         value = ctx.children[2].getText()
+
+        # Convert OpenSCAD expression syntax to Python
+        value = _scad_expr_to_python(value)
+
+        # Convert $fn/$fa/$fs to valid Python identifiers
+        var_name = _sanitize_var_name(var_name)
+
         self.variables[var_name] = value
 
         # Add to current module if inside one
@@ -215,22 +283,38 @@ class SCADtoASTBuilder(scadListener):
         for part in parts:
             if '=' in part:
                 key, val = part.split('=', 1)
-                args[key.strip()] = val.strip()
+                key = key.strip()
+                val = val.strip()
+                # Don't convert values inside brackets (vectors) here —
+                # they'll be converted when parse_vector_string splits them.
+                if not val.startswith('['):
+                    val = _scad_expr_to_python(val)
+                args[key] = val
             else:
                 # Positional argument
-                args[f'_pos_{len(args)}'] = part.strip()
+                val = part.strip()
+                if not val.startswith('['):
+                    val = _scad_expr_to_python(val)
+                args[f'_pos_{len(args)}'] = val
         return args
 
     def _parse_params(self, params_text):
         """Parse parameters (arrays, vectors, etc.)"""
-        # For now, just return as string
-        # Can be enhanced to parse arrays properly
+        # For vectors like [x,y,z] we leave them as-is since
+        # parse_vector_string + _scad_expr_to_python handles components.
+        # For single values, convert now.
+        if params_text and not params_text.startswith('['):
+            return _scad_expr_to_python(params_text)
         return params_text
 
 
 def generate_blender_geonodes(ast_modules, variables):
     """
-    Generate Blender Python code that creates Geometry Nodes from AST
+    Generate Blender Python code that creates a single Geometry Nodes graph from AST.
+
+    All top-level operations are placed in one node group.
+    SCAD module definitions become sub-groups (GeometryNodeGroup) that can be
+    instantiated from the main graph.
     """
     code_lines = [
         "import bpy",
@@ -241,37 +325,29 @@ def generate_blender_geonodes(ast_modules, variables):
         "    for obj in bpy.data.objects:",
         "        if obj.type == 'MESH':",
         "            bpy.data.objects.remove(obj, do_unlink=True)",
+        "    for ng in list(bpy.data.node_groups):",
+        "        bpy.data.node_groups.remove(ng)",
         "",
-        "# Create a new geometry nodes modifier",
-        "def setup_geometry_nodes(name):",
-        "    # Create a new mesh and object",
-        "    mesh = bpy.data.meshes.new(name)",
-        "    obj = bpy.data.objects.new(name, mesh)",
-        "    bpy.context.collection.objects.link(obj)",
-        "    ",
-        "    # Add Geometry Nodes modifier",
-        "    modifier = obj.modifiers.new(name='GeometryNodes', type='NODES')",
-        "    ",
-        "    # Create a new node group",
-        "    node_group = bpy.data.node_groups.new(name, 'GeometryNodeTree')",
-        "    modifier.node_group = node_group",
-        "    ",
-        "    # Add Group Input and Output nodes",
-        "    nodes = node_group.nodes",
-        "    group_input = nodes.new('NodeGroupInput')",
-        "    group_output = nodes.new('NodeGroupOutput')",
-        "    ",
-        "    # Add Geometry output socket to the group",
-        "    # Blender 4.x uses node_group.interface, older versions use node_group.outputs",
+        "def add_geometry_socket(node_group, name, in_out):",
+        "    \"\"\"Add a Geometry socket to a node group, compatible with Blender 3.x and 4.x.\"\"\"",
         "    if hasattr(node_group, 'interface'):",
-        "        node_group.interface.new_socket(name='Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')",
+        "        node_group.interface.new_socket(name=name, in_out=in_out, socket_type='NodeSocketGeometry')",
         "    else:",
-        "        node_group.outputs.new('NodeSocketGeometry', 'Geometry')",
-        "    ",
-        "    group_input.location = (-200, 0)",
-        "    group_output.location = (600, 0)",
-        "    ",
-        "    return obj, node_group, nodes, group_input, group_output",
+        "        if in_out == 'OUTPUT':",
+        "            node_group.outputs.new('NodeSocketGeometry', name)",
+        "        else:",
+        "            node_group.inputs.new('NodeSocketGeometry', name)",
+        "",
+        "def create_subgroup(name):",
+        "    \"\"\"Create a node sub-group (for SCAD module definitions).\"\"\"",
+        "    ng = bpy.data.node_groups.new(name, 'GeometryNodeTree')",
+        "    nodes = ng.nodes",
+        "    gi = nodes.new('NodeGroupInput')",
+        "    go = nodes.new('NodeGroupOutput')",
+        "    add_geometry_socket(ng, 'Geometry', 'OUTPUT')",
+        "    gi.location = (-400, 0)",
+        "    go.location = (800, 0)",
+        "    return ng, nodes, gi, go",
         "",
     ]
 
@@ -281,22 +357,78 @@ def generate_blender_geonodes(ast_modules, variables):
         code_lines.append(f"{var_name} = {value}")
     code_lines.append("")
 
-    # Generate node creation code for each module
-    for module in ast_modules:
-        code_lines.extend(generate_module_code(module, variables))
+    # Separate module definitions from top-level operations
+    module_defs = [m for m in ast_modules if isinstance(m, ModuleNode)]
+    top_level_ops = [m for m in ast_modules if not isinstance(m, ModuleNode)]
 
+    # Collect defined module names so we can resolve custom module calls
+    defined_modules = {m.name for m in module_defs}
+
+    # --- Generate sub-group creation functions for each SCAD module ---
+    for mod in module_defs:
+        code_lines.extend(generate_subgroup_code(mod, variables, defined_modules))
+
+    # --- Generate the main build function ---
+    code_lines.append("def build_geometry():")
+    code_lines.append("    # Create mesh object")
+    code_lines.append("    mesh = bpy.data.meshes.new('OpenSCAD')")
+    code_lines.append("    obj = bpy.data.objects.new('OpenSCAD', mesh)")
+    code_lines.append("    bpy.context.collection.objects.link(obj)")
+    code_lines.append("    ")
+    code_lines.append("    # Add Geometry Nodes modifier")
+    code_lines.append("    modifier = obj.modifiers.new(name='GeometryNodes', type='NODES')")
+    code_lines.append("    node_group = bpy.data.node_groups.new('OpenSCAD', 'GeometryNodeTree')")
+    code_lines.append("    modifier.node_group = node_group")
+    code_lines.append("    ")
+    code_lines.append("    # Main node group I/O")
+    code_lines.append("    nodes = node_group.nodes")
+    code_lines.append("    links = node_group.links")
+    code_lines.append("    group_input = nodes.new('NodeGroupInput')")
+    code_lines.append("    group_output = nodes.new('NodeGroupOutput')")
+    code_lines.append("    add_geometry_socket(node_group, 'Geometry', 'OUTPUT')")
+    code_lines.append("    group_input.location = (-400, 0)")
+    code_lines.append("    group_output.location = (800, 0)")
+    code_lines.append("    ")
+
+    # First, create all sub-groups so they exist for node-group references
+    if module_defs:
+        code_lines.append("    # Build SCAD module sub-groups")
+        for mod in module_defs:
+            code_lines.append(f"    subgroup_{mod.name} = create_{mod.name}_group()")
+        code_lines.append("    ")
+
+    # Generate code for all top-level operations inside the main node group
+    node_counter = [0]
+    child_outputs = []
+
+    for op in top_level_ops:
+        op_code, output = generate_node_code(op, variables, indent=1,
+                                             node_counter=node_counter,
+                                             defined_modules=defined_modules)
+        code_lines.extend(op_code)
+        if output:
+            child_outputs.append(output)
+
+    # Join all top-level outputs together and connect to group_output
+    ind = "    "
+    if len(child_outputs) > 1:
+        join_id = f"node_{node_counter[0]}"
+        node_counter[0] += 1
+        code_lines.append(f"{ind}# Join all top-level geometry")
+        code_lines.append(f"{ind}{join_id} = nodes.new('GeometryNodeJoinGeometry')")
+        for co in child_outputs:
+            code_lines.append(f"{ind}links.new({co}, {join_id}.inputs['Geometry'])")
+        code_lines.append(f"{ind}links.new({join_id}.outputs['Geometry'], group_output.inputs['Geometry'])")
+    elif len(child_outputs) == 1:
+        _connect_to_group_output(code_lines, child_outputs[0], indent=1, node_counter=node_counter)
+    code_lines.append("")
+
+    # Main execution
     code_lines.append("")
     code_lines.append("# Main execution")
     code_lines.append("if __name__ == '__main__':")
     code_lines.append("    clear_geometry_nodes()")
-
-    # Call appropriate functions
-    for module in ast_modules:
-        if isinstance(module, ModuleNode):
-            code_lines.append(f"    {module.name}()")
-        else:
-            # Top-level operation
-            code_lines.append(f"    main_geometry()")
+    code_lines.append("    build_geometry()")
 
     return "\n".join(code_lines)
 
@@ -322,52 +454,108 @@ def _connect_to_group_output(lines, output_socket_str, indent, node_counter):
         lines.append(f"{ind}links.new({conv_id}.outputs['Geometry'], group_output.inputs['Geometry'])")
 
 
-def generate_module_code(module, variables, indent=0):
-    """Generate Blender Python code for a module or top-level operation"""
-    ind = "    " * indent
+def generate_subgroup_code(module, variables, defined_modules):
+    """Generate a function that creates a Geometry Nodes sub-group for a SCAD module."""
     lines = []
+    func_name = f"create_{module.name}_group"
+    lines.append(f"def {func_name}():")
+    lines.append(f"    ng, nodes, group_input, group_output = create_subgroup('{module.name}')")
+    lines.append(f"    links = ng.links")
+    lines.append(f"    ")
 
-    if isinstance(module, ModuleNode):
-        lines.append(f"{ind}def {module.name}():")
-        lines.append(f"{ind}    obj, node_group, nodes, group_input, group_output = setup_geometry_nodes('{module.name}')")
-        lines.append(f"{ind}    links = node_group.links")
-        lines.append(f"{ind}    ")
+    # Process children
+    node_counter = [0]
+    last_output = None
 
-        # Process children
-        node_counter = [0]  # Use list to allow mutation in nested function
-        last_output = None
-
-        for child in module.children:
-            child_code, output = generate_node_code(child, variables, indent + 1, node_counter)
-            lines.extend(child_code)
+    for child in module.children:
+        child_code, output = generate_node_code(child, variables, indent=1,
+                                                node_counter=node_counter,
+                                                defined_modules=defined_modules)
+        lines.extend(child_code)
+        if output:
             last_output = output
 
-        # Connect final output to group output
-        if last_output:
-            _connect_to_group_output(lines, last_output, indent + 1, node_counter)
+    # Connect final output to group output
+    if last_output:
+        _connect_to_group_output(lines, last_output, indent=1, node_counter=node_counter)
 
-        lines.append("")
-
-    else:
-        # Top-level operation (not inside a module)
-        # Create a default function to wrap it
-        lines.append(f"{ind}def main_geometry():")
-        lines.append(f"{ind}    obj, node_group, nodes, group_input, group_output = setup_geometry_nodes('main_geometry')")
-        lines.append(f"{ind}    links = node_group.links")
-        lines.append(f"{ind}    ")
-
-        # Process the operation
-        node_counter = [0]
-        operation_code, output = generate_node_code(module, variables, indent + 1, node_counter)
-        lines.extend(operation_code)
-
-        # Connect final output to group output
-        if output:
-            _connect_to_group_output(lines, output, indent + 1, node_counter)
-
-        lines.append("")
-
+    lines.append(f"    return ng")
+    lines.append("")
     return lines
+
+
+def _sanitize_var_name(name):
+    """Convert OpenSCAD variable names to valid Python identifiers.
+
+    $fn → _fn, $fa → _fa, $fs → _fs, etc.
+    """
+    if name.startswith('$'):
+        return '_' + name[1:]
+    return name
+
+
+def _scad_expr_to_python(expr):
+    """Convert an OpenSCAD expression string to valid Python syntax.
+
+    Handles:
+      - Ternary:  cond ? a : b  →  (a if cond else b)
+      - Booleans: true / false  →  True / False
+      - Undef:    undef         →  None
+    """
+    if not expr:
+        return expr
+
+    s = expr.strip()
+
+    # Convert OpenSCAD ternary  cond ? val_true : val_false
+    # We need to handle nested ternaries so we find the *first* top-level '?'
+    # that isn't inside brackets/parens.
+    depth = 0
+    q_pos = -1
+    for i, ch in enumerate(s):
+        if ch in '([':
+            depth += 1
+        elif ch in ')]':
+            depth -= 1
+        elif ch == '?' and depth == 0:
+            q_pos = i
+            break
+
+    if q_pos != -1:
+        cond = s[:q_pos].strip()
+        rest = s[q_pos + 1:]
+        # Find the matching ':' at depth 0
+        depth = 0
+        c_pos = -1
+        for i, ch in enumerate(rest):
+            if ch in '([':
+                depth += 1
+            elif ch in ')]':
+                depth -= 1
+            elif ch == ':' and depth == 0:
+                c_pos = i
+                break
+        if c_pos != -1:
+            val_true = rest[:c_pos].strip()
+            val_false = rest[c_pos + 1:].strip()
+            # Recursively convert sub-expressions
+            cond = _scad_expr_to_python(cond)
+            val_true = _scad_expr_to_python(val_true)
+            val_false = _scad_expr_to_python(val_false)
+            return f"({val_true} if {cond} else {val_false})"
+
+    # Replace standalone boolean/undef keywords (word-boundary aware)
+    import re
+    s = re.sub(r'\btrue\b', 'True', s)
+    s = re.sub(r'\bfalse\b', 'False', s)
+    s = re.sub(r'\bundef\b', 'None', s)
+
+    # Replace $fn/$fa/$fs with _fn/_fa/_fs
+    s = re.sub(r'\$fn\b', '_fn', s)
+    s = re.sub(r'\$fa\b', '_fa', s)
+    s = re.sub(r'\$fs\b', '_fs', s)
+
+    return s
 
 
 def parse_vector_string(vector_str):
@@ -378,11 +566,29 @@ def parse_vector_string(vector_str):
     # Remove brackets and split by comma
     if vector_str.startswith('[') and vector_str.endswith(']'):
         content = vector_str[1:-1]
-        components = [c.strip() for c in content.split(',')]
-        return tuple(components)
+        # Split respecting bracket nesting
+        parts = []
+        depth = 0
+        current = []
+        for ch in content:
+            if ch in '([':
+                depth += 1
+                current.append(ch)
+            elif ch in ')]':
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                parts.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            parts.append(''.join(current).strip())
+        # Convert each component to valid Python
+        return tuple(_scad_expr_to_python(c) for c in parts)
     else:
         # Single value, return as single-element tuple
-        return (vector_str,)
+        return (_scad_expr_to_python(vector_str),)
 
 
 def generate_vector_assignment(lines, node_id, input_name, vector_str, indent):
@@ -404,10 +610,12 @@ def generate_vector_assignment(lines, node_id, input_name, vector_str, indent):
             lines.append(f"{ind}{node_id}.inputs['{input_name}'].default_value = ({', '.join(components)})")
 
 
-def generate_node_code(node, variables, indent=0, node_counter=None):
+def generate_node_code(node, variables, indent=0, node_counter=None, defined_modules=None):
     """Generate Blender node code for an AST node"""
     if node_counter is None:
         node_counter = [0]
+    if defined_modules is None:
+        defined_modules = set()
 
     ind = "    " * indent
     lines = []
@@ -699,7 +907,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
 
             # Process child geometry
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
 
                 if cut.lower() == 'true':
@@ -726,10 +934,16 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
             return lines, output_socket
 
         else:
-            # Custom module or unknown primitive
-            lines.append(f"{ind}# Custom module: {node.primitive_type}")
-            lines.append(f"{ind}# TODO: Implement custom module {node.primitive_type}")
-            output_socket = None
+            # Custom module call
+            if node.primitive_type in defined_modules:
+                lines.append(f"{ind}# Instantiate module: {node.primitive_type}")
+                lines.append(f"{ind}{node_id} = nodes.new('GeometryNodeGroup')")
+                lines.append(f"{ind}{node_id}.node_tree = bpy.data.node_groups['{node.primitive_type}']")
+                output_socket = f"{node_id}.outputs['Geometry']"
+            else:
+                lines.append(f"{ind}# Unknown module: {node.primitive_type}")
+                lines.append(f"{ind}# TODO: Implement custom module {node.primitive_type}")
+                output_socket = None
 
     elif isinstance(node, ExtrudeNode):
         node_id = f"node_{node_counter[0]}"
@@ -749,7 +963,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
             # Process child 2D geometry first
             child_output = None
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
 
             # Use Extrude Mesh node for basic linear extrusion
@@ -776,7 +990,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
             # Process child 2D profile first
             child_output = None
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
 
             # For rotate_extrude we need a Curve to Mesh approach:
@@ -829,7 +1043,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
 
             # Pass through child geometry
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 output_socket = child_output
             else:
@@ -845,7 +1059,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
             # Process all children and join them first
             child_outputs = []
             for child in node.children:
-                child_code, child_output = generate_node_code(child, variables, indent, node_counter)
+                child_code, child_output = generate_node_code(child, variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 if child_output:
                     child_outputs.append(child_output)
@@ -871,7 +1085,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
 
             child_outputs = []
             for child in node.children:
-                child_code, child_output = generate_node_code(child, variables, indent, node_counter)
+                child_code, child_output = generate_node_code(child, variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 if child_output:
                     child_outputs.append(child_output)
@@ -895,7 +1109,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
 
             # Pass through child geometry
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 output_socket = child_output
             else:
@@ -911,7 +1125,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
             generate_vector_assignment(lines, node_id, 'Scale', node.params, indent)
 
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 if child_output:
                     lines.append(f"{ind}links.new({child_output}, {node_id}.inputs['Geometry'])")
@@ -926,7 +1140,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
             lines.append(f"{ind}# TODO: Decompose 4x4 matrix into translate/rotate/scale components")
 
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 if child_output:
                     lines.append(f"{ind}links.new({child_output}, {node_id}.inputs['Geometry'])")
@@ -950,7 +1164,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
                 lines.append(f"{ind}# Mirror params: {node.params}")
 
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 if child_output:
                     lines.append(f"{ind}links.new({child_output}, {node_id}.inputs['Geometry'])")
@@ -971,7 +1185,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
 
             # Process child and connect
             if node.children:
-                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter)
+                child_code, child_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 if child_output:
                     lines.append(f"{ind}links.new({child_output}, {node_id}.inputs['Geometry'])")
@@ -988,7 +1202,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
         # OpenSCAD difference subtracts all children from the first child
         if node.op_type == 'difference' and len(node.children) > 2:
             # Process first child (the base object)
-            base_code, base_output = generate_node_code(node.children[0], variables, indent, node_counter)
+            base_code, base_output = generate_node_code(node.children[0], variables, indent, node_counter, defined_modules)
             lines.extend(base_code)
 
             # Subtract each subsequent child iteratively
@@ -1002,7 +1216,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
                 lines.append(f"{ind}{bool_node_id}.operation = 'DIFFERENCE'")
 
                 # Process child
-                child_code, child_output = generate_node_code(child, variables, indent, node_counter)
+                child_code, child_output = generate_node_code(child, variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
 
                 # Connect
@@ -1028,7 +1242,7 @@ def generate_node_code(node, variables, indent=0, node_counter=None):
 
             # Process children and connect them
             for i, child in enumerate(node.children[:2]):  # Only use first 2 children
-                child_code, child_output = generate_node_code(child, variables, indent, node_counter)
+                child_code, child_output = generate_node_code(child, variables, indent, node_counter, defined_modules)
                 lines.extend(child_code)
                 if child_output:
                     input_name = 'Mesh 1' if i == 0 else 'Mesh 2'
