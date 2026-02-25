@@ -223,14 +223,35 @@ bool BlenderGenerator::isSimpleVariableRef(const Value& value) {
     return true;
 }
 
+bool BlenderGenerator::exprTreeHasOnlyGroupInputVars(const ExprNodePtr& tree) {
+    if (!tree) return true;
+    switch (tree->kind) {
+        case ExprNode::Kind::Literal:
+            return true;
+        case ExprNode::Kind::VarRef:
+            return group_input_vars_.find(tree->var_name) != group_input_vars_.end();
+        case ExprNode::Kind::UnaryOp:
+            return exprTreeHasOnlyGroupInputVars(tree->left);
+        case ExprNode::Kind::BinaryOp:
+            return exprTreeHasOnlyGroupInputVars(tree->left) &&
+                   exprTreeHasOnlyGroupInputVars(tree->right);
+    }
+    return true;
+}
+
 void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::string& inputName,
                                           const Value& value, const std::string& pythonValue) {
     // Try expression tree path first
     ExprNodePtr tree = resolveExprTree(value);
     if (tree && tree->hasVariableRefs()) {
-        auto result = emitExpressionNodeTree(tree);
-        connectExprResultNamed(result, nodeId, inputName);
-        return;
+        // Only use the node-tree path if all variable refs are group_input sockets.
+        // Module parameters (local Python variables) can't be linked as Blender nodes.
+        if (exprTreeHasOnlyGroupInputVars(tree)) {
+            auto result = emitExpressionNodeTree(tree);
+            connectExprResultNamed(result, nodeId, inputName);
+            return;
+        }
+        // Fall through to use pythonValue (evaluated at compile time)
     }
 
     if (isSimpleVariableRef(value)) {
@@ -599,6 +620,22 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
         std::string nodeId = newNodeId();
         emit("# Call module: " + node.name());
 
+        // If the module call has children (e.g. outline(wall=2) circle(15)),
+        // process them first to produce geometry that becomes children_geo
+        if (!node.children().empty()) {
+            emit("# Process children geometry for " + node.name());
+            std::string savedGeo = "saved_geo_" + std::to_string(node_counter_++);
+            emit(savedGeo + " = last_geo");
+            emit("last_geo = None");
+            for (auto& child : node.children()) {
+                if (!child->isDisabled() && !child->isBackground()) {
+                    child->accept(*this);
+                }
+            }
+            emit("children_geo_tmp = last_geo");
+            emit("last_geo = " + savedGeo);
+        }
+
         // Build argument list
         std::string argStr = "nodes, links, group_input, x_pos, y_pos";
 
@@ -609,7 +646,11 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
             }
         }
 
-        argStr += ", children_geo=last_geo";
+        if (!node.children().empty()) {
+            argStr += ", children_geo=children_geo_tmp";
+        } else {
+            argStr += ", children_geo=last_geo";
+        }
 
         emit(nodeId + ", y_pos = module_" + node.name() + "(" + argStr + ")");
         emit("last_geo = " + nodeId);
@@ -701,8 +742,8 @@ void BlenderGenerator::visit(AssignmentNode& node) {
 
 void BlenderGenerator::visit(ChildrenNode& node) {
     if (in_module_) {
-        emit("# children() - use passed geometry");
-        emit("# last_geo already contains children_geo");
+        emit("# children() - restore passed geometry");
+        emit("last_geo = children_geo");
     }
 }
 
@@ -1318,23 +1359,76 @@ void BlenderGenerator::emitMirror(const Arguments& args) {
 }
 
 void BlenderGenerator::emitOffset(const Arguments& args) {
-    // Note: Blender Geometry Nodes doesn't have a direct equivalent to OpenSCAD's offset()
-    // which expands/contracts 2D curves. We'll use a scale transform as an approximation,
-    // but this won't work correctly for all shapes.
-
     std::string nodeId = newNodeId();
 
-    // Get offset parameters
-    Value r = getArg(args, "r", getPositionalArg(args, 0, Value(1.0)));
+    Value r = getArg(args, "r", getPositionalArg(args, 0, Value()));
     Value delta = getArg(args, "delta", Value());
 
-    // Use the first available value
-    Value offsetVal = !r.isUndefined() ? r : (!delta.isUndefined() ? delta : Value(1.0));
+    // Determine offset value and whether to round corners
+    bool useRounding = !r.isUndefined();
+    Value offsetVal;
+    if (!r.isUndefined()) {
+        offsetVal = r;
+    } else if (!delta.isUndefined()) {
+        offsetVal = delta;
+    } else {
+        // Positional arg or default
+        offsetVal = getPositionalArg(args, 0, Value(1.0));
+    }
 
-    emit("# Offset (approximated - Blender has no direct curve offset node)");
-    emit("# OpenSCAD offset value: " + offsetVal.toPython());
-    emit("# Passing geometry through unchanged - manual adjustment may be needed");
-    emit("# For proper offset, consider using Blender's 'Offset Polygon' or custom node setup");
+    // Use toPython() for the Python value string — this preserves variable references
+    // (e.g., "wall / 2") that are valid Python inside module functions.
+    std::string offsetPython = offsetVal.isExpression() ?
+        offsetVal.toPython() : std::to_string(offsetVal.toNumber());
+
+    // Try to determine the numeric value for fillet decisions.
+    // This may return 0 for unresolvable module parameters, so we check
+    // whether the expression tree has only resolvable variables.
+    ExprNodePtr offsetTree = resolveExprTree(offsetVal);
+    bool canEvaluate = !offsetTree || !offsetTree->hasVariableRefs() ||
+                       exprTreeHasOnlyGroupInputVars(offsetTree);
+    double offsetNum = 0.0;
+    if (!canEvaluate) {
+        // Can't determine sign at compile time (e.g., module parameter).
+        // Skip fillet since we don't know if offset is positive.
+        offsetNum = 0.0;
+    } else {
+        offsetNum = offsetVal.isExpression() ? evaluateExpr(offsetVal) : offsetVal.toNumber();
+    }
+
+    emit("# Offset");
+
+    // Step 1: Fillet corners (only for r mode with positive offset)
+    if (useRounding && offsetNum > 0) {
+        std::string filletId = newNodeId();
+        emit(filletId + " = nodes.new('GeometryNodeFilletCurve')");
+        emit(filletId + ".location = (x_pos, y_pos)");
+        emitSetInputOrLink(filletId, "Radius", offsetVal, offsetPython);
+        emit(filletId + ".inputs['Count'].default_value = 8");
+        emit("link_nodes(links, last_geo, 'Curve', " + filletId + ", 'Curve')");
+        emit("last_geo = " + filletId);
+        emit("x_pos += 200");
+    }
+
+    // Step 2: Offset each point along its normal
+    std::string normalId = newNodeId();
+    emit(normalId + " = nodes.new('GeometryNodeInputNormal')");
+    emit(normalId + ".location = (x_pos, y_pos)");
+
+    std::string scaleId = newNodeId();
+    emit(scaleId + " = nodes.new('ShaderNodeVectorMath')");
+    emit(scaleId + ".operation = 'SCALE'");
+    emit(scaleId + ".location = (x_pos, y_pos)");
+    emit("links.new(" + normalId + ".outputs['Normal'], " + scaleId + ".inputs[0])");
+    emitSetInputOrLink(scaleId, "Scale", offsetVal, offsetPython);
+
+    std::string setposId = newNodeId();
+    emit(setposId + " = nodes.new('GeometryNodeSetPosition')");
+    emit(setposId + ".location = (x_pos, y_pos)");
+    emit("link_nodes(links, last_geo, 'Geometry', " + setposId + ", 'Geometry')");
+    emit("links.new(" + scaleId + ".outputs['Vector'], " + setposId + ".inputs['Offset'])");
+    emit("last_geo = " + setposId);
+    emit("x_pos += 200");
 }
 
 void BlenderGenerator::emitHull(const Arguments& args) {
@@ -1438,40 +1532,61 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
     emit("# " + opName);
 
+    // Helper: ensure geometry is mesh (fill curves for 2D boolean operands)
+    // Nodes like SetPosition, FilletCurve, CurvePrimitiveCircle, etc. may output
+    // curve geometry that needs to be filled before mesh boolean operations.
+    // We check the node type to decide if filling is needed.
+    std::string fillHelper = "ensure_mesh_" + std::to_string(boolScopeId);
+    emit("def " + fillHelper + "(geo_node):");
+    indent_++;
+    emit("\"\"\"Fill curve geometry for boolean input\"\"\"");
+    emit("nonlocal x_pos, y_pos");
+    emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+    emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+    emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
+    emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
+    emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment'}");
+    emit("if geo_node is not None and geo_node.bl_idname in curve_types:");
+    indent_++;
+    emit("fill = nodes.new('GeometryNodeFillCurve')");
+    emit("fill.location = (x_pos, y_pos)");
+    emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
+    emit("x_pos += 200");
+    emit("return fill");
+    indent_--;
+    emit("return geo_node");
+    indent_--;
+
     // Process first child
     std::string firstGeo = "bool_first_" + std::to_string(boolScopeId);
     emit(firstGeo + " = None");
 
     actualChildren[0]->accept(*this);
+    emit("last_geo = " + fillHelper + "(last_geo)");
     emit(firstGeo + " = last_geo");
 
     // Process remaining children and combine
     for (size_t i = 1; i < actualChildren.size(); ++i) {
         actualChildren[i]->accept(*this);
 
+        emit("last_geo = " + fillHelper + "(last_geo)");
+
         std::string boolId = newNodeId();
         emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
         emit(boolId + ".location = (x_pos, y_pos)");
         emit(boolId + ".operation = '" + blenderOp + "'");
-        emit("# Connect first geometry to Mesh 1 (or first Mesh input)");
-        emit("try:");
-        indent_++;
-        emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs['Mesh 1'])");
-        indent_--;
-        emit("except:");
-        indent_++;
-        emit("# Blender 4.x uses different input names");
-        emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[0])");
-        indent_--;
-        emit("# Connect second geometry to Mesh 2");
-        emit("try:");
-        indent_++;
-        emit("links.new(last_geo.outputs[0], " + boolId + ".inputs['Mesh 2'])");
-        indent_--;
-        emit("except:");
-        indent_++;
-        emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
-        indent_--;
+
+        // Blender 5.x boolean: inputs[0] = 'Mesh 1' (single), inputs[1] = 'Mesh' (multi-input)
+        // DIFFERENCE: first operand -> inputs[0], rest -> inputs[1]
+        // INTERSECT/UNION: all operands -> inputs[1] (multi-input)
+        if (blenderOp == "DIFFERENCE") {
+            emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[0])");
+            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+        } else {
+            // INTERSECT and UNION: both go to multi-input Mesh (index 1)
+            emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[1])");
+            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+        }
         emit(firstGeo + " = " + boolId);
         emit("x_pos += 200");
         emit("y_pos -= 50");
@@ -1498,21 +1613,38 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
     emit("link_nodes(links, last_geo, 'Curve', " + fillId + ", 'Curve')");
     emit("x_pos += 200");
 
-    // Then extrude
+    // Extrude with Individual=False for proper solid extrusion
     emit(nodeId + " = nodes.new('GeometryNodeExtrudeMesh')");
     emit(nodeId + ".location = (x_pos, y_pos)");
-    // Set offset — height is the Z component of the offset vector
+    emit(nodeId + ".inputs['Individual'].default_value = False");
+
+    // Set offset direction (0,0,1) and use Offset Scale for height
+    emit(nodeId + ".inputs['Offset'].default_value = (0, 0, 1)");
     ExprNodePtr heightTree = getOrMakeLiteralTree(height);
     if (heightTree->hasVariableRefs()) {
-        emitScalarToVectorInput(nodeId, "Offset", heightTree, 2, 0.0, 0.0, 0.0);
+        auto result = emitExpressionNodeTree(heightTree);
+        connectExprResultNamed(result, nodeId, "Offset Scale");
     } else {
-        emit(nodeId + ".inputs['Offset'].default_value = (0, 0, " +
-             std::to_string(height.toNumber()) + ")");
+        emit(nodeId + ".inputs['Offset Scale'].default_value = " +
+             std::to_string(height.toNumber()));
     }
     emit("link_nodes(links, " + fillId + ", 'Mesh', " + nodeId + ", 'Mesh')");
-
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
+
+    // Handle scale parameter — scale the top face
+    double scaleNum = scale_val.isExpression() ? evaluateExpr(scale_val) : scale_val.toNumber();
+    if (scaleNum != 1.0) {
+        std::string scaleId = newNodeId();
+        emit("# Scale top face for linear_extrude(scale=" + std::to_string(scaleNum) + ")");
+        emit(scaleId + " = nodes.new('GeometryNodeScaleElements')");
+        emit(scaleId + ".location = (x_pos, y_pos)");
+        emit(scaleId + ".inputs['Scale'].default_value = " + std::to_string(scaleNum));
+        emit("links.new(" + nodeId + ".outputs['Mesh'], " + scaleId + ".inputs['Geometry'])");
+        emit("links.new(" + nodeId + ".outputs['Top'], " + scaleId + ".inputs['Selection'])");
+        emit("last_geo = " + scaleId);
+        emit("x_pos += 200");
+    }
 }
 
 void BlenderGenerator::emitRotateExtrude(const Arguments& args) {

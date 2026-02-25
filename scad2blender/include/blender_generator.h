@@ -110,6 +110,9 @@ private:
     // Helper to check if a value is a simple variable reference (no operators)
     bool isSimpleVariableRef(const Value& value);
 
+    // Helper to check if all VarRefs in a tree are group_input sockets
+    bool exprTreeHasOnlyGroupInputVars(const ExprNodePtr& tree);
+
     // Helper to set input or create link from group_input for expressions
     void emitSetInputOrLink(const std::string& nodeId, const std::string& inputName,
                             const Value& value, const std::string& pythonValue);
