@@ -128,6 +128,8 @@ private:
     ExprNodePtr resolveExprTree(const Value& value);
     bool vectorHasExprTrees(const Value& v);
     void collectGroupInputVars(ASTNode& node);
+    void collectModulesRecursive(ASTNode* node);
+    void emitModulesRecursive(ASTNode* node);
 
     // Helper to evaluate an expression Value to a numeric result by resolving variable refs
     double evaluateExpr(const Value& value);

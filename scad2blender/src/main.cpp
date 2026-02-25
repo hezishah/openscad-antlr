@@ -17,6 +17,7 @@
 extern int yyparse();
 extern FILE* yyin;
 extern scad2blender::ASTNodePtr g_root;
+extern void prescan_variables(FILE* f);
 
 void printUsage(const char* program) {
     std::cerr << "Usage: " << program << " [options] <input.scad> [output.py]\n"
@@ -84,6 +85,9 @@ int main(int argc, char* argv[]) {
 
     // Set up lexer input
     yyin = input;
+
+    // Pre-scan for top-level variable assignments (OpenSCAD hoists these)
+    prescan_variables(input);
 
     // Parse the input
     int parseResult = yyparse();

@@ -25,14 +25,10 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
     emitHeader();
     emitHelperFunctions();
 
-    // First pass: collect modules and variables
+    // First pass: collect modules (recursively, to find nested modules) and variables
     for (auto& child : root->children()) {
-        if (child->type() == ASTNode::Type::Module) {
-            auto* mod = dynamic_cast<ModuleNode*>(child.get());
-            if (mod) {
-                defined_modules_.insert(mod->name());
-            }
-        } else if (child->type() == ASTNode::Type::Assignment) {
+        collectModulesRecursive(child.get());
+        if (child->type() == ASTNode::Type::Assignment) {
             auto* assign = dynamic_cast<AssignmentNode*>(child.get());
             if (assign) {
                 variables_[assign->name()] = assign->value();
@@ -43,7 +39,7 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
 
     emitVariables();
 
-    // Pre-scan all modules to collect variables that will become group_input sockets
+    // Pre-scan all modules (recursively) to collect variables that will become group_input sockets
     // This must happen before emitting module functions so resolveExprTree knows
     // which variables should be group_input leaf nodes
     for (auto& child : root->children()) {
@@ -63,14 +59,9 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
         }
     }
 
-    // Emit module functions
+    // Emit module functions (recursively, to emit nested modules too)
     for (auto& child : root->children()) {
-        if (child->type() == ASTNode::Type::Module) {
-            auto* mod = dynamic_cast<ModuleNode*>(child.get());
-            if (mod) {
-                emitModuleFunction(*mod);
-            }
-        }
+        emitModulesRecursive(child.get());
     }
 
     // Emit main build_geometry function
@@ -2138,6 +2129,32 @@ void BlenderGenerator::emitScalarToAllVectorComponents(const std::string& target
     }
 
     emit("links.new(" + combineId + ".outputs['Vector'], " + targetNodeId + ".inputs['" + inputName + "'])");
+}
+
+void BlenderGenerator::collectModulesRecursive(ASTNode* node) {
+    if (!node) return;
+    if (node->type() == ASTNode::Type::Module) {
+        auto* mod = dynamic_cast<ModuleNode*>(node);
+        if (mod) {
+            defined_modules_.insert(mod->name());
+        }
+    }
+    for (auto& child : node->children()) {
+        collectModulesRecursive(child.get());
+    }
+}
+
+void BlenderGenerator::emitModulesRecursive(ASTNode* node) {
+    if (!node) return;
+    if (node->type() == ASTNode::Type::Module) {
+        auto* mod = dynamic_cast<ModuleNode*>(node);
+        if (mod) {
+            emitModuleFunction(*mod);
+        }
+    }
+    for (auto& child : node->children()) {
+        emitModulesRecursive(child.get());
+    }
 }
 
 void BlenderGenerator::collectGroupInputVars(ASTNode& node) {

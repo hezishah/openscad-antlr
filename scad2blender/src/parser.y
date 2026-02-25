@@ -64,6 +64,126 @@ static Value lookup_variable(const std::string& name) {
 static void set_variable(const std::string& name, const Value& val) {
     current_scope()[name] = val;
 }
+
+// Pre-scan file for simple top-level assignments (id = true/false/number ;)
+// This implements OpenSCAD's "hoisted" variable semantics so that ternaries
+// evaluated before the assignment line still see the correct value.
+void prescan_variables(FILE* f) {
+    // Save current position
+    long saved = ftell(f);
+    rewind(f);
+
+    // Simple state machine to find patterns like: ID = VALUE ;
+    // at the top level (not inside braces)
+    int brace_depth = 0;
+    int c;
+    std::string token;
+    enum { IDLE, GOT_ID, GOT_EQ, GOT_VAL } state = IDLE;
+    std::string current_id;
+    std::string current_val;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+    int prev_c = 0;
+
+    while ((c = fgetc(f)) != EOF) {
+        // Handle comments
+        if (in_line_comment) {
+            if (c == '\n') in_line_comment = false;
+            prev_c = c;
+            continue;
+        }
+        if (in_block_comment) {
+            if (prev_c == '*' && c == '/') in_block_comment = false;
+            prev_c = c;
+            continue;
+        }
+        if (prev_c == '/' && c == '/') { in_line_comment = true; prev_c = c; continue; }
+        if (prev_c == '/' && c == '*') { in_block_comment = true; prev_c = c; continue; }
+
+        if (c == '{') { brace_depth++; state = IDLE; prev_c = c; continue; }
+        if (c == '}') { brace_depth--; state = IDLE; prev_c = c; continue; }
+
+        // Only process top-level assignments
+        if (brace_depth > 0) { prev_c = c; continue; }
+
+        if (state == IDLE) {
+            if (isalpha(c) || c == '_' || c == '$') {
+                token.clear();
+                token += (char)c;
+                state = GOT_ID;
+            }
+        } else if (state == GOT_ID) {
+            if (isalnum(c) || c == '_') {
+                token += (char)c;
+            } else if (c == '=' && !token.empty()) {
+                current_id = token;
+                current_val.clear();
+                state = GOT_EQ;
+            } else if (c == '(' || c == '{') {
+                // This is a function/module call, not assignment
+                if (c == '{') brace_depth++;
+                state = IDLE;
+            } else if (!isspace(c)) {
+                state = IDLE;
+            }
+        } else if (state == GOT_EQ) {
+            if (isspace(c)) {
+                if (current_val.empty()) { prev_c = c; continue; }
+                // whitespace after value - stay in GOT_VAL
+                state = GOT_VAL;
+            } else if (c == ';') {
+                // End of assignment
+                std::string val = current_val.empty() ? "" : current_val;
+                // Trim
+                while (!val.empty() && isspace(val.back())) val.pop_back();
+                if (val == "true") {
+                    set_variable(current_id, Value(true));
+                } else if (val == "false") {
+                    set_variable(current_id, Value(false));
+                } else {
+                    // Try to parse as number
+                    try {
+                        size_t pos;
+                        double d = std::stod(val, &pos);
+                        if (pos == val.size()) {
+                            set_variable(current_id, Value(d));
+                        }
+                    } catch (...) {}
+                }
+                state = IDLE;
+            } else {
+                current_val += (char)c;
+                state = GOT_EQ; // stay in GOT_EQ while collecting value chars
+            }
+        } else if (state == GOT_VAL) {
+            if (c == ';') {
+                std::string val = current_val;
+                while (!val.empty() && isspace(val.back())) val.pop_back();
+                if (val == "true") {
+                    set_variable(current_id, Value(true));
+                } else if (val == "false") {
+                    set_variable(current_id, Value(false));
+                } else {
+                    try {
+                        size_t pos;
+                        double d = std::stod(val, &pos);
+                        if (pos == val.size()) {
+                            set_variable(current_id, Value(d));
+                        }
+                    } catch (...) {}
+                }
+                state = IDLE;
+            } else if (!isspace(c)) {
+                // More value chars after whitespace - complex expression, abort
+                state = IDLE;
+            }
+        }
+        prev_c = c;
+    }
+
+    // Restore file position
+    fseek(f, saved, SEEK_SET);
+}
 %}
 
 %union {
@@ -698,7 +818,15 @@ expr:
         delete $1; delete $3;
     }
     | expr '?' expr ':' expr {
-        bool cond = $1->toBool();
+        // Try to resolve variable reference for ternary condition
+        Value condVal = *$1;
+        if ($1->isExpression()) {
+            Value resolved = lookup_variable($1->toString());
+            if (!resolved.isUndefined()) {
+                condVal = resolved;
+            }
+        }
+        bool cond = condVal.toBool();
         delete $1;
         if (cond) { $$ = $3; delete $5; }
         else      { $$ = $5; delete $3; }
