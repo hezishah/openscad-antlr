@@ -691,8 +691,34 @@ void BlenderGenerator::visit(IfElseNode& node) {
     emit("# Conditional");
     const Value& cond = node.condition();
 
+    // Try to resolve condition to a concrete boolean
+    bool resolved = false;
+    bool condValue = false;
+
     if (cond.isBool()) {
-        if (cond.toBool()) {
+        resolved = true;
+        condValue = cond.toBool();
+    } else if (cond.isNumber()) {
+        resolved = true;
+        condValue = (cond.toNumber() != 0.0);
+    } else if (cond.isExpression()) {
+        // Try to resolve variable reference from variables_ map
+        const std::string& expr = cond.toString();
+        auto it = variables_.find(expr);
+        if (it != variables_.end()) {
+            const Value& val = it->second;
+            if (val.isBool()) {
+                resolved = true;
+                condValue = val.toBool();
+            } else if (val.isNumber()) {
+                resolved = true;
+                condValue = (val.toNumber() != 0.0);
+            }
+        }
+    }
+
+    if (resolved) {
+        if (condValue) {
             emit("# if (true):");
             for (auto& child : node.children()) {
                 child->accept(*this);
@@ -700,6 +726,10 @@ void BlenderGenerator::visit(IfElseNode& node) {
         } else if (node.elseBranch()) {
             emit("# if (false) - else branch:");
             node.elseBranch()->accept(*this);
+        } else {
+            // Condition is false and no else branch — signal no geometry produced
+            // so parent boolean operations can skip this child
+            emit("last_geo = None");
         }
     } else {
         // Runtime condition - emit both branches
@@ -860,7 +890,7 @@ void BlenderGenerator::emitSphere(const Arguments& args) {
 
     Value r = getArg(args, "r", getPositionalArg(args, 0, Value(1.0)));
     Value d = getArg(args, "d", Value());
-    Value fn = getArg(args, "$fn", Value(32.0));
+    Value fn = resolveFn(args);
 
     // Determine which value to use for radius
     Value radiusValue = r;
@@ -879,11 +909,12 @@ void BlenderGenerator::emitSphere(const Arguments& args) {
     emitSetInputOrLink(nodeId, "Radius", radiusValue, radiusPython);
 
     // Segments and Rings from $fn
-    emitSetInputOrLink(nodeId, "Segments", fn, std::to_string(static_cast<int>(fn.toNumber())));
+    int fnVal = static_cast<int>(evaluateExpr(fn));
+    emitSetInputOrLink(nodeId, "Segments", fn, std::to_string(fnVal));
 
     // Rings = fn / 2 — build expression tree
     Value ringsValue = makeDivisionValue(fn, 2.0);
-    emitSetInputOrLink(nodeId, "Rings", ringsValue, std::to_string(static_cast<int>(fn.toNumber()) / 2));
+    emitSetInputOrLink(nodeId, "Rings", ringsValue, std::to_string(fnVal / 2));
 
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
@@ -901,7 +932,7 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
     Value d1 = getArg(args, "d1", Value());
     Value d2 = getArg(args, "d2", Value());
     Value center = getArg(args, "center", Value(false));
-    Value fn = getArg(args, "$fn", Value(32.0));
+    Value fn = resolveFn(args);
 
     // Use Cone node to support different top/bottom radii
     emit("# Cylinder (using Cone for radius support)");
@@ -953,29 +984,34 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
     emitSetInputOrLink(nodeId, "Radius Bottom", radiusBottom, radiusBottomPython);
 
     // Handle $fn
-    emitSetInputOrLink(nodeId, "Vertices", fn, std::to_string(static_cast<int>(fn.toNumber())));
+    emitSetInputOrLink(nodeId, "Vertices", fn, std::to_string(static_cast<int>(evaluateExpr(fn))));
 
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
     emit("y_pos -= 50");
 
-    // Handle center=false
-    if (!center.toBool() && !isSimpleVariableRef(center)) {
+    // Handle center parameter
+    // Blender's MeshCone already places bottom at Z=0 and top at Z=Depth,
+    // which matches OpenSCAD's center=false behavior.
+    // For center=true, we need to translate by -h/2 to center it.
+    if (center.toBool() || isSimpleVariableRef(center)) {
         emitBlank();
-        emit("# Translate for center=false");
+        emit("# Translate for center=true");
         std::string transId = newNodeId();
         emit(transId + " = nodes.new('GeometryNodeTransform')");
         emit(transId + ".location = (x_pos, y_pos)");
 
         ExprNodePtr hTree = getOrMakeLiteralTree(h);
         if (hTree && hTree->hasVariableRefs()) {
-            // Build h / 2 expression tree and emit as Z component of CombineXYZ
-            ExprNodePtr halfH = ExprNode::makeBinary(
-                ExprNode::Op::DIVIDE, hTree, ExprNode::makeLiteral(2.0));
-            emitScalarToVectorInput(transId, "Translation", halfH, 2, 0.0, 0.0, 0.0);
+            // Build -h / 2 expression tree and emit as Z component of CombineXYZ
+            ExprNodePtr negHalfH = ExprNode::makeBinary(
+                ExprNode::Op::DIVIDE,
+                ExprNode::makeUnary(ExprNode::Op::NEGATE, hTree),
+                ExprNode::makeLiteral(2.0));
+            emitScalarToVectorInput(transId, "Translation", negHalfH, 2, 0.0, 0.0, 0.0);
         } else {
             emit(transId + ".inputs['Translation'].default_value = (0, 0, " +
-                 std::to_string(h.toNumber() / 2) + ")");
+                 std::to_string(-h.toNumber() / 2) + ")");
         }
 
         emit("link_nodes(links, last_geo, 'Mesh', " + transId + ", 'Geometry')");
@@ -989,7 +1025,7 @@ void BlenderGenerator::emitCircle(const Arguments& args) {
 
     Value r = getArg(args, "r", getPositionalArg(args, 0, Value(1.0)));
     Value d = getArg(args, "d", Value());
-    Value fn = getArg(args, "$fn", Value(32.0));
+    Value fn = resolveFn(args);
 
     // Determine radius value
     Value radiusValue = r;
@@ -1020,7 +1056,7 @@ void BlenderGenerator::emitCircle(const Arguments& args) {
         emit("links.new(group_input.outputs['" + socketName + "'], " + nodeId + ".inputs['Resolution'])");
     } else {
         emit(nodeId + ".inputs['Resolution'].default_value = " +
-             std::to_string(static_cast<int>(fn.toNumber())));
+             std::to_string(static_cast<int>(evaluateExpr(fn))));
     }
 
     emit("last_geo = " + nodeId);
@@ -1150,7 +1186,10 @@ void BlenderGenerator::emitPolyhedron(const Arguments& args) {
     }
     vertsCode += "]";
 
-    // Generate faces as Python list
+    // Generate faces as Python list.
+    // OpenSCAD uses CW winding (outward normals follow left-hand rule),
+    // but Blender's from_pydata expects CCW winding (right-hand rule).
+    // Reverse vertex order in each face to fix normals.
     std::string facesCode = "[";
     if (faces.isVector()) {
         for (size_t i = 0; i < faces.size(); ++i) {
@@ -1158,9 +1197,10 @@ void BlenderGenerator::emitPolyhedron(const Arguments& args) {
             if (face.isVector()) {
                 if (i > 0) facesCode += ", ";
                 facesCode += "(";
-                for (size_t j = 0; j < face.size(); ++j) {
-                    if (j > 0) facesCode += ", ";
-                    facesCode += face[j].toPython();
+                // Reverse vertex order for correct normals
+                for (size_t j = face.size(); j > 0; --j) {
+                    if (j < face.size()) facesCode += ", ";
+                    facesCode += face[j - 1].toPython();
                 }
                 facesCode += ")";
             }
@@ -1364,15 +1404,15 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
     Value r = getArg(args, "r", getPositionalArg(args, 0, Value()));
     Value delta = getArg(args, "delta", Value());
 
-    // Determine offset value and whether to round corners
-    bool useRounding = !r.isUndefined();
+    // Determine offset value and whether to use corner rounding (r mode vs delta mode)
+    bool useRounding = !r.isUndefined() || delta.isUndefined();
     Value offsetVal;
     if (!r.isUndefined()) {
         offsetVal = r;
     } else if (!delta.isUndefined()) {
         offsetVal = delta;
     } else {
-        // Positional arg or default
+        // Positional arg defaults to r mode
         offsetVal = getPositionalArg(args, 0, Value(1.0));
     }
 
@@ -1381,45 +1421,79 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
     std::string offsetPython = offsetVal.isExpression() ?
         offsetVal.toPython() : std::to_string(offsetVal.toNumber());
 
-    // Try to determine the numeric value for fillet decisions.
-    // This may return 0 for unresolvable module parameters, so we check
-    // whether the expression tree has only resolvable variables.
-    ExprNodePtr offsetTree = resolveExprTree(offsetVal);
-    bool canEvaluate = !offsetTree || !offsetTree->hasVariableRefs() ||
-                       exprTreeHasOnlyGroupInputVars(offsetTree);
-    double offsetNum = 0.0;
-    if (!canEvaluate) {
-        // Can't determine sign at compile time (e.g., module parameter).
-        // Skip fillet since we don't know if offset is positive.
-        offsetNum = 0.0;
-    } else {
-        offsetNum = offsetVal.isExpression() ? evaluateExpr(offsetVal) : offsetVal.toNumber();
-    }
+    // Resolve $fn for corner rounding segments
+    Value fn = resolveFn(args);
+    int fnVal = static_cast<int>(evaluateExpr(fn));
 
     emit("# Offset");
 
-    // Step 1: Fillet corners (only for r mode with positive offset)
-    if (useRounding && offsetNum > 0) {
-        std::string filletId = newNodeId();
-        emit(filletId + " = nodes.new('GeometryNodeFilletCurve')");
-        emit(filletId + ".location = (x_pos, y_pos)");
-        emitSetInputOrLink(filletId, "Radius", offsetVal, offsetPython);
-        emit(filletId + ".inputs['Count'].default_value = 8");
-        emit("link_nodes(links, last_geo, 'Curve', " + filletId + ", 'Curve')");
-        emit("last_geo = " + filletId);
+    if (useRounding) {
+        // r mode: subdivide to add intermediate points, then offset outward.
+        // SubdivideCurve adds $fn/4 midpoints per edge segment. Combined with
+        // the tangent-perpendicular offset, this approximates the rounded corners
+        // of OpenSCAD's offset(r=R) with $fn-controlled resolution.
+        std::string subdivId = newNodeId();
+        emit(subdivId + " = nodes.new('GeometryNodeSubdivideCurve')");
+        emit(subdivId + ".location = (x_pos, y_pos)");
+
+        // Use $fn/4 cuts per edge for corner resolution
+        ExprNodePtr fnTree = getOrMakeLiteralTree(fn);
+        if (fnTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(fnTree)) {
+            ExprNodePtr cutsTree = ExprNode::makeBinary(
+                ExprNode::Op::DIVIDE, fnTree, ExprNode::makeLiteral(4.0));
+            auto result = emitExpressionNodeTree(cutsTree);
+            connectExprResultNamed(result, subdivId, "Cuts");
+        } else {
+            int cuts = fnVal / 4;
+            if (cuts < 1) cuts = 1;
+            emit(subdivId + ".inputs['Cuts'].default_value = " + std::to_string(cuts));
+        }
+
+        emit("link_nodes(links, last_geo, 'Curve', " + subdivId + ", 'Curve')");
+        emit("last_geo = " + subdivId);
+        emit("x_pos += 200");
+    } else {
+        // delta mode: subdivide straight edges for smooth offset without corner rounding.
+        std::string subdivId = newNodeId();
+        emit(subdivId + " = nodes.new('GeometryNodeSubdivideCurve')");
+        emit(subdivId + ".location = (x_pos, y_pos)");
+
+        // Use $fn/4 cuts per edge for consistent resolution
+        int cuts = fnVal / 4;
+        if (cuts < 1) cuts = 1;
+        emit(subdivId + ".inputs['Cuts'].default_value = " + std::to_string(cuts));
+        emit("link_nodes(links, last_geo, 'Curve', " + subdivId + ", 'Curve')");
+        emit("last_geo = " + subdivId);
         emit("x_pos += 200");
     }
 
-    // Step 2: Offset each point along its normal
-    std::string normalId = newNodeId();
-    emit(normalId + " = nodes.new('GeometryNodeInputNormal')");
-    emit(normalId + ".location = (x_pos, y_pos)");
+    // Offset each point perpendicular to the curve tangent.
+    // For a 2D curve in the XY plane, cross(Tangent, Z) gives the outward
+    // perpendicular direction. Scaling by the offset amount moves each point
+    // outward (positive) or inward (negative).
+    std::string tangentId = newNodeId();
+    emit(tangentId + " = nodes.new('GeometryNodeInputTangent')");
+    emit(tangentId + ".location = (x_pos, y_pos)");
+
+    std::string crossId = newNodeId();
+    emit(crossId + " = nodes.new('ShaderNodeVectorMath')");
+    emit(crossId + ".operation = 'CROSS_PRODUCT'");
+    emit(crossId + ".location = (x_pos, y_pos)");
+    emit("links.new(" + tangentId + ".outputs['Tangent'], " + crossId + ".inputs[0])");
+
+    std::string zAxisId = newNodeId();
+    emit(zAxisId + " = nodes.new('ShaderNodeCombineXYZ')");
+    emit(zAxisId + ".location = (x_pos, y_pos)");
+    emit(zAxisId + ".inputs['X'].default_value = 0");
+    emit(zAxisId + ".inputs['Y'].default_value = 0");
+    emit(zAxisId + ".inputs['Z'].default_value = 1");
+    emit("links.new(" + zAxisId + ".outputs['Vector'], " + crossId + ".inputs[1])");
 
     std::string scaleId = newNodeId();
     emit(scaleId + " = nodes.new('ShaderNodeVectorMath')");
     emit(scaleId + ".operation = 'SCALE'");
     emit(scaleId + ".location = (x_pos, y_pos)");
-    emit("links.new(" + normalId + ".outputs['Normal'], " + scaleId + ".inputs[0])");
+    emit("links.new(" + crossId + ".outputs['Vector'], " + scaleId + ".inputs[0])");
     emitSetInputOrLink(scaleId, "Scale", offsetVal, offsetPython);
 
     std::string setposId = newNodeId();
@@ -1532,21 +1606,28 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
     emit("# " + opName);
 
-    // Helper: ensure geometry is mesh (fill curves for 2D boolean operands)
-    // Nodes like SetPosition, FilletCurve, CurvePrimitiveCircle, etc. may output
-    // curve geometry that needs to be filled before mesh boolean operations.
-    // We check the node type to decide if filling is needed.
+    // Helper: check if a node outputs curve geometry (2D)
+    std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
+    emit("def " + isCurveHelper + "(geo_node):");
+    indent_++;
+    emit("if geo_node is None: return False");
+    emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+    emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+    emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
+    emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
+    emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
+    emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
+    emit("               'GeometryNodeJoinGeometry'}");
+    emit("return geo_node.bl_idname in curve_types");
+    indent_--;
+
+    // Helper: ensure geometry is mesh (fill curves for 3D boolean operands)
     std::string fillHelper = "ensure_mesh_" + std::to_string(boolScopeId);
     emit("def " + fillHelper + "(geo_node):");
     indent_++;
     emit("\"\"\"Fill curve geometry for boolean input\"\"\"");
     emit("nonlocal x_pos, y_pos");
-    emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
-    emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
-    emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
-    emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
-    emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment'}");
-    emit("if geo_node is not None and geo_node.bl_idname in curve_types:");
+    emit("if " + isCurveHelper + "(geo_node):");
     indent_++;
     emit("fill = nodes.new('GeometryNodeFillCurve')");
     emit("fill.location = (x_pos, y_pos)");
@@ -1562,34 +1643,79 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
     emit(firstGeo + " = None");
 
     actualChildren[0]->accept(*this);
-    emit("last_geo = " + fillHelper + "(last_geo)");
-    emit(firstGeo + " = last_geo");
 
-    // Process remaining children and combine
-    for (size_t i = 1; i < actualChildren.size(); ++i) {
-        actualChildren[i]->accept(*this);
+    if (blenderOp == "DIFFERENCE") {
+        // For DIFFERENCE, check at runtime if operands are 2D curves.
+        // If so, use curve-join-with-reverse to create a multi-spline curve
+        // with holes, which FillCurve handles correctly (proper inner walls).
+        // Otherwise fall back to mesh boolean.
+        emit(firstGeo + " = last_geo");
 
-        emit("last_geo = " + fillHelper + "(last_geo)");
+        for (size_t i = 1; i < actualChildren.size(); ++i) {
+            actualChildren[i]->accept(*this);
 
-        std::string boolId = newNodeId();
-        emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
-        emit(boolId + ".location = (x_pos, y_pos)");
-        emit(boolId + ".operation = '" + blenderOp + "'");
+            // Skip boolean if child produced no geometry (e.g. false conditional)
+            emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+            indent_++;
 
-        // Blender 5.x boolean: inputs[0] = 'Mesh 1' (single), inputs[1] = 'Mesh' (multi-input)
-        // DIFFERENCE: first operand -> inputs[0], rest -> inputs[1]
-        // INTERSECT/UNION: all operands -> inputs[1] (multi-input)
-        if (blenderOp == "DIFFERENCE") {
+            // Runtime check: if both first and current are curves, use curve difference
+            emit("if " + isCurveHelper + "(" + firstGeo + ") and " + isCurveHelper + "(last_geo):");
+            indent_++;
+            // Reverse the subtracted curve so FillCurve treats it as a hole
+            std::string revId = newNodeId();
+            emit(revId + " = nodes.new('GeometryNodeReverseCurve')");
+            emit(revId + ".location = (x_pos, y_pos)");
+            emit("link_nodes(links, last_geo, 'Curve', " + revId + ", 'Curve')");
+            std::string joinId = newNodeId();
+            emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+            emit(joinId + ".location = (x_pos, y_pos)");
+            emit("link_nodes(links, " + firstGeo + ", 'Curve', " + joinId + ", 'Geometry')");
+            emit("link_nodes(links, " + revId + ", 'Curve', " + joinId + ", 'Geometry')");
+            emit(firstGeo + " = " + joinId);
+            emit("x_pos += 200");
+            indent_--;
+            emit("else:");
+            indent_++;
+            // 3D path: use mesh boolean
+            emit(firstGeo + " = " + fillHelper + "(" + firstGeo + ")");
+            emit("last_geo = " + fillHelper + "(last_geo)");
+            std::string boolId = newNodeId();
+            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+            emit(boolId + ".location = (x_pos, y_pos)");
+            emit(boolId + ".operation = 'DIFFERENCE'");
             emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[0])");
             emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
-        } else {
-            // INTERSECT and UNION: both go to multi-input Mesh (index 1)
+            emit(firstGeo + " = " + boolId);
+            emit("x_pos += 200");
+            indent_--;
+            indent_--;
+            emit("y_pos -= 50");
+        }
+    } else {
+        // UNION and INTERSECT: always use mesh boolean
+        emit("last_geo = " + fillHelper + "(last_geo)");
+        emit(firstGeo + " = last_geo");
+
+        for (size_t i = 1; i < actualChildren.size(); ++i) {
+            actualChildren[i]->accept(*this);
+
+            // Skip boolean if child produced no geometry (e.g. false conditional)
+            emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+            indent_++;
+            emit("last_geo = " + fillHelper + "(last_geo)");
+
+            std::string boolId = newNodeId();
+            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+            emit(boolId + ".location = (x_pos, y_pos)");
+            emit(boolId + ".operation = '" + blenderOp + "'");
+
             emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[1])");
             emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+            emit(firstGeo + " = " + boolId);
+            emit("x_pos += 200");
+            emit("y_pos -= 50");
+            indent_--;
         }
-        emit(firstGeo + " = " + boolId);
-        emit("x_pos += 200");
-        emit("y_pos -= 50");
     }
 
     emit("last_geo = " + firstGeo);
@@ -1606,12 +1732,24 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
 
     emit("# Linear Extrude");
 
-    // First fill the curve
+    // Fill the curve to create a mesh face for extrusion.
+    // We need two fills: one becomes the bottom cap (flipped normals),
+    // one gets extruded to create sides + top.
     std::string fillId = newNodeId();
     emit(fillId + " = nodes.new('GeometryNodeFillCurve')");
     emit(fillId + ".location = (x_pos, y_pos)");
     emit("link_nodes(links, last_geo, 'Curve', " + fillId + ", 'Curve')");
     emit("x_pos += 200");
+
+    // Bottom cap: fill the same curve again and flip normals to face downward
+    std::string fillBottomId = newNodeId();
+    emit(fillBottomId + " = nodes.new('GeometryNodeFillCurve')");
+    emit(fillBottomId + ".location = (x_pos, y_pos - 200)");
+    emit("link_nodes(links, last_geo, 'Curve', " + fillBottomId + ", 'Curve')");
+    std::string flipId = newNodeId();
+    emit(flipId + " = nodes.new('GeometryNodeFlipFaces')");
+    emit(flipId + ".location = (x_pos, y_pos - 200)");
+    emit("links.new(" + fillBottomId + ".outputs['Mesh'], " + flipId + ".inputs['Mesh'])");
 
     // Extrude with Individual=False for proper solid extrusion
     emit(nodeId + " = nodes.new('GeometryNodeExtrudeMesh')");
@@ -1629,8 +1767,10 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
              std::to_string(height.toNumber()));
     }
     emit("link_nodes(links, " + fillId + ", 'Mesh', " + nodeId + ", 'Mesh')");
-    emit("last_geo = " + nodeId);
     emit("x_pos += 200");
+
+    // Track the last node from the extrude chain (may be ScaleElements or ExtrudeMesh)
+    std::string extrudeLastId = nodeId;
 
     // Handle scale parameter — scale the top face
     double scaleNum = scale_val.isExpression() ? evaluateExpr(scale_val) : scale_val.toNumber();
@@ -1642,16 +1782,30 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         emit(scaleId + ".inputs['Scale'].default_value = " + std::to_string(scaleNum));
         emit("links.new(" + nodeId + ".outputs['Mesh'], " + scaleId + ".inputs['Geometry'])");
         emit("links.new(" + nodeId + ".outputs['Top'], " + scaleId + ".inputs['Selection'])");
-        emit("last_geo = " + scaleId);
+        extrudeLastId = scaleId;
         emit("x_pos += 200");
     }
+
+    // Join bottom cap with extruded mesh and merge overlapping vertices
+    std::string joinId = newNodeId();
+    emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+    emit(joinId + ".location = (x_pos, y_pos)");
+    emit("links.new(" + flipId + ".outputs['Mesh'], " + joinId + ".inputs['Geometry'])");
+    emit("link_nodes(links, " + extrudeLastId + ", 'Geometry', " + joinId + ", 'Geometry')");
+    std::string mergeId = newNodeId();
+    emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
+    emit(mergeId + ".location = (x_pos, y_pos)");
+    emit(mergeId + ".inputs['Distance'].default_value = 0.001");
+    emit("links.new(" + joinId + ".outputs['Geometry'], " + mergeId + ".inputs['Geometry'])");
+    emit("last_geo = " + mergeId);
+    emit("x_pos += 200");
 }
 
 void BlenderGenerator::emitRotateExtrude(const Arguments& args) {
     std::string nodeId = newNodeId();
 
     Value angle = getArg(args, "angle", Value(360.0));
-    Value fn = getArg(args, "$fn", Value(32.0));
+    Value fn = resolveFn(args);
 
     emit("# Rotate Extrude (Lathe/Revolution)");
     emit("# Note: Blender doesn't have direct equivalent - using curve to mesh");
@@ -1860,6 +2014,27 @@ std::string BlenderGenerator::emitVectorWithExprTrees(const std::string& targetN
 
     emit("links.new(" + combineId + ".outputs['Vector'], " + targetNodeId + ".inputs['" + inputName + "'])");
     return combineId;
+}
+
+Value BlenderGenerator::resolveFn(const Arguments& args) {
+    // 1. Check function args for explicit $fn
+    Value fn = getArg(args, "$fn", Value());
+    if (!fn.isUndefined()) return fn;
+
+    // 2. Check global variables_ for $fn
+    auto it = variables_.find("$fn");
+    if (it != variables_.end()) {
+        // If $fn is a group_input variable, return an expression reference
+        // so the generated code links to the group_input socket
+        if (group_input_vars_.find("$fn") != group_input_vars_.end()) {
+            return Value::expressionWithTree("$fn", ExprNode::makeVarRef("$fn"));
+        }
+        // Otherwise return the literal value
+        return it->second;
+    }
+
+    // 3. Default
+    return Value(32.0);
 }
 
 double BlenderGenerator::evaluateExpr(const Value& value) {

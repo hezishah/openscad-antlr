@@ -107,6 +107,9 @@ private:
     bool vectorHasExpressions(const Value& v);
     bool moduleUsesChildren(ASTNode& node);
 
+    // Resolve $fn: check args, then global variables_, then default
+    Value resolveFn(const Arguments& args);
+
     // Helper to check if a value is a simple variable reference (no operators)
     bool isSimpleVariableRef(const Value& value);
 

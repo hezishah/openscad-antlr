@@ -1,12 +1,14 @@
-rm -R scad scad_py
-antlr scad.g4 -o scad
-antlr scad.g4 -o scad_py -Dlanguage=Python3
-touch scad_py/__init__.py
-pushd $(pwd)
-cd scad
-javac -classpath $(which antlr| echo $(dirname $(which antlr))/$(dirname $(xargs readlink))/../antlr-4.13.2-complete.jar) scad*.java
+./scad2blender/build/scad2blender simple_test.scad > blender_simple.py
+/Applications/Blender.app/Contents/MacOS/Blender -b -P blender_simple.py
 
-#echo "module hezi () \n { \n }" | grun scad prog -gui
-grun scad parse -gui < ../knob_factory.scad
-popd
-python3 scad_to_blender_geonodes.py knob_factory.scad
+./scad2blender/build/scad2blender offset.scad > blender_offset.py
+/Applications/Blender.app/Contents/MacOS/Blender -b -P blender_offset.py
+
+./scad2blender/build/scad2blender playground.scad > blender_playground.py
+/Applications/Blender.app/Contents/MacOS/Blender -b -P blender_playground.py
+
+./scad2blender/build/scad2blender knob_factory.scad > blender_knob.py
+/Applications/Blender.app/Contents/MacOS/Blender -b -P blender_knob.py
+
+./scad2blender/build/scad2blender DoorStop.scad > blender_doorstop.py
+/Applications/Blender.app/Contents/MacOS/Blender -b -P blender_doorstop.py
