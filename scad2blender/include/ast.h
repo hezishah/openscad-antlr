@@ -77,6 +77,7 @@ public:
         Assignment,
         Expression,
         FunctionCall,
+        FunctionDef,
 
         // Root
         Root
@@ -188,11 +189,14 @@ public:
 
     const std::string& name() const { return name_; }
     const std::vector<std::string>& parameters() const { return parameters_; }
+    const std::map<std::string, Value>& parameterDefaults() const { return param_defaults_; }
+    void setParameterDefault(const std::string& name, const Value& val) { param_defaults_[name] = val; }
     void accept(ASTVisitor& visitor) override;
 
 private:
     std::string name_;
     std::vector<std::string> parameters_;
+    std::map<std::string, Value> param_defaults_;
 };
 
 /**
@@ -276,6 +280,24 @@ public:
 };
 
 /**
+ * @brief Function definition (function name(params) = expr;)
+ */
+class FunctionNode : public ASTNode {
+public:
+    FunctionNode(const std::string& name, const std::vector<std::string>& params)
+        : ASTNode(Type::FunctionDef), name_(name), parameters_(params) {}
+    const std::string& name() const { return name_; }
+    const std::vector<std::string>& parameters() const { return parameters_; }
+    const ExprNodePtr& body() const { return body_; }
+    void setBody(const ExprNodePtr& body) { body_ = body; }
+    void accept(ASTVisitor& visitor) override;
+private:
+    std::string name_;
+    std::vector<std::string> parameters_;
+    ExprNodePtr body_;
+};
+
+/**
  * @brief Visitor interface for AST traversal
  */
 class ASTVisitor {
@@ -293,6 +315,7 @@ public:
     virtual void visit(IfElseNode& node) = 0;
     virtual void visit(AssignmentNode& node) = 0;
     virtual void visit(ChildrenNode& node) = 0;
+    virtual void visit(FunctionNode& node) = 0;
 };
 
 } // namespace scad2blender

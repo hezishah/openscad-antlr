@@ -10,6 +10,8 @@
 #include <sstream>
 #include <string>
 #include <cstring>
+#include <vector>
+#include <libgen.h>
 #include "ast.h"
 #include "blender_generator.h"
 
@@ -19,23 +21,30 @@ extern FILE* yyin;
 extern scad2blender::ASTNodePtr g_root;
 extern void prescan_variables(FILE* f);
 
+// External lexer declarations
+extern void set_include_paths(const std::vector<std::string>& paths);
+extern void set_current_file_dir(const std::string& dir);
+
 void printUsage(const char* program) {
     std::cerr << "Usage: " << program << " [options] <input.scad> [output.py]\n"
               << "\nOptions:\n"
               << "  -h, --help     Show this help message\n"
               << "  -v, --verbose  Enable verbose output\n"
               << "  -o <file>      Specify output file\n"
+              << "  -I <dir>       Add include search path\n"
               << "\nIf output file is not specified, writes to stdout.\n"
               << "\nExamples:\n"
               << "  " << program << " model.scad output.py\n"
               << "  " << program << " model.scad > output.py\n"
-              << "  " << program << " -o output.py model.scad\n";
+              << "  " << program << " -o output.py model.scad\n"
+              << "  " << program << " -I /path/to/libs model.scad output.py\n";
 }
 
 int main(int argc, char* argv[]) {
     std::string inputFile;
     std::string outputFile;
     bool verbose = false;
+    std::vector<std::string> extra_include_paths;
 
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
@@ -49,6 +58,13 @@ int main(int argc, char* argv[]) {
                 outputFile = argv[++i];
             } else {
                 std::cerr << "Error: -o requires an argument\n";
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-I") == 0) {
+            if (i + 1 < argc) {
+                extra_include_paths.push_back(argv[++i]);
+            } else {
+                std::cerr << "Error: -I requires an argument\n";
                 return 1;
             }
         } else if (argv[i][0] == '-') {
@@ -81,6 +97,34 @@ int main(int argc, char* argv[]) {
 
     if (verbose) {
         std::cerr << "Parsing: " << inputFile << "\n";
+    }
+
+    // Set up include paths
+    char* input_copy = strdup(inputFile.c_str());
+    std::string input_dir = dirname(input_copy);
+    free(input_copy);
+
+    set_current_file_dir(input_dir);
+
+    std::vector<std::string> paths;
+    paths.push_back(input_dir);
+    // Add user-specified include paths
+    for (const auto& p : extra_include_paths) {
+        paths.push_back(p);
+    }
+    // Add standard OpenSCAD library paths
+    const char* home = getenv("HOME");
+    if (home) {
+        paths.push_back(std::string(home) + "/Documents/OpenSCAD/libraries");
+        paths.push_back(std::string(home) + "/.local/share/OpenSCAD/libraries");
+    }
+    set_include_paths(paths);
+
+    if (verbose) {
+        std::cerr << "Include search paths:\n";
+        for (const auto& p : paths) {
+            std::cerr << "  " << p << "\n";
+        }
     }
 
     // Set up lexer input

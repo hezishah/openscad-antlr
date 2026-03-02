@@ -7,6 +7,8 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <set>
+#include <algorithm>
 
 namespace scad2blender {
 
@@ -42,11 +44,32 @@ ExprNodePtr ExprNode::makeBinary(Op op, ExprNodePtr left, ExprNodePtr right) {
     return node;
 }
 
+ExprNodePtr ExprNode::makeFunctionCall(const std::string& name, const std::vector<ExprNodePtr>& args) {
+    auto node = std::make_shared<ExprNode>();
+    node->kind = Kind::FunctionCall;
+    node->func_name = name;
+    node->func_args = args;
+    return node;
+}
+
+ExprNodePtr ExprNode::makeVectorLiteral(const std::vector<ExprNodePtr>& elements) {
+    auto node = std::make_shared<ExprNode>();
+    node->kind = Kind::VectorLiteral;
+    node->vec_elements = elements;
+    return node;
+}
+
 bool ExprNode::hasVariableRefs() const {
     if (kind == Kind::VarRef) return true;
     if (kind == Kind::Literal) return false;
     if (left && left->hasVariableRefs()) return true;
     if (right && right->hasVariableRefs()) return true;
+    for (const auto& arg : func_args) {
+        if (arg && arg->hasVariableRefs()) return true;
+    }
+    for (const auto& elem : vec_elements) {
+        if (elem && elem->hasVariableRefs()) return true;
+    }
     return false;
 }
 
@@ -156,6 +179,62 @@ std::string Value::toPython() const {
     }
 
     return ss.str();
+}
+
+static const double DEG2RAD = M_PI / 180.0;
+static const double RAD2DEG = 180.0 / M_PI;
+
+bool isBuiltinFunction(const std::string& name) {
+    static const std::set<std::string> builtins = {
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+        "sqrt", "abs", "pow", "exp", "ln", "log", "floor", "ceil", "round", "sign",
+        "max", "min", "norm", "len", "concat", "cross"
+    };
+    return builtins.count(name) > 0;
+}
+
+double evaluateBuiltinMath(const std::string& name, const std::vector<double>& args) {
+    if (args.empty()) return 0.0;
+    double a = args[0];
+
+    if (name == "sin") return std::sin(a * DEG2RAD);
+    if (name == "cos") return std::cos(a * DEG2RAD);
+    if (name == "tan") return std::tan(a * DEG2RAD);
+    if (name == "asin") return std::asin(a) * RAD2DEG;
+    if (name == "acos") return std::acos(a) * RAD2DEG;
+    if (name == "atan") {
+        if (args.size() >= 2) return std::atan2(a, args[1]) * RAD2DEG;
+        return std::atan(a) * RAD2DEG;
+    }
+    if (name == "atan2") {
+        if (args.size() >= 2) return std::atan2(a, args[1]) * RAD2DEG;
+        return 0.0;
+    }
+    if (name == "sqrt") return std::sqrt(a);
+    if (name == "abs") return std::abs(a);
+    if (name == "pow") return args.size() >= 2 ? std::pow(a, args[1]) : a;
+    if (name == "exp") return std::exp(a);
+    if (name == "ln" || name == "log") return std::log(a);
+    if (name == "floor") return std::floor(a);
+    if (name == "ceil") return std::ceil(a);
+    if (name == "round") return std::round(a);
+    if (name == "sign") return (a > 0) ? 1.0 : (a < 0) ? -1.0 : 0.0;
+    if (name == "max") {
+        double result = a;
+        for (size_t i = 1; i < args.size(); i++) result = std::max(result, args[i]);
+        return result;
+    }
+    if (name == "min") {
+        double result = a;
+        for (size_t i = 1; i < args.size(); i++) result = std::min(result, args[i]);
+        return result;
+    }
+    if (name == "norm") {
+        double sum = 0;
+        for (double v : args) sum += v * v;
+        return std::sqrt(sum);
+    }
+    return 0.0;
 }
 
 } // namespace scad2blender

@@ -34,7 +34,7 @@ using ExprNodePtr = std::shared_ptr<ExprNode>;
  * outputs through expression trees to geometry node inputs.
  */
 struct ExprNode {
-    enum class Kind { Literal, VarRef, UnaryOp, BinaryOp };
+    enum class Kind { Literal, VarRef, UnaryOp, BinaryOp, FunctionCall, VectorLiteral };
     enum class Op { ADD, SUBTRACT, MULTIPLY, DIVIDE, MODULO, POWER, NEGATE };
 
     Kind kind;
@@ -43,10 +43,16 @@ struct ExprNode {
     Op op = Op::ADD;              // UnaryOp/BinaryOp
     ExprNodePtr left, right;      // BinaryOp (left only for UnaryOp)
 
+    std::string func_name;                  // FunctionCall
+    std::vector<ExprNodePtr> func_args;     // FunctionCall
+    std::vector<ExprNodePtr> vec_elements;  // VectorLiteral
+
     static ExprNodePtr makeLiteral(double v);
     static ExprNodePtr makeVarRef(const std::string& name);
     static ExprNodePtr makeUnary(Op op, ExprNodePtr operand);
     static ExprNodePtr makeBinary(Op op, ExprNodePtr left, ExprNodePtr right);
+    static ExprNodePtr makeFunctionCall(const std::string& name, const std::vector<ExprNodePtr>& args);
+    static ExprNodePtr makeVectorLiteral(const std::vector<ExprNodePtr>& elements);
     bool hasVariableRefs() const;
 };
 
@@ -174,6 +180,10 @@ inline Value getPositionalArg(const Arguments& args, size_t index,
 inline bool hasArg(const Arguments& args, const std::string& name) {
     return args.find(name) != args.end();
 }
+
+// Built-in math function evaluation (trig uses degrees like OpenSCAD)
+double evaluateBuiltinMath(const std::string& name, const std::vector<double>& args);
+bool isBuiltinFunction(const std::string& name);
 
 } // namespace scad2blender
 

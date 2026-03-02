@@ -50,6 +50,7 @@ public:
     void visit(IfElseNode& node) override;
     void visit(AssignmentNode& node) override;
     void visit(ChildrenNode& node) override;
+    void visit(FunctionNode& node) override;
 
 private:
     std::ostringstream code_;
@@ -62,6 +63,13 @@ private:
     bool module_uses_children_ = false;
     std::set<std::string> group_input_vars_;  // Variables with group_input sockets
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
+
+    // User-defined function table (collected from AST FunctionNode nodes)
+    struct FuncDef {
+        std::vector<std::string> params;
+        ExprNodePtr body;
+    };
+    std::map<std::string, FuncDef> functions_;
 
     // Helper methods
     void emit(const std::string& line);
@@ -81,6 +89,7 @@ private:
     void emitSphere(const Arguments& args);
     void emitCylinder(const Arguments& args);
     void emitPolyhedron(const Arguments& args);
+    void emitPolygon(const Arguments& args);
     void emitCircle(const Arguments& args);
     void emitSquare(const Arguments& args);
     void emitText(const Arguments& args);
@@ -129,11 +138,19 @@ private:
     bool vectorHasExprTrees(const Value& v);
     void collectGroupInputVars(ASTNode& node);
     void collectModulesRecursive(ASTNode* node);
+    void collectFunctionsRecursive(ASTNode* node);
     void emitModulesRecursive(ASTNode* node);
 
     // Helper to evaluate an expression Value to a numeric result by resolving variable refs
     double evaluateExpr(const Value& value);
     double evaluateExprTree(const ExprNodePtr& tree);
+
+    // Full Value-returning evaluator (handles vectors and user-defined functions)
+    Value evaluateExprToValue(const Value& value);
+    Value evaluateExprTreeToValue(const ExprNodePtr& tree);
+
+    // Convert expression tree to a Python expression string using Python-level variables
+    std::string exprTreeToPython(const ExprNodePtr& tree);
 
     // Helper to get a resolved expression tree or create a literal fallback
     ExprNodePtr getOrMakeLiteralTree(const Value& value);

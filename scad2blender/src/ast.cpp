@@ -52,4 +52,8 @@ void ChildrenNode::accept(ASTVisitor& visitor) {
     visitor.visit(*this);
 }
 
+void FunctionNode::accept(ASTVisitor& visitor) {
+    visitor.visit(*this);
+}
+
 } // namespace scad2blender
