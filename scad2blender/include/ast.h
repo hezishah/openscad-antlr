@@ -62,6 +62,7 @@ public:
         // Other
         Hull,
         Minkowski,
+        Roof,
         Projection,
         Import,
         Surface,

@@ -58,7 +58,7 @@ const std::string& get_current_file_dir() {
 DIGIT       [0-9]
 LETTER      [a-zA-Z_]
 ID          {LETTER}({LETTER}|{DIGIT})*
-NUMBER      {DIGIT}+("."{DIGIT}+)?([eE][+-]?{DIGIT}+)?|"."{DIGIT}+([eE][+-]?{DIGIT}+)?
+NUMBER      {DIGIT}+("."{DIGIT}*)?([eE][+-]?{DIGIT}+)?|"."{DIGIT}+([eE][+-]?{DIGIT}+)?
 WS          [ \t\r]+
 
 %%
@@ -132,6 +132,7 @@ WS          [ \t\r]+
 <STRING>\\\\                { string_buffer += '\\'; }
 <STRING>\\\"                { string_buffer += '"'; }
 <STRING>.                   { string_buffer += yytext[0]; }
+<STRING>\n                  { string_buffer += '\n'; }
 
  /* Keywords */
 "module"                    { return TOK_MODULE; }
@@ -179,6 +180,7 @@ WS          [ \t\r]+
  /* Built-in modules - Other */
 "hull"                      { return TOK_HULL; }
 "minkowski"                 { return TOK_MINKOWSKI; }
+"roof"                      { return TOK_ROOF; }
 "projection"                { return TOK_PROJECTION; }
 "import"                    { return TOK_IMPORT; }
 "surface"                   { return TOK_SURFACE; }

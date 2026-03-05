@@ -34,8 +34,11 @@ using ExprNodePtr = std::shared_ptr<ExprNode>;
  * outputs through expression trees to geometry node inputs.
  */
 struct ExprNode {
-    enum class Kind { Literal, VarRef, UnaryOp, BinaryOp, FunctionCall, VectorLiteral };
-    enum class Op { ADD, SUBTRACT, MULTIPLY, DIVIDE, MODULO, POWER, NEGATE };
+    enum class Kind { Literal, VarRef, UnaryOp, BinaryOp, FunctionCall, VectorLiteral,
+                      Conditional, ForLoop, LetBinding };
+    enum class Op { ADD, SUBTRACT, MULTIPLY, DIVIDE, MODULO, POWER, NEGATE,
+                    LESS, GREATER, LESS_EQ, GREATER_EQ, EQUAL, NOT_EQUAL,
+                    AND, OR, NOT };
 
     Kind kind;
     double literal_value = 0.0;   // Literal
@@ -45,7 +48,11 @@ struct ExprNode {
 
     std::string func_name;                  // FunctionCall
     std::vector<ExprNodePtr> func_args;     // FunctionCall
+    std::vector<std::string> arg_names;     // FunctionCall: named param mapping
     std::vector<ExprNodePtr> vec_elements;  // VectorLiteral
+
+    ExprNodePtr else_branch;                                       // Conditional: else expr
+    std::vector<std::pair<std::string, ExprNodePtr>> let_bindings; // LetBinding: name→expr pairs
 
     static ExprNodePtr makeLiteral(double v);
     static ExprNodePtr makeVarRef(const std::string& name);
@@ -53,6 +60,9 @@ struct ExprNode {
     static ExprNodePtr makeBinary(Op op, ExprNodePtr left, ExprNodePtr right);
     static ExprNodePtr makeFunctionCall(const std::string& name, const std::vector<ExprNodePtr>& args);
     static ExprNodePtr makeVectorLiteral(const std::vector<ExprNodePtr>& elements);
+    static ExprNodePtr makeConditional(ExprNodePtr cond, ExprNodePtr then_expr, ExprNodePtr else_expr);
+    static ExprNodePtr makeForLoop(const std::string& var, ExprNodePtr range, ExprNodePtr body);
+    static ExprNodePtr makeLetBinding(std::vector<std::pair<std::string, ExprNodePtr>> bindings, ExprNodePtr body);
     bool hasVariableRefs() const;
 };
 
@@ -109,6 +119,20 @@ public:
         return v;
     }
 
+    // Range constructor with expression trees for bounds
+    static Value rangeWithExprs(double start, double end, double step,
+                                ExprNodePtr startExpr, ExprNodePtr endExpr, ExprNodePtr stepExpr = nullptr) {
+        Value v;
+        v.type_ = Type::Range;
+        v.range_start_ = start;
+        v.range_end_ = end;
+        v.range_step_ = step;
+        v.range_start_expr_ = startExpr;
+        v.range_end_expr_ = endExpr;
+        v.range_step_expr_ = stepExpr;
+        return v;
+    }
+
     // Type checking
     Type type() const { return type_; }
     bool isUndefined() const { return type_ == Type::Undefined; }
@@ -129,6 +153,9 @@ public:
     double rangeStart() const { return range_start_; }
     double rangeEnd() const { return range_end_; }
     double rangeStep() const { return range_step_; }
+    const ExprNodePtr& rangeStartExpr() const { return range_start_expr_; }
+    const ExprNodePtr& rangeEndExpr() const { return range_end_expr_; }
+    const ExprNodePtr& rangeStepExpr() const { return range_step_expr_; }
 
     // Vector operations
     size_t size() const { return vec_val_.size(); }
@@ -154,6 +181,9 @@ private:
     double range_start_ = 0.0;
     double range_end_ = 0.0;
     double range_step_ = 1.0;
+    ExprNodePtr range_start_expr_;
+    ExprNodePtr range_end_expr_;
+    ExprNodePtr range_step_expr_;
     ExprNodePtr expr_tree_;
 };
 

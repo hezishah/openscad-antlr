@@ -57,10 +57,13 @@ private:
     int indent_ = 0;
     int node_counter_ = 0;
     std::string last_output_;
-    std::set<std::string> defined_modules_;
+    std::map<std::string, std::vector<std::string>> defined_modules_;  // name -> parameter names
     std::map<std::string, Value> variables_;
+    std::set<std::string> eval_visiting_;  // Guard against infinite recursion in evaluateExprTree
     bool in_module_ = false;
     bool module_uses_children_ = false;
+    std::set<std::string> current_module_params_;  // Parameter names of the module being emitted
+    std::set<std::string> loop_variables_;            // Active for-loop variable names
     std::set<std::string> group_input_vars_;  // Variables with group_input sockets
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
 
@@ -102,6 +105,7 @@ private:
     void emitOffset(const Arguments& args);
     void emitHull(const Arguments& args);
     void emitMinkowski(const Arguments& args);
+    void emitRoof(const Arguments& args);
 
     // Boolean generators
     void emitBooleanOp(BooleanNode& node);
@@ -124,6 +128,13 @@ private:
 
     // Helper to check if all VarRefs in a tree are group_input sockets
     bool exprTreeHasOnlyGroupInputVars(const ExprNodePtr& tree);
+
+    // Helper to check if any VarRef in a tree references a runtime Python variable
+    // (module parameter or loop variable — not resolved at compile time)
+    bool exprTreeReferencesModuleParams(const ExprNodePtr& tree);
+
+    // Check if a variable name is a runtime Python variable (module param or loop var)
+    bool isRuntimePythonVar(const std::string& varName) const;
 
     // Helper to set input or create link from group_input for expressions
     void emitSetInputOrLink(const std::string& nodeId, const std::string& inputName,
