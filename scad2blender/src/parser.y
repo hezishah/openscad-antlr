@@ -228,14 +228,35 @@ static Value evaluate_expr_tree(const ExprNodePtr& tree, const std::map<std::str
             // Scalar * Vector or Vector * Scalar
             if (tree->op == ExprNode::Op::MULTIPLY) {
                 Value scalar, vec;
-                if (left.isNumber() && right.isVector()) { scalar = left; vec = right; }
-                else if (left.isVector() && right.isNumber()) { scalar = right; vec = left; }
+                ExprNodePtr scalarTree;
+                if (left.isNumber() && right.isVector()) {
+                    scalar = left; vec = right;
+                    scalarTree = tree->left;
+                } else if (left.isVector() && right.isNumber()) {
+                    scalar = right; vec = left;
+                    scalarTree = tree->right;
+                }
                 if (vec.isVector() && scalar.isNumber()) {
                     double s = scalar.toNumber();
                     Vector vr;
                     for (size_t i = 0; i < vec.size(); i++) {
-                        if (vec[i].isNumber()) vr.push_back(Value(vec[i].toNumber() * s));
-                        else vr.push_back(vec[i]);
+                        if (vec[i].isNumber()) {
+                            Value elem(vec[i].toNumber() * s);
+                            // Preserve expression tree: scalar * element
+                            ExprNodePtr elemTree = vec[i].exprTree();
+                            if (elemTree && elemTree->hasVariableRefs()) {
+                                ExprNodePtr sTree = scalarTree ? scalarTree : ExprNode::makeLiteral(s);
+                                auto prodTree = ExprNode::makeBinary(ExprNode::Op::MULTIPLY, sTree, elemTree);
+                                elem.setExprTree(prodTree);
+                            } else if (scalarTree && scalarTree->hasVariableRefs()) {
+                                ExprNodePtr eTree = elemTree ? elemTree : ExprNode::makeLiteral(vec[i].toNumber());
+                                auto prodTree = ExprNode::makeBinary(ExprNode::Op::MULTIPLY, scalarTree, eTree);
+                                elem.setExprTree(prodTree);
+                            }
+                            vr.push_back(elem);
+                        } else {
+                            vr.push_back(vec[i]);
+                        }
                     }
                     result = Value(vr);
                     break;
@@ -1927,18 +1948,44 @@ expr:
             $$->setExprTree(ExprNode::makeLiteral($1->toNumber() * $3->toNumber()));
         } else if ($1->isNumber() && $3->isVector()) {
             double s = $1->toNumber();
+            ExprNodePtr sTree = $1->exprTree();
             Vector v;
             for (size_t i = 0; i < $3->size(); i++) {
-                if ((*$3)[i].isNumber()) v.push_back(Value((*$3)[i].toNumber() * s));
-                else v.push_back((*$3)[i]);
+                if ((*$3)[i].isNumber()) {
+                    Value elem((*$3)[i].toNumber() * s);
+                    ExprNodePtr elemTree = (*$3)[i].exprTree();
+                    if (elemTree && elemTree->hasVariableRefs()) {
+                        ExprNodePtr st = sTree ? sTree : ExprNode::makeLiteral(s);
+                        elem.setExprTree(ExprNode::makeBinary(ExprNode::Op::MULTIPLY, st, elemTree));
+                    } else if (sTree && sTree->hasVariableRefs()) {
+                        ExprNodePtr et = elemTree ? elemTree : ExprNode::makeLiteral((*$3)[i].toNumber());
+                        elem.setExprTree(ExprNode::makeBinary(ExprNode::Op::MULTIPLY, sTree, et));
+                    }
+                    v.push_back(elem);
+                } else {
+                    v.push_back((*$3)[i]);
+                }
             }
             $$ = new Value(v);
         } else if ($1->isVector() && $3->isNumber()) {
             double s = $3->toNumber();
+            ExprNodePtr sTree = $3->exprTree();
             Vector v;
             for (size_t i = 0; i < $1->size(); i++) {
-                if ((*$1)[i].isNumber()) v.push_back(Value((*$1)[i].toNumber() * s));
-                else v.push_back((*$1)[i]);
+                if ((*$1)[i].isNumber()) {
+                    Value elem((*$1)[i].toNumber() * s);
+                    ExprNodePtr elemTree = (*$1)[i].exprTree();
+                    if (elemTree && elemTree->hasVariableRefs()) {
+                        ExprNodePtr st = sTree ? sTree : ExprNode::makeLiteral(s);
+                        elem.setExprTree(ExprNode::makeBinary(ExprNode::Op::MULTIPLY, elemTree, st));
+                    } else if (sTree && sTree->hasVariableRefs()) {
+                        ExprNodePtr et = elemTree ? elemTree : ExprNode::makeLiteral((*$1)[i].toNumber());
+                        elem.setExprTree(ExprNode::makeBinary(ExprNode::Op::MULTIPLY, et, sTree));
+                    }
+                    v.push_back(elem);
+                } else {
+                    v.push_back((*$1)[i]);
+                }
             }
             $$ = new Value(v);
         } else {
@@ -1989,7 +2036,8 @@ expr:
         delete $1; delete $3;
     }
     | '-' expr %prec UNARY {
-        if ($2->isExpression()) {
+        bool hasVarTree = ($2->isNumber() && $2->exprTree() && $2->exprTree()->hasVariableRefs());
+        if ($2->isExpression() || hasVarTree) {
             auto operand = $2->exprTree() ? $2->exprTree() : ExprNode::makeLiteral($2->toNumber());
             auto tree = ExprNode::makeUnary(ExprNode::Op::NEGATE, operand);
             $$ = new Value(Value::expressionWithTree("(-" + $2->toPython() + ")", tree));
@@ -2734,7 +2782,8 @@ vector_expr:
             auto it = $2->find("_" + std::to_string(i));
             if (it == $2->end()) break;
             v.push_back(it->second);
-            if (it->second.isExpression() && it->second.exprTree()) hasExprTrees = true;
+            if (it->second.exprTree() && it->second.exprTree()->hasVariableRefs()) hasExprTrees = true;
+            else if (it->second.isExpression() && it->second.exprTree()) hasExprTrees = true;
         }
         $$ = new Value(v);
         if (hasExprTrees) {

@@ -900,6 +900,18 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
                 }
                 if (v.size() == 1) valStr += ",";
                 valStr += ")";
+            } else if (v.isExpression() && v.exprTree()) {
+                // Use expression tree for proper Python output
+                // (toPython() may mangle variable names as "unsafe")
+                ExprNodePtr tree = resolveExprTree(v);
+                if (tree && tree->hasVariableRefs()) {
+                    valStr = exprTreeToPython(tree);
+                } else if (tree) {
+                    double numVal = evaluateExprTree(tree);
+                    valStr = pyDouble(numVal);
+                } else {
+                    valStr = v.toPython();
+                }
             } else {
                 valStr = v.toPython();
             }
@@ -1074,10 +1086,18 @@ void BlenderGenerator::visit(AssignmentNode& node) {
             // Undefined values become 0 to avoid None in arithmetic
             emit(pyName(node.name()) + " = 0");
         } else if (val.isExpression()) {
-            // Resolve expression to numeric value to avoid referencing Python
-            // variables that aren't in scope in module functions
-            double numVal = evaluateExpr(val);
-            emit(pyName(node.name()) + " = " + pyDouble(numVal));
+            // Check if expression tree references runtime vars (module params, loop vars)
+            ExprNodePtr tree = resolveExprTree(val);
+            if (tree && exprTreeReferencesModuleParams(tree)) {
+                std::string pyExpr = exprTreeToPython(tree);
+                emit(pyName(node.name()) + " = " + pyExpr);
+                // Track this variable as a runtime variable since it depends on runtime vars
+                loop_variables_.insert(node.name());
+            } else {
+                // Resolve expression to numeric value
+                double numVal = evaluateExpr(val);
+                emit(pyName(node.name()) + " = " + pyDouble(numVal));
+            }
         } else if (val.isVector()) {
             // Evaluate vector components numerically to avoid expression references
             std::string vecStr = "(";
@@ -1769,6 +1789,61 @@ void BlenderGenerator::emitTranslate(const Arguments& args) {
     emit("# Translate");
     emit(nodeId + " = nodes.new('GeometryNodeTransform')");
     emit(nodeId + ".location = (x_pos, y_pos)");
+
+    // If the value is an expression (not a vector), try to resolve the expression tree
+    // to extract vector components (e.g., scalar * [x, y, z] → per-component expressions)
+    if (v.isExpression() && v.exprTree()) {
+        ExprNodePtr tree = resolveExprTree(v);
+        if (tree && tree->kind == ExprNode::Kind::BinaryOp &&
+            tree->op == ExprNode::Op::MULTIPLY) {
+            // Check for scalar * vector or vector * scalar
+            ExprNodePtr scalarSide = nullptr;
+            ExprNodePtr vecSide = nullptr;
+            if (tree->right && tree->right->kind == ExprNode::Kind::VectorLiteral) {
+                scalarSide = tree->left;
+                vecSide = tree->right;
+            } else if (tree->left && tree->left->kind == ExprNode::Kind::VectorLiteral) {
+                scalarSide = tree->right;
+                vecSide = tree->left;
+            }
+            if (scalarSide && vecSide && vecSide->vec_elements.size() >= 3) {
+                // Expand scalar * [x, y, z] into per-component expressions
+                std::string combineId = newNodeId();
+                emit("# CombineXYZ for Translation");
+                emit(combineId + " = nodes.new('ShaderNodeCombineXYZ')");
+                emit(combineId + ".location = (x_pos, y_pos)");
+                emit("y_pos -= 50");
+                const char* components[] = {"X", "Y", "Z"};
+                for (size_t i = 0; i < 3 && i < vecSide->vec_elements.size(); ++i) {
+                    auto compTree = ExprNode::makeBinary(ExprNode::Op::MULTIPLY,
+                                                         scalarSide, vecSide->vec_elements[i]);
+                    if (exprTreeReferencesModuleParams(compTree)) {
+                        emit(combineId + ".inputs['" + std::string(components[i]) +
+                             "'].default_value = " + exprTreeToPython(compTree));
+                    } else if (exprTreeHasOnlyGroupInputVars(compTree)) {
+                        auto result = emitExpressionNodeTree(compTree);
+                        connectExprResultNamed(result, combineId, components[i]);
+                    } else {
+                        double val = evaluateExprTree(compTree);
+                        emit(combineId + ".inputs['" + std::string(components[i]) +
+                             "'].default_value = " + pyDouble(val));
+                    }
+                }
+                emit("links.new(" + combineId + ".outputs['Vector'], " + nodeId + ".inputs['Translation'])");
+                // Skip the normal vector handling below
+                emit("link_nodes(links, last_geo, 'Geometry', " + nodeId + ", 'Geometry')");
+                emit("last_geo = " + nodeId);
+                emit("x_pos += 200");
+                return;
+            }
+        }
+        // Fallback: try evaluating the expression to a vector
+        Value resolved = evaluateExprTreeToValue(tree);
+        if (resolved.isVector() && resolved.size() >= 3) {
+            v = resolved;
+            // Fall through to vector handling below
+        }
+    }
 
     if (isSimpleVariableRef(v)) {
         // Link translation from group_input
@@ -2795,6 +2870,10 @@ std::string BlenderGenerator::emitVectorWithExprTrees(const std::string& targetN
         if (tree && tree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(tree)) {
             auto result = emitExpressionNodeTree(tree);
             connectExprResultNamed(result, combineId, components[i]);
+        } else if (tree && tree->hasVariableRefs() && exprTreeReferencesModuleParams(tree)) {
+            // Runtime Python variable refs — emit as Python expression
+            emit(combineId + ".inputs['" + components[i] + "'].default_value = " +
+                 exprTreeToPython(tree));
         } else if (comp.exprTree() && comp.exprTree()->kind == ExprNode::Kind::Literal) {
             emit(combineId + ".inputs['" + components[i] + "'].default_value = " +
                  std::to_string(comp.exprTree()->literal_value));
@@ -3167,9 +3246,25 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                     return exprTreeToPython(inlined);
                 }
             }
-            if (fn == "sin" || fn == "cos" || fn == "tan")
-                fn = "math." + fn;
-            else if (fn == "sqrt") fn = "math.sqrt";
+            if (fn == "sin" || fn == "cos" || fn == "tan") {
+                // OpenSCAD trig functions take degrees, Python math takes radians
+                std::string argExpr = exprTreeToPython(tree->func_args[0]);
+                return "math." + fn + "(math.radians(" + argExpr + "))";
+            }
+            if (fn == "asin" || fn == "acos" || fn == "atan") {
+                // OpenSCAD inverse trig returns degrees
+                std::string argExpr = exprTreeToPython(tree->func_args[0]);
+                return "math.degrees(math." + fn + "(" + argExpr + "))";
+            }
+            if (fn == "atan2") {
+                std::string argsStr;
+                for (size_t i = 0; i < tree->func_args.size(); i++) {
+                    if (i > 0) argsStr += ", ";
+                    argsStr += exprTreeToPython(tree->func_args[i]);
+                }
+                return "math.degrees(math.atan2(" + argsStr + "))";
+            }
+            if (fn == "sqrt") fn = "math.sqrt";
             else if (fn == "abs") fn = "abs";
             else if (fn == "pow") fn = "math.pow";
             std::string argsStr;
