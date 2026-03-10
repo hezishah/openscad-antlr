@@ -66,6 +66,7 @@ private:
     std::set<std::string> loop_variables_;            // Active for-loop variable names
     std::set<std::string> group_input_vars_;  // Variables with group_input sockets
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
+    std::set<std::string> for_loop_range_vars_; // Variables used as for-loop range bounds
 
     // User-defined function table (collected from AST FunctionNode nodes)
     struct FuncDef {
@@ -150,6 +151,8 @@ private:
     void collectGroupInputVars(ASTNode& node);
     void collectModulesRecursive(ASTNode* node);
     void collectFunctionsRecursive(ASTNode* node);
+    void collectForLoopRangeVars(ASTNode* node);
+    void collectVarRefsFromExpr(const ExprNodePtr& expr);
     void emitModulesRecursive(ASTNode* node);
 
     // Helper to evaluate an expression Value to a numeric result by resolving variable refs

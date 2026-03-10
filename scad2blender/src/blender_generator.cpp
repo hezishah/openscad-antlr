@@ -27,6 +27,7 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
     functions_.clear();
     group_input_vars_.clear();
     top_level_vars_.clear();
+    for_loop_range_vars_.clear();
     in_module_ = false;
     module_uses_children_ = false;
 
@@ -101,6 +102,12 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
                 }
             }
         }
+    }
+
+    // Pre-scan for-loop range expressions to find variables that should be integers
+    for (auto& child : root->children()) {
+        if (!child) continue;
+        collectForLoopRangeVars(child.get());
     }
 
     emitVariables();
@@ -398,10 +405,25 @@ void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::
             return;
         }
         // If the tree references runtime Python variables (module params, loop vars),
-        // emit a Python expression using runtime variable names
+        // emit a Python expression using runtime variable names.
+        // If the tree is a simple VarRef to a module param, also handle the case
+        // where the param might be a Blender node (passed from a call site that
+        // linked it to group_input sockets).
         if (exprTreeReferencesModuleParams(tree)) {
-            std::string pyExpr = exprTreeToPython(tree);
-            emit(nodeId + ".inputs['" + inputName + "'].default_value = " + pyExpr);
+            if (tree->kind == ExprNode::Kind::VarRef) {
+                std::string varName = pyName(tree->var_name);
+                emit("if hasattr(" + varName + ", 'outputs'):");
+                indent_++;
+                emit("links.new(" + varName + ".outputs['Value'], " + nodeId + ".inputs['" + inputName + "'])");
+                indent_--;
+                emit("else:");
+                indent_++;
+                emit(nodeId + ".inputs['" + inputName + "'].default_value = " + varName);
+                indent_--;
+            } else {
+                std::string pyExpr = exprTreeToPython(tree);
+                emit(nodeId + ".inputs['" + inputName + "'].default_value = " + pyExpr);
+            }
             return;
         }
         // Fall through to use pythonValue (evaluated at compile time)
@@ -417,8 +439,17 @@ void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::
             }
             emit("links.new(group_input.outputs['" + socketName + "'], " + nodeId + ".inputs['" + inputName + "'])");
         } else if (isRuntimePythonVar(varName)) {
-            // Runtime Python variable — use the Python variable name
-            emit(nodeId + ".inputs['" + inputName + "'].default_value = " + pyName(varName));
+            // Runtime Python variable — might be a Blender node ref (if caller
+            // linked it to group_input) or a scalar value
+            std::string py = pyName(varName);
+            emit("if hasattr(" + py + ", 'outputs'):");
+            indent_++;
+            emit("links.new(" + py + ".outputs['Value'], " + nodeId + ".inputs['" + inputName + "'])");
+            indent_--;
+            emit("else:");
+            indent_++;
+            emit(nodeId + ".inputs['" + inputName + "'].default_value = " + py);
+            indent_--;
         } else {
             // Module-local variable — evaluate to concrete value
             double val = evaluateExpr(value);
@@ -559,7 +590,13 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
             if (value.isBool()) {
                 emit("add_input_socket(node_group, '" + socketName + "', 'NodeSocketBool', " + value.toPython() + ")");
             } else if (value.isNumber()) {
-                emit("add_input_socket(node_group, '" + socketName + "', 'NodeSocketFloat', " + value.toPython() + ")");
+                // Use integer socket for variables used as for-loop range bounds
+                if (for_loop_range_vars_.count(name) > 0) {
+                    int intVal = (int)value.toNumber();
+                    emit("add_input_socket(node_group, '" + socketName + "', 'NodeSocketInt', " + std::to_string(intVal) + ")");
+                } else {
+                    emit("add_input_socket(node_group, '" + socketName + "', 'NodeSocketFloat', " + value.toPython() + ")");
+                }
             } else if (value.isString()) {
                 emit("add_input_socket(node_group, '" + socketName + "', 'NodeSocketString', " + value.toPython() + ")");
             } else if (value.isVector()) {
@@ -658,6 +695,46 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
     indent_--;
     emit("link_nodes(links, join_node, 'Geometry', group_output, 'Geometry')");
     indent_--;
+
+    emitBlank();
+    // Remove unconnected input sockets (variables only used inside DIFFERENCE temp groups)
+    // But keep sockets for top-level variables used as Python variables (for-loops, if-statements, module calls)
+    emit("# Clean up unconnected input sockets");
+    {
+        std::string keepSet = "_keep_vars = {";
+        bool first = true;
+        for (const auto& name : top_level_vars_) {
+            std::string socketName = name;
+            if (!socketName.empty() && socketName[0] == '$') {
+                socketName = socketName.substr(1);
+            }
+            if (!first) keepSet += ", ";
+            keepSet += "'" + socketName + "'";
+            first = false;
+        }
+        keepSet += "}";
+        emit(keepSet);
+    }
+    emit("for _n in nodes:");
+    indent_++;
+    emit("if _n.type == 'GROUP_INPUT':");
+    indent_++;
+    emit("_unused = [_o.name for _o in _n.outputs if _o.name and not _o.links and 'Virtual' not in _o.bl_idname and _o.name not in _keep_vars]");
+    emit("for _uname in _unused:");
+    indent_++;
+    emit("for _item in list(node_group.interface.items_tree):");
+    indent_++;
+    emit("if hasattr(_item, 'item_type') and _item.item_type == 'SOCKET' and _item.in_out == 'INPUT' and _item.name == _uname:");
+    indent_++;
+    emit("node_group.interface.remove(_item)");
+    emit("break");
+    indent_--;
+    indent_--;
+    indent_--;
+    emit("break");
+    indent_--;
+    indent_--;
+
     indent_--;
     emitBlank();
 }
@@ -709,6 +786,28 @@ void BlenderGenerator::emitFooter() {
     emitBlank();
     emit("# Remove the modifier so the exporter uses the baked mesh");
     emit("obj.modifiers.clear()");
+    emit("bpy.data.node_groups.remove(node_group)");
+    emitBlank();
+    emit("# Clean up temporary boolean objects");
+    emit("for _o in list(bpy.data.objects):");
+    indent_++;
+    emit("if _o.name.startswith('_diff_'):");
+    indent_++;
+    emit("_mesh = _o.data");
+    emit("bpy.data.objects.remove(_o, do_unlink=True)");
+    emit("if _mesh and _mesh.users == 0:");
+    indent_++;
+    emit("bpy.data.meshes.remove(_mesh)");
+    indent_--;
+    indent_--;
+    indent_--;
+    emit("for _ng in list(bpy.data.node_groups):");
+    indent_++;
+    emit("if _ng.name.startswith('_diff_') and _ng.users == 0:");
+    indent_++;
+    emit("bpy.data.node_groups.remove(_ng)");
+    indent_--;
+    indent_--;
     emitBlank();
     emit("# Determine STL output path from script filename");
     emit("script_path = os.path.abspath(__file__)");
@@ -905,7 +1004,30 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
                 // (toPython() may mangle variable names as "unsafe")
                 ExprNodePtr tree = resolveExprTree(v);
                 if (tree && tree->hasVariableRefs()) {
-                    valStr = exprTreeToPython(tree);
+                    if (exprTreeHasOnlyGroupInputVars(tree)) {
+                        // Emit expression node tree linked to group_input sockets.
+                        // Pass the resulting Blender node as the module argument so
+                        // the module body can create links instead of setting default_value.
+                        auto result = emitExpressionNodeTree(tree);
+                        if (result.nodeId == "__literal__") {
+                            valStr = pyDouble(result.literalValue);
+                        } else if (result.isGroupInput) {
+                            // Direct VarRef to group_input — create a passthrough Math node
+                            // so we have a node reference to pass as the argument
+                            std::string passId = newNodeId();
+                            emit(passId + " = nodes.new('ShaderNodeMath')");
+                            emit(passId + ".operation = 'ADD'");
+                            emit(passId + ".location = (x_pos, y_pos)");
+                            emit("y_pos -= 50");
+                            emit("links.new(group_input.outputs['" + result.socketName + "'], " + passId + ".inputs[0])");
+                            emit(passId + ".inputs[1].default_value = 0.0");
+                            valStr = passId;
+                        } else {
+                            valStr = result.nodeId;
+                        }
+                    } else {
+                        valStr = exprTreeToPython(tree);
+                    }
                 } else if (tree) {
                     double numVal = evaluateExprTree(tree);
                     valStr = pyDouble(numVal);
@@ -1372,6 +1494,35 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
                 ExprNode::makeUnary(ExprNode::Op::NEGATE, hTree),
                 ExprNode::makeLiteral(2.0));
             emitScalarToVectorInput(transId, "Translation", negHalfH, 2, 0.0, 0.0, 0.0);
+        } else if (hTree && hTree->hasVariableRefs() && exprTreeReferencesModuleParams(hTree)) {
+            // Runtime Python variable — might be a Blender node ref or scalar.
+            // For simple VarRef to a module param, emit conditional code.
+            if (hTree->kind == ExprNode::Kind::VarRef) {
+                std::string varName = pyName(hTree->var_name);
+                emit("if hasattr(" + varName + ", 'outputs'):");
+                indent_++;
+                // Build -h/2 as Math node chain + CombineXYZ
+                std::string mulId = newNodeId();
+                emit(mulId + " = nodes.new('ShaderNodeMath')");
+                emit(mulId + ".operation = 'MULTIPLY'");
+                emit(mulId + ".location = (x_pos, y_pos)");
+                emit("links.new(" + varName + ".outputs['Value'], " + mulId + ".inputs[0])");
+                emit(mulId + ".inputs[1].default_value = -0.5");
+                std::string xyzId = newNodeId();
+                emit(xyzId + " = nodes.new('ShaderNodeCombineXYZ')");
+                emit(xyzId + ".location = (x_pos, y_pos)");
+                emit("links.new(" + mulId + ".outputs['Value'], " + xyzId + ".inputs['Z'])");
+                emit("links.new(" + xyzId + ".outputs['Vector'], " + transId + ".inputs['Translation'])");
+                emit("x_pos += 200");
+                indent_--;
+                emit("else:");
+                indent_++;
+                emit(transId + ".inputs['Translation'].default_value = (0, 0, -(" + varName + ") / 2)");
+                indent_--;
+            } else {
+                std::string pyExpr = exprTreeToPython(hTree);
+                emit(transId + ".inputs['Translation'].default_value = (0, 0, -(" + pyExpr + ") / 2)");
+            }
         } else {
             double hCenterVal = h.isExpression() ? evaluateExpr(h) : h.toNumber();
             emit(transId + ".inputs['Translation'].default_value = (0, 0, " +
@@ -1868,7 +2019,7 @@ void BlenderGenerator::emitRotate(const Arguments& args) {
     std::string nodeId = newNodeId();
 
     Value a = getArg(args, "a", getPositionalArg(args, 0, Value(0.0)));
-    Value v = getArg(args, "v", Value());
+    Value v = getArg(args, "v", getPositionalArg(args, 1, Value()));
 
     emit("# Rotate (converting degrees to radians)");
     emit(nodeId + " = nodes.new('GeometryNodeTransform')");
@@ -1931,27 +2082,110 @@ void BlenderGenerator::emitRotate(const Arguments& args) {
     } else if (a.isNumber() || a.isExpression()) {
         // Scalar angle — check for expression tree
         ExprNodePtr aTree = getOrMakeLiteralTree(a);
-        if (aTree->hasVariableRefs()) {
-            if (exprTreeReferencesModuleParams(aTree)) {
-                // Runtime Python variables — emit as Python expression
-                std::string pyExpr = exprTreeToPython(aTree);
-                emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, math.radians(" + pyExpr + "))");
+
+        // Determine if v (axis vector) is provided
+        bool hasAxisVec = false;
+        bool axisIsRuntime = false;
+        ExprNodePtr vTree;
+
+        if (v.isVector() && v.size() >= 3) {
+            hasAxisVec = true;
+            for (size_t i = 0; i < 3; i++) {
+                ExprNodePtr ct = getOrMakeLiteralTree(v[i]);
+                if (ct->hasVariableRefs()) { axisIsRuntime = true; break; }
+            }
+        } else if (v.isExpression() && v.exprTree()) {
+            hasAxisVec = true;
+            vTree = resolveExprTree(v);
+            if (vTree && vTree->hasVariableRefs()) axisIsRuntime = true;
+        }
+
+        bool angleIsRuntime = aTree->hasVariableRefs();
+
+        if (hasAxisVec) {
+            // Axis-angle rotation: rotate(angle, axis_vector)
+            if (angleIsRuntime || axisIsRuntime) {
+                // Runtime: emit Python code for axis-angle → Euler conversion
+                std::string angleExpr;
+                if (angleIsRuntime) {
+                    angleExpr = "math.radians(" + exprTreeToPython(aTree) + ")";
+                } else {
+                    angleExpr = pyDouble(a.toNumber() * M_PI / 180.0);
+                }
+
+                std::string axisExpr;
+                if (vTree) {
+                    axisExpr = exprTreeToPython(vTree);
+                } else if (v.isVector() && v.size() >= 3) {
+                    // Build tuple from components (may have mixed var/literal)
+                    std::string parts[3];
+                    for (int i = 0; i < 3; i++) {
+                        ExprNodePtr ct = getOrMakeLiteralTree(v[i]);
+                        if (ct->hasVariableRefs()) {
+                            parts[i] = exprTreeToPython(ct);
+                        } else {
+                            parts[i] = pyDouble(v[i].toNumber());
+                        }
+                    }
+                    axisExpr = "(" + parts[0] + ", " + parts[1] + ", " + parts[2] + ")";
+                }
+
+                emit("# Axis-angle rotation");
+                emit("_axis = Vector(" + axisExpr + ")");
+                emit("if _axis.length > 0:");
+                indent_++;
+                emit("_axis.normalize()");
+                emit("_rot_mat = Matrix.Rotation(" + angleExpr + ", 4, _axis)");
+                emit("_euler = _rot_mat.to_euler()");
+                emit(nodeId + ".inputs['Rotation'].default_value = (_euler.x, _euler.y, _euler.z)");
+                indent_--;
+                emit("else:");
+                indent_++;
+                emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, 0)");
+                indent_--;
             } else {
-                // Build: a * PI / 180
-                ExprNodePtr radTree = ExprNode::makeBinary(
-                    ExprNode::Op::MULTIPLY, aTree,
-                    ExprNode::makeLiteral(M_PI / 180.0));
-                // Emit as Z component (default rotation axis)
-                emitScalarToVectorInput(nodeId, "Rotation", radTree, 2, 0.0, 0.0, 0.0);
+                // Compile-time: compute axis-angle → Euler in C++
+                double angle_rad = a.toNumber() * M_PI / 180.0;
+                double vx = v[0].toNumber(), vy = v[1].toNumber(), vz = v[2].toNumber();
+                double len = sqrt(vx*vx + vy*vy + vz*vz);
+                if (len > 1e-10) {
+                    vx /= len; vy /= len; vz /= len;
+                    // Rotation matrix from axis-angle (Rodrigues' formula)
+                    double c = cos(angle_rad), s = sin(angle_rad), t = 1.0 - c;
+                    double r00 = t*vx*vx + c,    r01 = t*vx*vy - s*vz, r02 = t*vx*vz + s*vy;
+                    double r10 = t*vx*vy + s*vz, r11 = t*vy*vy + c,    r12 = t*vy*vz - s*vx;
+                    double r20 = t*vx*vz - s*vy, r21 = t*vy*vz + s*vx, r22 = t*vz*vz + c;
+                    // Decompose to Euler XYZ
+                    double rx, ry, rz;
+                    ry = asin(std::clamp(-(r20), -1.0, 1.0));
+                    if (fabs(cos(ry)) > 1e-10) {
+                        rx = atan2(r21, r22);
+                        rz = atan2(r10, r00);
+                    } else {
+                        rx = atan2(-r12, r11);
+                        rz = 0;
+                    }
+                    emit("# Axis-angle rotation (compile-time)");
+                    emit(nodeId + ".inputs['Rotation'].default_value = (" +
+                         pyDouble(rx) + ", " + pyDouble(ry) + ", " + pyDouble(rz) + ")");
+                } else {
+                    emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, 0)");
+                }
             }
         } else {
-            double angle = a.toNumber() * M_PI / 180.0;
-            if (v.isVector() && v.size() >= 3) {
-                // Axis-angle rotation
-                emit("# Axis-angle rotation around " + v.repr());
-                emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, " + pyDouble(angle) + ")");
+            // No axis vector — Z-axis rotation by default
+            if (angleIsRuntime) {
+                if (exprTreeReferencesModuleParams(aTree)) {
+                    std::string pyExpr = exprTreeToPython(aTree);
+                    emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, math.radians(" + pyExpr + "))");
+                } else {
+                    ExprNodePtr radTree = ExprNode::makeBinary(
+                        ExprNode::Op::MULTIPLY, aTree,
+                        ExprNode::makeLiteral(M_PI / 180.0));
+                    emitScalarToVectorInput(nodeId, "Rotation", radTree, 2, 0.0, 0.0, 0.0);
+                }
             } else {
-                // Z-axis rotation by default
+                double angle = a.toNumber() * M_PI / 180.0;
                 emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, " + pyDouble(angle) + ")");
             }
         }
@@ -2227,6 +2461,40 @@ void BlenderGenerator::emitRoof(const Arguments& args) {
 }
 
 // Boolean operation
+// Helper: determine if an AST node produces 2D curve geometry
+static bool is2DGeometry(const ASTNodePtr& node) {
+    if (!node) return false;
+    switch (node->type()) {
+        case ASTNode::Type::Circle:
+        case ASTNode::Type::Square:
+        case ASTNode::Type::Polygon:
+        case ASTNode::Type::Text:
+        case ASTNode::Type::Offset:
+        case ASTNode::Type::Projection:
+            return true;
+        case ASTNode::Type::Translate:
+        case ASTNode::Type::Rotate:
+        case ASTNode::Type::Scale:
+        case ASTNode::Type::Mirror:
+        case ASTNode::Type::Color:
+        case ASTNode::Type::Resize:
+        case ASTNode::Type::Multmatrix:
+            if (!node->children().empty())
+                return is2DGeometry(node->children()[0]);
+            return false;
+        case ASTNode::Type::Union:
+        case ASTNode::Type::Difference:
+        case ASTNode::Type::Intersection:
+        case ASTNode::Type::Hull:
+        case ASTNode::Type::Minkowski:
+            if (!node->children().empty())
+                return is2DGeometry(node->children()[0]);
+            return false;
+        default:
+            return false;
+    }
+}
+
 void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
     if (node.children().empty()) {
         return;
@@ -2314,102 +2582,172 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
     emit("# " + opName);
 
-    // Helper: check if a node outputs curve geometry (2D)
-    std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
-    emit("def " + isCurveHelper + "(geo_node):");
-    indent_++;
-    emit("if geo_node is None: return False");
-    emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
-    emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
-    emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
-    emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
-    emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
-    emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
-    emit("               'GeometryNodeJoinGeometry'}");
-    emit("return geo_node.bl_idname in curve_types");
-    indent_--;
-
-    // Helper: ensure geometry is mesh (fill curves for 3D boolean operands)
-    std::string fillHelper = "ensure_mesh_" + std::to_string(boolScopeId);
-    emit("def " + fillHelper + "(geo_node):");
-    indent_++;
-    emit("\"\"\"Fill curve geometry for boolean input\"\"\"");
-    emit("nonlocal x_pos, y_pos");
-    emit("if " + isCurveHelper + "(geo_node):");
-    indent_++;
-    emit("fill = nodes.new('GeometryNodeFillCurve')");
-    emit("fill.location = (x_pos, y_pos)");
-    emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
-    emit("x_pos += 200");
-    emit("return fill");
-    indent_--;
-    emit("return geo_node");
-    indent_--;
-
-    // Process first child
     std::string firstGeo = "bool_first_" + std::to_string(boolScopeId);
     emit(firstGeo + " = None");
 
-    actualChildren[0]->accept(*this);
-
     if (blenderOp == "DIFFERENCE") {
-        // For DIFFERENCE, check at runtime if operands are 2D curves.
-        // If so, use curve-join-with-reverse to create a multi-spline curve
-        // with holes, which FillCurve handles correctly (proper inner walls).
-        // Otherwise fall back to mesh boolean.
-        emit(firstGeo + " = last_geo");
+        // Determine at compile time if this is a 2D or 3D difference
+        bool is2D = is2DGeometry(actualChildren[0]);
 
-        for (size_t i = 1; i < actualChildren.size(); ++i) {
-            actualChildren[i]->accept(*this);
-
-            // Skip boolean if child produced no geometry (e.g. false conditional)
-            emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+        if (is2D) {
+            // 2D path: use curve reverse + join approach (keeps curves as curves)
+            std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
+            emit("def " + isCurveHelper + "(geo_node):");
             indent_++;
+            emit("if geo_node is None: return False");
+            emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+            emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+            emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
+            emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
+            emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
+            emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
+            emit("               'GeometryNodeJoinGeometry'}");
+            emit("return geo_node.bl_idname in curve_types");
+            indent_--;
 
-            // If first geo is None (e.g. conditional produced nothing), adopt this child
-            emit("if " + firstGeo + " is None:");
-            indent_++;
+            // Process first child normally
+            actualChildren[0]->accept(*this);
             emit(firstGeo + " = last_geo");
-            indent_--;
-            emit("else:");
-            indent_++;
 
-            // Runtime check: if both first and current are curves, use curve difference
-            emit("if " + isCurveHelper + "(" + firstGeo + ") and " + isCurveHelper + "(last_geo):");
+            for (size_t i = 1; i < actualChildren.size(); ++i) {
+                actualChildren[i]->accept(*this);
+
+                emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+                indent_++;
+                emit("if " + firstGeo + " is None:");
+                indent_++;
+                emit(firstGeo + " = last_geo");
+                indent_--;
+                emit("else:");
+                indent_++;
+                // Reverse the subtracted curve so FillCurve treats it as a hole
+                std::string revId = newNodeId();
+                emit(revId + " = nodes.new('GeometryNodeReverseCurve')");
+                emit(revId + ".location = (x_pos, y_pos)");
+                emit("link_nodes(links, last_geo, 'Curve', " + revId + ", 'Curve')");
+                std::string joinId = newNodeId();
+                emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+                emit(joinId + ".location = (x_pos, y_pos)");
+                emit("link_nodes(links, " + firstGeo + ", 'Curve', " + joinId + ", 'Geometry')");
+                emit("link_nodes(links, " + revId + ", 'Curve', " + joinId + ", 'Geometry')");
+                emit(firstGeo + " = " + joinId);
+                emit("x_pos += 200");
+                indent_--;
+                indent_--;
+                emit("y_pos -= 50");
+            }
+        } else {
+            // 3D path: use in-graph GeometryNodeMeshBoolean with DIFFERENCE operation.
+            // Chain one boolean per tool: (((base - tool1) - tool2) - tool3)
+
+            // Helper: check if a node outputs curve geometry (2D)
+            std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
+            emit("def " + isCurveHelper + "(geo_node):");
             indent_++;
-            // Reverse the subtracted curve so FillCurve treats it as a hole
-            std::string revId = newNodeId();
-            emit(revId + " = nodes.new('GeometryNodeReverseCurve')");
-            emit(revId + ".location = (x_pos, y_pos)");
-            emit("link_nodes(links, last_geo, 'Curve', " + revId + ", 'Curve')");
-            std::string joinId = newNodeId();
-            emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-            emit(joinId + ".location = (x_pos, y_pos)");
-            emit("link_nodes(links, " + firstGeo + ", 'Curve', " + joinId + ", 'Geometry')");
-            emit("link_nodes(links, " + revId + ", 'Curve', " + joinId + ", 'Geometry')");
-            emit(firstGeo + " = " + joinId);
-            emit("x_pos += 200");
+            emit("if geo_node is None: return False");
+            emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+            emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+            emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
+            emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
+            emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
+            emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
+            emit("               'GeometryNodeJoinGeometry'}");
+            emit("return geo_node.bl_idname in curve_types");
             indent_--;
-            emit("else:");
+
+            // Helper: ensure geometry is mesh (fill curves for 3D boolean operands)
+            std::string fillHelper = "ensure_mesh_" + std::to_string(boolScopeId);
+            emit("def " + fillHelper + "(geo_node):");
             indent_++;
-            // 3D path: use mesh boolean
-            emit(firstGeo + " = " + fillHelper + "(" + firstGeo + ")");
+            emit("\"\"\"Fill curve geometry for boolean input\"\"\"");
+            emit("nonlocal x_pos, y_pos");
+            emit("if " + isCurveHelper + "(geo_node):");
+            indent_++;
+            emit("fill = nodes.new('GeometryNodeFillCurve')");
+            emit("fill.location = (x_pos, y_pos)");
+            emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
+            emit("x_pos += 200");
+            emit("return fill");
+            indent_--;
+            emit("return geo_node");
+            indent_--;
+
+            // Process first child as base
+            actualChildren[0]->accept(*this);
+
             emit("last_geo = " + fillHelper + "(last_geo)");
-            std::string boolId = newNodeId();
-            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
-            emit(boolId + ".location = (x_pos, y_pos)");
-            emit(boolId + ".operation = 'DIFFERENCE'");
-            emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[0])");
-            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
-            emit(firstGeo + " = " + boolId);
-            emit("x_pos += 200");
-            indent_--;
-            indent_--;  // end else (firstGeo not None)
-            indent_--;  // end if last_geo is not None
-            emit("y_pos -= 50");
-        }
+            emit(firstGeo + " = last_geo");
+
+            for (size_t i = 1; i < actualChildren.size(); ++i) {
+                actualChildren[i]->accept(*this);
+
+                // Skip boolean if child produced no geometry
+                emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+                indent_++;
+                emit("last_geo = " + fillHelper + "(last_geo)");
+
+                // If first geo is None, adopt this child
+                emit("if " + firstGeo + " is None:");
+                indent_++;
+                emit(firstGeo + " = last_geo");
+                indent_--;
+                emit("else:");
+                indent_++;
+
+                std::string boolId = newNodeId();
+                emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+                emit(boolId + ".location = (x_pos, y_pos)");
+                emit(boolId + ".operation = 'DIFFERENCE'");
+                emit(boolId + ".solver = 'EXACT'");
+
+                // DIFFERENCE: base -> inputs[0], tool -> inputs[1]
+                emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[0])");
+                emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+                emit(firstGeo + " = " + boolId);
+                emit("x_pos += 200");
+                emit("y_pos -= 50");
+                indent_--;  // end else
+                indent_--;  // end if last_geo is not None
+            }
+        }  // end 3D DIFFERENCE path
     } else {
-        // UNION and INTERSECT: always use mesh boolean
+        // UNION and INTERSECT: use geometry nodes mesh boolean
+
+        // Helper: check if a node outputs curve geometry (2D)
+        std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
+        emit("def " + isCurveHelper + "(geo_node):");
+        indent_++;
+        emit("if geo_node is None: return False");
+        emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+        emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+        emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
+        emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
+        emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
+        emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
+        emit("               'GeometryNodeJoinGeometry'}");
+        emit("return geo_node.bl_idname in curve_types");
+        indent_--;
+
+        // Helper: ensure geometry is mesh (fill curves for 3D boolean operands)
+        std::string fillHelper = "ensure_mesh_" + std::to_string(boolScopeId);
+        emit("def " + fillHelper + "(geo_node):");
+        indent_++;
+        emit("\"\"\"Fill curve geometry for boolean input\"\"\"");
+        emit("nonlocal x_pos, y_pos");
+        emit("if " + isCurveHelper + "(geo_node):");
+        indent_++;
+        emit("fill = nodes.new('GeometryNodeFillCurve')");
+        emit("fill.location = (x_pos, y_pos)");
+        emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
+        emit("x_pos += 200");
+        emit("return fill");
+        indent_--;
+        emit("return geo_node");
+        indent_--;
+
+        // Process first child
+        actualChildren[0]->accept(*this);
+
         emit("last_geo = " + fillHelper + "(last_geo)");
         emit(firstGeo + " = last_geo");
 
@@ -3193,6 +3531,11 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
             if (isRuntimePythonVar(tree->var_name)) {
                 return pyName(tree->var_name);
             }
+            // Group input variables should use their Python variable name
+            // so that changes to the socket propagate through module calls
+            if (group_input_vars_.count(tree->var_name)) {
+                return pyName(tree->var_name);
+            }
             // If the variable can be resolved to a concrete value, use that
             auto it = variables_.find(tree->var_name);
             if (it != variables_.end() && it->second.isNumber()) {
@@ -3390,6 +3733,51 @@ void BlenderGenerator::collectFunctionsRecursive(ASTNode* node) {
     }
     for (auto& child : node->children()) {
         collectFunctionsRecursive(child.get());
+    }
+}
+
+void BlenderGenerator::collectVarRefsFromExpr(const ExprNodePtr& expr) {
+    if (!expr) return;
+    switch (expr->kind) {
+        case ExprNode::Kind::VarRef:
+            for_loop_range_vars_.insert(expr->var_name);
+            break;
+        case ExprNode::Kind::BinaryOp:
+            collectVarRefsFromExpr(expr->left);
+            collectVarRefsFromExpr(expr->right);
+            break;
+        case ExprNode::Kind::UnaryOp:
+            collectVarRefsFromExpr(expr->left);
+            break;
+        case ExprNode::Kind::FunctionCall:
+            for (auto& arg : expr->func_args)
+                collectVarRefsFromExpr(arg);
+            break;
+        case ExprNode::Kind::Conditional:
+            collectVarRefsFromExpr(expr->left);
+            collectVarRefsFromExpr(expr->right);
+            collectVarRefsFromExpr(expr->else_branch);
+            break;
+        default:
+            break;
+    }
+}
+
+void BlenderGenerator::collectForLoopRangeVars(ASTNode* node) {
+    if (!node) return;
+    if (node->type() == ASTNode::Type::ForLoop) {
+        auto* forNode = dynamic_cast<ForLoopNode*>(node);
+        if (forNode) {
+            const Value& range = forNode->range();
+            if (range.isRange()) {
+                collectVarRefsFromExpr(range.rangeStartExpr());
+                collectVarRefsFromExpr(range.rangeEndExpr());
+                collectVarRefsFromExpr(range.rangeStepExpr());
+            }
+        }
+    }
+    for (auto& child : node->children()) {
+        collectForLoopRangeVars(child.get());
     }
 }
 
