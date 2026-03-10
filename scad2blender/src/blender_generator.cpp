@@ -2771,6 +2771,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
             emit(boolId + ".location = (x_pos, y_pos)");
             emit(boolId + ".operation = '" + blenderOp + "'");
+            emit(boolId + ".solver = 'EXACT'");
 
             // In Blender 5.1+, UNION/INTERSECT use inputs[1] as multi-input
             // (inputs[0] is disabled). Both operands go to inputs[1].
