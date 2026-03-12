@@ -175,6 +175,11 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
         emitModulesRecursive(child.get());
     }
 
+    // Emit Python helper functions for recursive user-defined functions
+    if (!python_helper_functions_.empty()) {
+        emitPythonHelperFunctions();
+    }
+
     // Emit main build_geometry function
     auto* rootNode = dynamic_cast<RootNode*>(root.get());
     if (rootNode) {
@@ -321,6 +326,16 @@ void BlenderGenerator::emitHelperFunctions() {
     indent_++;
     emit("print(f'Link error: {e}')");
     indent_--;
+    indent_--;
+    emitBlank();
+
+    // OpenSCAD rands() helper
+    emit("def _scad_rands(min_val, max_val, num, seed=None):");
+    indent_++;
+    emit("\"\"\"OpenSCAD rands() — generate pseudo-random numbers\"\"\"");
+    emit("import random");
+    emit("rng = random.Random(seed)");
+    emit("return [min_val + rng.random() * (max_val - min_val) for _ in range(int(num))]");
     indent_--;
     emitBlank();
 }
@@ -516,6 +531,16 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
         current_module_params_.insert(pyName(p));
     }
 
+    // Collect captured parent module params (pre-computed in collectModulesRecursive)
+    std::vector<std::string> captured_params;
+    auto cpit = captured_parent_params_.find(node.name());
+    if (cpit != captured_parent_params_.end()) {
+        captured_params = cpit->second;
+        for (const auto& cp : captured_params) {
+            current_module_params_.insert(cp);  // Treat as runtime Python vars
+        }
+    }
+
     // Save existing variables and push parameter defaults so evaluateExprTree
     // can resolve references to module parameters (like mm_per_tooth, thickness, etc.)
     auto saved_variables = variables_;
@@ -578,6 +603,10 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
             }
             params += ", " + p + "=" + defaultStr;
         }
+    }
+    // Add captured parent module params to signature
+    for (const auto& cp : captured_params) {
+        params += ", " + cp + "=0.0";
     }
     params += ", children_geo=None";
 
@@ -686,6 +715,19 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
     // Emit Python variable assignments for group_input parameters
     // so that Python-level code (e.g. polyhedron vertex lists) can reference them
     if (!variables_.empty()) {
+        // If there are Python helper functions, declare top-level vars as global
+        // so the helper functions can access them
+        if (!python_helper_functions_.empty()) {
+            std::string globalDecl = "global ";
+            bool first = true;
+            for (const auto& [name, value] : variables_) {
+                if (top_level_vars_.find(name) == top_level_vars_.end()) continue;
+                if (!first) globalDecl += ", ";
+                globalDecl += pyName(name);
+                first = false;
+            }
+            if (!first) emit(globalDecl);
+        }
         emit("# Python variables for group_input parameters");
         for (const auto& [name, value] : variables_) {
             // Only process top-level variables, not module-internal ones
@@ -1080,6 +1122,10 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
                     if (vi > 0) valStr += ", ";
                     if (v[vi].isUndefined()) {
                         valStr += "0";
+                    } else if (v[vi].isExpression() && v[vi].exprTree()) {
+                        valStr += exprTreeToPython(v[vi].exprTree());
+                    } else if (v[vi].exprTree() && v[vi].exprTree()->hasVariableRefs()) {
+                        valStr += exprTreeToPython(v[vi].exprTree());
                     } else {
                         valStr += v[vi].toPython();
                     }
@@ -1105,6 +1151,14 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
                 valStr = v.toPython();
             }
             argStr += ", " + pyName(paramName) + "=" + valStr;
+        }
+
+        // Pass captured parent module params to nested modules
+        auto cpit = captured_parent_params_.find(node.name());
+        if (cpit != captured_parent_params_.end()) {
+            for (const auto& cp : cpit->second) {
+                argStr += ", " + cp + "=" + cp;
+            }
         }
 
         if (!node.children().empty()) {
@@ -1280,11 +1334,30 @@ void BlenderGenerator::visit(IfElseNode& node) {
             emit("last_geo = None");
         }
     } else {
-        // Runtime condition - emit both branches
-        emit("# Runtime conditional - emitting if branch");
-        for (auto& child : node.children()) {
-            if (!child) continue;
-            child->accept(*this);
+        // Runtime condition - emit Python if statement
+        ExprNodePtr condTree = cond.exprTree();
+        if (condTree) {
+            std::string pyCond = exprTreeToPython(condTree);
+            emit("if " + pyCond + ":");
+            indent_++;
+            for (auto& child : node.children()) {
+                if (!child) continue;
+                child->accept(*this);
+            }
+            indent_--;
+            if (node.elseBranch()) {
+                emit("else:");
+                indent_++;
+                node.elseBranch()->accept(*this);
+                indent_--;
+            }
+        } else {
+            // No expression tree available - emit if branch unconditionally
+            emit("# Runtime conditional - emitting if branch");
+            for (auto& child : node.children()) {
+                if (!child) continue;
+                child->accept(*this);
+            }
         }
     }
 }
@@ -1317,21 +1390,114 @@ void BlenderGenerator::visit(AssignmentNode& node) {
                 emit(pyName(node.name()) + " = " + pyDouble(numVal));
             }
         } else if (val.isVector()) {
-            // Evaluate vector components numerically to avoid expression references
-            std::string vecStr = "(";
-            for (size_t i = 0; i < val.size(); ++i) {
-                if (i > 0) vecStr += ", ";
-                if (val[i].isExpression()) {
-                    vecStr += pyDouble(evaluateExpr(val[i]));
-                } else if (val[i].isUndefined()) {
-                    vecStr += "0";
-                } else {
-                    vecStr += val[i].toPython();
+            // Use the overall vector exprTree (VectorLiteral) if available,
+            // as individual element Values may have been resolved away
+            ExprNodePtr vecTree = val.exprTree();
+            bool hasModuleParamRef = false;
+            if (vecTree && exprTreeReferencesModuleParams(vecTree)) {
+                hasModuleParamRef = true;
+            }
+            if (!hasModuleParamRef) {
+                // Also check individual element trees
+                for (size_t i = 0; i < val.size(); ++i) {
+                    ExprNodePtr et = val[i].exprTree();
+                    if (et && exprTreeReferencesModuleParams(et)) {
+                        hasModuleParamRef = true;
+                        break;
+                    }
                 }
             }
-            if (val.size() == 1) vecStr += ",";
-            vecStr += ")";
-            emit(pyName(node.name()) + " = " + vecStr);
+            if (hasModuleParamRef) {
+                // Emit as Python tuple with runtime expressions
+                if (vecTree && vecTree->kind == ExprNode::Kind::BinaryOp &&
+                    (vecTree->op == ExprNode::Op::ADD || vecTree->op == ExprNode::Op::SUBTRACT)) {
+                    // Vector arithmetic: decompose into per-element operations
+                    // E.g. top + [w/2, 0, 0] becomes (top[0] + w/2, top[1] + 0, top[2] + 0)
+                    std::string opStr = (vecTree->op == ExprNode::Op::ADD) ? " + " : " - ";
+                    auto& left = vecTree->left;
+                    auto& right = vecTree->right;
+
+                    // Determine which side is VectorLiteral (or both might be VarRef)
+                    auto getElemExpr = [&](const ExprNodePtr& tree, size_t idx) -> std::string {
+                        if (tree->kind == ExprNode::Kind::VectorLiteral && idx < tree->vec_elements.size()) {
+                            return exprTreeToPython(tree->vec_elements[idx]);
+                        } else if (tree->kind == ExprNode::Kind::VarRef) {
+                            return exprTreeToPython(tree) + "[" + std::to_string(idx) + "]";
+                        } else {
+                            // Generic case
+                            return exprTreeToPython(tree) + "[" + std::to_string(idx) + "]";
+                        }
+                    };
+
+                    std::string vecStr = "(";
+                    for (size_t i = 0; i < val.size(); ++i) {
+                        if (i > 0) vecStr += ", ";
+                        vecStr += "(" + getElemExpr(left, i) + opStr + getElemExpr(right, i) + ")";
+                    }
+                    if (val.size() == 1) vecStr += ",";
+                    vecStr += ")";
+                    emit(pyName(node.name()) + " = " + vecStr);
+                } else if (vecTree && vecTree->kind == ExprNode::Kind::FunctionCall) {
+                    // Function call returning a vector — emit as Python call directly
+                    emit(pyName(node.name()) + " = " + exprTreeToPython(vecTree));
+                } else if (vecTree && vecTree->kind != ExprNode::Kind::VectorLiteral && val.size() > 0) {
+                    // Other complex expression — try element-wise extraction
+                    std::string vecStr = "(";
+                    for (size_t i = 0; i < val.size(); ++i) {
+                        if (i > 0) vecStr += ", ";
+                        vecStr += exprTreeToPython(vecTree) + "[" + std::to_string(i) + "]";
+                    }
+                    if (val.size() == 1) vecStr += ",";
+                    vecStr += ")";
+                    emit(pyName(node.name()) + " = " + vecStr);
+                } else {
+                    // VectorLiteral or per-element trees available
+                    std::vector<ExprNodePtr> elemTrees;
+                    if (vecTree && vecTree->kind == ExprNode::Kind::VectorLiteral) {
+                        elemTrees = vecTree->vec_elements;
+                    }
+                    std::string vecStr = "(";
+                    for (size_t i = 0; i < val.size(); ++i) {
+                        if (i > 0) vecStr += ", ";
+                        // Use element tree from VectorLiteral if available
+                        ExprNodePtr et = (i < elemTrees.size()) ? elemTrees[i] : val[i].exprTree();
+                        if (et && exprTreeReferencesModuleParams(et)) {
+                            vecStr += exprTreeToPython(et);
+                        } else if (et) {
+                            // Non-module-param expression tree — evaluate to constant
+                            double v = evaluateExprTree(et);
+                            vecStr += pyDouble(v);
+                        } else if (val[i].isUndefined()) {
+                            vecStr += "0";
+                        } else if (val[i].isNumber()) {
+                            vecStr += pyDouble(val[i].toNumber());
+                        } else {
+                            vecStr += val[i].toPython();
+                        }
+                    }
+                    if (val.size() == 1) vecStr += ",";
+                    vecStr += ")";
+                    emit(pyName(node.name()) + " = " + vecStr);
+                }
+                // Track as runtime variable
+                loop_variables_.insert(node.name());
+            } else {
+                // Evaluate vector components numerically
+                std::string vecStr = "(";
+                for (size_t i = 0; i < val.size(); ++i) {
+                    if (i > 0) vecStr += ", ";
+                    if (val[i].isExpression()) {
+                        vecStr += pyDouble(evaluateExpr(val[i]));
+                    } else if (val[i].isUndefined()) {
+                        vecStr += "0";
+                    } else {
+                        vecStr += val[i].toPython();
+                    }
+                }
+                if (val.size() == 1) vecStr += ",";
+                vecStr += ")";
+                emit(pyName(node.name()) + " = " + vecStr);
+            }
         } else {
             emit(pyName(node.name()) + " = " + val.toPython());
         }
@@ -2111,6 +2277,21 @@ void BlenderGenerator::emitTranslate(const Arguments& args) {
             socketName = varName.substr(1);
         }
         emit("links.new(group_input.outputs['" + socketName + "'], " + nodeId + ".inputs['Translation'])");
+    } else if (v.isExpression() && v.exprTree() && exprTreeReferencesModuleParams(v.exprTree())) {
+        // Module parameter vector: set translation from runtime Python variable
+        std::string pyExpr = exprTreeToPython(v.exprTree());
+        emit("_tv = " + pyExpr);
+        emit("if isinstance(_tv, (list, tuple)) and len(_tv) >= 3:");
+        emit("    " + nodeId + ".inputs['Translation'].default_value = (_tv[0], _tv[1], _tv[2])");
+        emit("elif isinstance(_tv, (int, float)):");
+        emit("    " + nodeId + ".inputs['Translation'].default_value = (_tv, _tv, _tv)");
+    } else if (v.isExpression() && isRuntimePythonVar(v.toString())) {
+        // Runtime Python variable (e.g. loop var or previously assigned var)
+        std::string varName = pyName(v.toString());
+        emit("if isinstance(" + varName + ", (list, tuple)) and len(" + varName + ") >= 3:");
+        emit("    " + nodeId + ".inputs['Translation'].default_value = (" + varName + "[0], " + varName + "[1], " + varName + "[2])");
+        emit("elif isinstance(" + varName + ", (int, float)):");
+        emit("    " + nodeId + ".inputs['Translation'].default_value = (" + varName + ", " + varName + ", " + varName + ")");
     } else if (v.isVector() && v.size() >= 3 && vectorHasExprTrees(v)) {
         emitVectorWithExprTrees(nodeId, "Translation", v);
     } else if (v.isVector() && v.size() >= 3) {
@@ -3070,6 +3251,10 @@ std::string BlenderGenerator::vectorToPython(const Value& v) {
             if (i > 0) ss << ", ";
             if (v[i].isUndefined()) {
                 ss << "0";
+            } else if (v[i].isExpression() && v[i].exprTree()) {
+                ss << exprTreeToPython(v[i].exprTree());
+            } else if (v[i].exprTree() && v[i].exprTree()->hasVariableRefs()) {
+                ss << exprTreeToPython(v[i].exprTree());
             } else {
                 ss << v[i].toPython();
             }
@@ -3157,10 +3342,20 @@ ExprNodePtr BlenderGenerator::resolveExprTree(const Value& value) {
             argVal.setExprTree(arg);
             resolvedArgs.push_back(resolveExprTree(argVal));
         }
-        // Inline user-defined functions
+        // Inline user-defined functions (but not recursive ones)
         auto fit = functions_.find(tree->func_name);
         if (fit != functions_.end() && fit->second.body) {
             const FuncDef& fd = fit->second;
+            // Check if function is recursive — don't inline recursive functions
+            bool isRecursive = exprTreeCallsFunction(fd.body, tree->func_name);
+            if (isRecursive) {
+                python_helper_functions_.insert(tree->func_name);
+                auto resolved = std::make_shared<ExprNode>();
+                resolved->kind = ExprNode::Kind::FunctionCall;
+                resolved->func_name = tree->func_name;
+                resolved->func_args = resolvedArgs;
+                return resolved;
+            }
             std::map<std::string, ExprNodePtr> subst;
             for (size_t i = 0; i < fd.params.size() && i < resolvedArgs.size(); i++) {
                 subst[fd.params[i]] = resolvedArgs[i];
@@ -3185,6 +3380,43 @@ ExprNodePtr BlenderGenerator::resolveExprTree(const Value& value) {
             elemVal.setExprTree(elem);
             resolved->vec_elements.push_back(resolveExprTree(elemVal));
         }
+        return resolved;
+    }
+    if (tree->kind == ExprNode::Kind::ForLoop) {
+        auto resolved = std::make_shared<ExprNode>();
+        resolved->kind = ExprNode::Kind::ForLoop;
+        resolved->var_name = tree->var_name;
+        Value rangeVal;
+        rangeVal.setExprTree(tree->left);
+        resolved->left = resolveExprTree(rangeVal);
+        Value bodyVal;
+        bodyVal.setExprTree(tree->right);
+        resolved->right = resolveExprTree(bodyVal);
+        return resolved;
+    }
+    if (tree->kind == ExprNode::Kind::LetBinding) {
+        auto resolved = std::make_shared<ExprNode>();
+        resolved->kind = ExprNode::Kind::LetBinding;
+        for (const auto& binding : tree->let_bindings) {
+            Value bval;
+            bval.setExprTree(binding.second);
+            resolved->let_bindings.push_back({binding.first, resolveExprTree(bval)});
+        }
+        Value bodyVal;
+        bodyVal.setExprTree(tree->right);
+        resolved->right = resolveExprTree(bodyVal);
+        return resolved;
+    }
+    if (tree->kind == ExprNode::Kind::Conditional) {
+        auto resolved = std::make_shared<ExprNode>();
+        resolved->kind = ExprNode::Kind::Conditional;
+        Value condVal, thenVal, elseVal;
+        condVal.setExprTree(tree->left);
+        thenVal.setExprTree(tree->right);
+        elseVal.setExprTree(tree->else_branch);
+        resolved->left = resolveExprTree(condVal);
+        resolved->right = resolveExprTree(thenVal);
+        resolved->else_branch = resolveExprTree(elseVal);
         return resolved;
     }
     return tree;  // Literal or group_input VarRef
@@ -3644,6 +3876,29 @@ static ExprNodePtr substituteVarRefs(const ExprNodePtr& tree,
             result->else_branch = substituteVarRefs(tree->else_branch, subst);
             return result;
         }
+        case ExprNode::Kind::ForLoop: {
+            auto result = std::make_shared<ExprNode>();
+            result->kind = ExprNode::Kind::ForLoop;
+            result->var_name = tree->var_name;
+            result->left = substituteVarRefs(tree->left, subst);  // range
+            // Don't substitute the loop variable in the body — it shadows outer vars
+            auto innerSubst = subst;
+            innerSubst.erase(tree->var_name);
+            result->right = substituteVarRefs(tree->right, innerSubst);  // body
+            return result;
+        }
+        case ExprNode::Kind::LetBinding: {
+            auto result = std::make_shared<ExprNode>();
+            result->kind = ExprNode::Kind::LetBinding;
+            // Substitute in binding expressions, but remove bound names from body subst
+            auto innerSubst = subst;
+            for (const auto& binding : tree->let_bindings) {
+                result->let_bindings.push_back({binding.first, substituteVarRefs(binding.second, subst)});
+                innerSubst.erase(binding.first);  // shadow outer var
+            }
+            result->right = substituteVarRefs(tree->right, innerSubst);  // body
+            return result;
+        }
         default:
             return tree;
     }
@@ -3703,6 +3958,8 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
         case ExprNode::Kind::UnaryOp:
             if (tree->op == ExprNode::Op::NEGATE)
                 return "(-" + exprTreeToPython(tree->left) + ")";
+            if (tree->op == ExprNode::Op::NOT)
+                return "(not " + exprTreeToPython(tree->left) + ")";
             return exprTreeToPython(tree->left);
         case ExprNode::Kind::BinaryOp: {
             std::string l = exprTreeToPython(tree->left);
@@ -3714,6 +3971,14 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 case ExprNode::Op::DIVIDE: return "(" + l + " / " + r + ")";
                 case ExprNode::Op::MODULO: return "(" + l + " % " + r + ")";
                 case ExprNode::Op::POWER: return "(" + l + " ** " + r + ")";
+                case ExprNode::Op::LESS: return "(" + l + " < " + r + ")";
+                case ExprNode::Op::GREATER: return "(" + l + " > " + r + ")";
+                case ExprNode::Op::LESS_EQ: return "(" + l + " <= " + r + ")";
+                case ExprNode::Op::GREATER_EQ: return "(" + l + " >= " + r + ")";
+                case ExprNode::Op::EQUAL: return "(" + l + " == " + r + ")";
+                case ExprNode::Op::NOT_EQUAL: return "(" + l + " != " + r + ")";
+                case ExprNode::Op::AND: return "(" + l + " and " + r + ")";
+                case ExprNode::Op::OR: return "(" + l + " or " + r + ")";
                 default: return "0";
             }
         }
@@ -3736,7 +4001,20 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 auto fit = functions_.find(fn);
                 if (fit != functions_.end() && fit->second.body) {
                     const FuncDef& fd = fit->second;
-                    // Build substitution map: formal param name → actual arg tree
+                    // Check if function is recursive (body references itself)
+                    bool isRecursive = exprTreeCallsFunction(fd.body, fn);
+                    if (isRecursive) {
+                        // Emit as Python function call — the function will be emitted
+                        // as a helper in emitPythonHelperFunctions
+                        python_helper_functions_.insert(fn);
+                        std::string argsStr;
+                        for (size_t i = 0; i < tree->func_args.size(); i++) {
+                            if (i > 0) argsStr += ", ";
+                            argsStr += exprTreeToPython(tree->func_args[i]);
+                        }
+                        return "_scad_" + pyName(fn) + "(" + argsStr + ")";
+                    }
+                    // Non-recursive: inline by substituting parameters in body
                     std::map<std::string, ExprNodePtr> subst;
                     for (size_t i = 0; i < fd.params.size() && i < tree->func_args.size(); i++) {
                         subst[fd.params[i]] = tree->func_args[i];
@@ -3790,6 +4068,35 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 std::string a = exprTreeToPython(tree->func_args[0]);
                 return "(1 if " + a + " > 0 else (-1 if " + a + " < 0 else 0))";
             }
+            else if (fn == "rands") fn = "_scad_rands";
+            else if (fn == "__index__" && tree->func_args.size() == 2) {
+                // Array indexing: __index__(vec, idx) → vec[int(idx)]
+                std::string vec = exprTreeToPython(tree->func_args[0]);
+                std::string idx = exprTreeToPython(tree->func_args[1]);
+                return vec + "[int(" + idx + ")]";
+            }
+            else if (fn == "__range__" && tree->func_args.size() >= 2) {
+                // Range: __range__(start, end[, step]) → range(int(start), int(end)+1[, int(step)])
+                std::string start = exprTreeToPython(tree->func_args[0]);
+                std::string end = exprTreeToPython(tree->func_args[1]);
+                if (tree->func_args.size() > 2) {
+                    std::string step = exprTreeToPython(tree->func_args[2]);
+                    return "range(int(" + start + "), int(" + end + ")+1, int(" + step + "))";
+                }
+                return "range(int(" + start + "), int(" + end + ")+1)";
+            }
+            else if (fn == "concat") {
+                // concat in Python: list concatenation
+                // Use lambda to avoid evaluating each argument twice
+                std::string result = "(";
+                for (size_t i = 0; i < tree->func_args.size(); i++) {
+                    if (i > 0) result += " + ";
+                    std::string arg = exprTreeToPython(tree->func_args[i]);
+                    result += "(lambda _c: list(_c) if isinstance(_c, (list, tuple)) else [_c])(" + arg + ")";
+                }
+                result += ")";
+                return result;
+            }
             else {
                 // Unknown function — can't evaluate in Python, return 0
                 return "0";
@@ -3801,14 +4108,141 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
             }
             return fn + "(" + argsStr + ")";
         }
-        case ExprNode::Kind::VectorLiteral:
-            return "0";
-        case ExprNode::Kind::Conditional:
-        case ExprNode::Kind::ForLoop:
-        case ExprNode::Kind::LetBinding:
-            return "0";
+        case ExprNode::Kind::VectorLiteral: {
+            std::string result = "[";
+            for (size_t i = 0; i < tree->vec_elements.size(); i++) {
+                if (i > 0) result += ", ";
+                result += exprTreeToPython(tree->vec_elements[i]);
+            }
+            result += "]";
+            return result;
+        }
+        case ExprNode::Kind::Conditional: {
+            std::string cond = exprTreeToPython(tree->left);
+            std::string then_expr = exprTreeToPython(tree->right);
+            std::string else_expr = tree->else_branch ? exprTreeToPython(tree->else_branch) : "0";
+            return "(" + then_expr + " if " + cond + " else " + else_expr + ")";
+        }
+        case ExprNode::Kind::ForLoop: {
+            // [for (var = range) body] → [body for var in range]
+            std::string var = pyName(tree->var_name);
+            // Handle range expression
+            std::string rangeExpr;
+            if (tree->left && tree->left->kind == ExprNode::Kind::FunctionCall &&
+                tree->left->func_name == "__range__") {
+                std::string start = exprTreeToPython(tree->left->func_args[0]);
+                std::string end = exprTreeToPython(tree->left->func_args[1]);
+                if (tree->left->func_args.size() > 2) {
+                    std::string step = exprTreeToPython(tree->left->func_args[2]);
+                    rangeExpr = "range(int(" + start + "), int(" + end + ")+1, int(" + step + "))";
+                } else {
+                    rangeExpr = "range(int(" + start + "), int(" + end + ")+1)";
+                }
+            } else if (tree->left) {
+                rangeExpr = exprTreeToPython(tree->left);
+            } else {
+                rangeExpr = "[]";
+            }
+            // Temporarily add loop var as runtime var
+            bool wasPresent = loop_variables_.count(tree->var_name) > 0;
+            loop_variables_.insert(tree->var_name);
+            std::string body = exprTreeToPython(tree->right);
+            if (!wasPresent) loop_variables_.erase(tree->var_name);
+            return "[" + body + " for " + var + " in " + rangeExpr + "]";
+        }
+        case ExprNode::Kind::LetBinding: {
+            // let(a=expr1, b=expr2) body → (lambda a, b: body)(expr1, expr2)
+            if (tree->let_bindings.empty()) {
+                return exprTreeToPython(tree->right);
+            }
+            std::string params, args;
+            // Temporarily add let-bound names as runtime vars
+            std::vector<std::string> added;
+            for (size_t i = 0; i < tree->let_bindings.size(); i++) {
+                if (i > 0) { params += ", "; args += ", "; }
+                std::string pname = pyName(tree->let_bindings[i].first);
+                params += pname;
+                args += exprTreeToPython(tree->let_bindings[i].second);
+                if (loop_variables_.find(tree->let_bindings[i].first) == loop_variables_.end()) {
+                    loop_variables_.insert(tree->let_bindings[i].first);
+                    added.push_back(tree->let_bindings[i].first);
+                }
+            }
+            std::string body = exprTreeToPython(tree->right);
+            // Remove the temporarily added let-bound names
+            for (const auto& a : added) {
+                loop_variables_.erase(a);
+            }
+            return "(lambda " + params + ": " + body + ")(" + args + ")";
+        }
     }
     return "0";
+}
+
+bool BlenderGenerator::exprTreeCallsFunction(const ExprNodePtr& tree, const std::string& funcName) {
+    if (!tree) return false;
+    switch (tree->kind) {
+        case ExprNode::Kind::Literal:
+        case ExprNode::Kind::VarRef:
+            return false;
+        case ExprNode::Kind::UnaryOp:
+            return exprTreeCallsFunction(tree->left, funcName);
+        case ExprNode::Kind::BinaryOp:
+            return exprTreeCallsFunction(tree->left, funcName) ||
+                   exprTreeCallsFunction(tree->right, funcName);
+        case ExprNode::Kind::FunctionCall:
+            if (tree->func_name == funcName) return true;
+            for (const auto& arg : tree->func_args) {
+                if (exprTreeCallsFunction(arg, funcName)) return true;
+            }
+            return false;
+        case ExprNode::Kind::VectorLiteral:
+            for (const auto& elem : tree->vec_elements) {
+                if (exprTreeCallsFunction(elem, funcName)) return true;
+            }
+            return false;
+        case ExprNode::Kind::Conditional:
+            return exprTreeCallsFunction(tree->left, funcName) ||
+                   exprTreeCallsFunction(tree->right, funcName) ||
+                   (tree->else_branch && exprTreeCallsFunction(tree->else_branch, funcName));
+        case ExprNode::Kind::ForLoop:
+            return exprTreeCallsFunction(tree->left, funcName) ||
+                   exprTreeCallsFunction(tree->right, funcName);
+        case ExprNode::Kind::LetBinding:
+            for (const auto& b : tree->let_bindings) {
+                if (exprTreeCallsFunction(b.second, funcName)) return true;
+            }
+            return exprTreeCallsFunction(tree->right, funcName);
+    }
+    return false;
+}
+
+void BlenderGenerator::emitPythonHelperFunctions() {
+    for (const auto& fn : python_helper_functions_) {
+        auto fit = functions_.find(fn);
+        if (fit == functions_.end() || !fit->second.body) continue;
+        const FuncDef& fd = fit->second;
+
+        // Emit Python function definition
+        std::string params;
+        for (size_t i = 0; i < fd.params.size(); i++) {
+            if (i > 0) params += ", ";
+            params += pyName(fd.params[i]);
+        }
+        emit("def _scad_" + pyName(fn) + "(" + params + "):");
+        indent_++;
+        // Temporarily treat function params as runtime Python vars
+        // so exprTreeToPython emits them as variable references
+        std::set<std::string> saved_loop_vars = loop_variables_;
+        for (const auto& p : fd.params) {
+            loop_variables_.insert(p);
+        }
+        std::string body = exprTreeToPython(fd.body);
+        loop_variables_ = saved_loop_vars;
+        emit("return " + body);
+        indent_--;
+        emitBlank();
+    }
 }
 
 ExprNodePtr BlenderGenerator::getOrMakeLiteralTree(const Value& value) {
@@ -3897,10 +4331,44 @@ void BlenderGenerator::collectModulesRecursive(ASTNode* node) {
         auto* mod = dynamic_cast<ModuleNode*>(node);
         if (mod) {
             defined_modules_[mod->name()] = mod->parameters();
+
+            // Compute captured parent params for this nested module
+            if (!parent_module_params_stack_.empty()) {
+                const auto& parent_params = parent_module_params_stack_.back();
+                std::set<std::string> own_params;
+                for (const auto& p : mod->parameters()) {
+                    own_params.insert(pyName(p));
+                }
+                std::vector<std::string> captured;
+                for (const auto& pp : parent_params) {
+                    if (own_params.find(pp) == own_params.end()) {
+                        captured.push_back(pp);
+                    }
+                }
+                if (!captured.empty()) {
+                    std::sort(captured.begin(), captured.end());
+                    captured_parent_params_[mod->name()] = captured;
+                }
+            }
+
+            // Push this module's params (plus any parent params) for nested modules
+            std::set<std::string> params;
+            for (const auto& p : mod->parameters()) {
+                params.insert(pyName(p));
+            }
+            for (const auto& parent_set : parent_module_params_stack_) {
+                params.insert(parent_set.begin(), parent_set.end());
+            }
+            parent_module_params_stack_.push_back(params);
         }
     }
     for (auto& child : node->children()) {
         collectModulesRecursive(child.get());
+    }
+    if (node->type() == ASTNode::Type::Module) {
+        if (!parent_module_params_stack_.empty()) {
+            parent_module_params_stack_.pop_back();
+        }
     }
 }
 

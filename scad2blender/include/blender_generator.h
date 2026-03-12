@@ -68,6 +68,9 @@ private:
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
     std::set<std::string> for_loop_range_vars_; // Variables used as for-loop range bounds
     std::set<std::string> non_geometric_modules_; // Modules that produce no geometry
+    std::set<std::string> python_helper_functions_; // Recursive functions needing Python helpers
+    std::vector<std::set<std::string>> parent_module_params_stack_; // Stack of parent module param names
+    std::map<std::string, std::vector<std::string>> captured_parent_params_; // module_name -> captured parent params
 
     // User-defined function table (collected from AST FunctionNode nodes)
     struct FuncDef {
@@ -168,6 +171,12 @@ private:
 
     // Convert expression tree to a Python expression string using Python-level variables
     std::string exprTreeToPython(const ExprNodePtr& tree);
+
+    // Check if an expression tree contains a call to a specific function
+    bool exprTreeCallsFunction(const ExprNodePtr& tree, const std::string& funcName);
+
+    // Emit Python helper functions for recursive user-defined functions
+    void emitPythonHelperFunctions();
 
     // Helper to get a resolved expression tree or create a literal fallback
     ExprNodePtr getOrMakeLiteralTree(const Value& value);
