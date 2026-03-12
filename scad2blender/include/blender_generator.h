@@ -67,6 +67,7 @@ private:
     std::set<std::string> group_input_vars_;  // Variables with group_input sockets
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
     std::set<std::string> for_loop_range_vars_; // Variables used as for-loop range bounds
+    std::set<std::string> non_geometric_modules_; // Modules that produce no geometry
 
     // User-defined function table (collected from AST FunctionNode nodes)
     struct FuncDef {
@@ -154,6 +155,8 @@ private:
     void collectForLoopRangeVars(ASTNode* node);
     void collectVarRefsFromExpr(const ExprNodePtr& expr);
     void emitModulesRecursive(ASTNode* node);
+    bool nodeProducesGeometry(ASTNode* node);
+    void classifyModuleGeometry(ASTNode* node);
 
     // Helper to evaluate an expression Value to a numeric result by resolving variable refs
     double evaluateExpr(const Value& value);

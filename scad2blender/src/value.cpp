@@ -176,9 +176,22 @@ std::string Value::toPython() const {
             }
             break;
 
-        case Type::String:
-            ss << "\"" << str_val_ << "\"";
+        case Type::String: {
+            // Escape special characters for valid Python string literal
+            ss << "\"";
+            for (char c : str_val_) {
+                switch (c) {
+                    case '\\': ss << "\\\\"; break;
+                    case '"':  ss << "\\\""; break;
+                    case '\n': ss << "\\n"; break;
+                    case '\r': ss << "\\r"; break;
+                    case '\t': ss << "\\t"; break;
+                    default:   ss << c; break;
+                }
+            }
+            ss << "\"";
             break;
+        }
 
         case Type::Vector:
             ss << "(";
