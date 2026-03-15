@@ -1182,10 +1182,780 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
     }
 }
 
+// ─── Instance on Points helpers for for-loop optimization ───
+
+// Check if an expression tree references a specific variable name
+static bool exprTreeReferencesVar(const ExprNodePtr& tree, const std::string& varName) {
+    if (!tree) return false;
+    switch (tree->kind) {
+        case ExprNode::Kind::VarRef:
+            return tree->var_name == varName;
+        case ExprNode::Kind::Literal:
+            return false;
+        case ExprNode::Kind::UnaryOp:
+            return exprTreeReferencesVar(tree->left, varName);
+        case ExprNode::Kind::BinaryOp:
+            return exprTreeReferencesVar(tree->left, varName) ||
+                   exprTreeReferencesVar(tree->right, varName);
+        case ExprNode::Kind::FunctionCall:
+            for (const auto& arg : tree->func_args) {
+                if (exprTreeReferencesVar(arg, varName)) return true;
+            }
+            return false;
+        case ExprNode::Kind::VectorLiteral:
+            for (const auto& elem : tree->vec_elements) {
+                if (exprTreeReferencesVar(elem, varName)) return true;
+            }
+            return false;
+        case ExprNode::Kind::Conditional:
+            return exprTreeReferencesVar(tree->left, varName) ||
+                   exprTreeReferencesVar(tree->right, varName) ||
+                   exprTreeReferencesVar(tree->else_branch, varName);
+        case ExprNode::Kind::ForLoop:
+        case ExprNode::Kind::LetBinding:
+            return exprTreeReferencesVar(tree->left, varName) ||
+                   exprTreeReferencesVar(tree->right, varName);
+    }
+    return false;
+}
+
+// Check if a Value references a specific variable name
+static bool valueReferencesVar(const Value& value, const std::string& varName) {
+    if (value.isExpression()) {
+        if (value.toString() == varName) return true;
+        if (value.exprTree()) {
+            return exprTreeReferencesVar(value.exprTree(), varName);
+        }
+    }
+    if (value.isVector()) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (valueReferencesVar(value[i], varName)) return true;
+        }
+    }
+    return false;
+}
+
+// Check if any node in the subtree references a specific variable in its arguments
+static bool subtreeReferencesVar(const ASTNodePtr& node, const std::string& varName) {
+    if (!node) return false;
+
+    // Check arguments for node types that have them
+    switch (node->type()) {
+        case ASTNode::Type::Translate:
+        case ASTNode::Type::Rotate:
+        case ASTNode::Type::Scale:
+        case ASTNode::Type::Mirror:
+        case ASTNode::Type::Color:
+        case ASTNode::Type::Offset:
+        case ASTNode::Type::Resize:
+        case ASTNode::Type::Multmatrix: {
+            auto* transform = dynamic_cast<TransformNode*>(node.get());
+            if (transform) {
+                for (const auto& kv : transform->args()) {
+                    if (valueReferencesVar(kv.second, varName)) return true;
+                }
+            }
+            break;
+        }
+        case ASTNode::Type::Cube:
+        case ASTNode::Type::Sphere:
+        case ASTNode::Type::Cylinder:
+        case ASTNode::Type::Circle:
+        case ASTNode::Type::Square:
+        case ASTNode::Type::Polygon:
+        case ASTNode::Type::Text:
+        case ASTNode::Type::Polyhedron: {
+            auto* prim = dynamic_cast<PrimitiveNode*>(node.get());
+            if (prim) {
+                for (const auto& kv : prim->args()) {
+                    if (valueReferencesVar(kv.second, varName)) return true;
+                }
+            }
+            break;
+        }
+        case ASTNode::Type::LinearExtrude:
+        case ASTNode::Type::RotateExtrude: {
+            auto* ext = dynamic_cast<ExtrudeNode*>(node.get());
+            if (ext) {
+                for (const auto& kv : ext->args()) {
+                    if (valueReferencesVar(kv.second, varName)) return true;
+                }
+            }
+            break;
+        }
+        case ASTNode::Type::ModuleCall: {
+            auto* call = dynamic_cast<ModuleCallNode*>(node.get());
+            if (call) {
+                for (const auto& kv : call->args()) {
+                    if (valueReferencesVar(kv.second, varName)) return true;
+                }
+            }
+            break;
+        }
+        case ASTNode::Type::ForLoop: {
+            auto* loop = dynamic_cast<ForLoopNode*>(node.get());
+            if (loop) {
+                if (valueReferencesVar(loop->range(), varName)) return true;
+                // If the inner loop shadows the same variable, stop recursion
+                if (loop->variable() == varName) return false;
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    // Recursively check children
+    for (const auto& child : node->children()) {
+        if (subtreeReferencesVar(child, varName)) return true;
+    }
+    return false;
+}
+
+// Information about an instanceable rotation array pattern
+struct RotationArrayInfo {
+    bool valid = false;
+    int rotComponent = -1;  // 0=X, 1=Y, 2=Z
+    double rangeStart = 0;
+    double rangeEnd = 0;
+    double rangeStep = 1;
+    int iterCount = 0;
+    // Other (constant) rotation components in degrees
+    double otherRot[3] = {0, 0, 0};
+};
+
+// Detect if a for-loop is a "rotation array" pattern:
+//   for (var = [start:step:end]) rotate([..., var, ...]) { body }
+// where body does NOT reference var, and var appears in exactly one rotation component.
+static RotationArrayInfo detectRotationArrayPattern(ForLoopNode& node) {
+    RotationArrayInfo info;
+
+    const Value& range = node.range();
+    if (!range.isRange()) return info;
+
+    // Range must be fully constant (no runtime expressions in bounds)
+    if (range.rangeStartExpr() && range.rangeStartExpr()->hasVariableRefs()) return info;
+    if (range.rangeEndExpr() && range.rangeEndExpr()->hasVariableRefs()) return info;
+    if (range.rangeStepExpr() && range.rangeStepExpr()->hasVariableRefs()) return info;
+
+    info.rangeStart = range.rangeStart();
+    info.rangeEnd = range.rangeEnd();
+    info.rangeStep = range.rangeStep();
+
+    if (info.rangeStep == 0) return info;
+    info.iterCount = static_cast<int>((info.rangeEnd - info.rangeStart) / info.rangeStep) + 1;
+    if (info.iterCount < 2 || info.iterCount > 1000) return info;
+
+    // The for loop must have exactly one direct child
+    auto& children = node.children();
+    if (children.size() != 1) return info;
+    auto& child = children[0];
+    if (!child || child->type() != ASTNode::Type::Rotate) return info;
+
+    auto* rotateNode = dynamic_cast<TransformNode*>(child.get());
+    if (!rotateNode) return info;
+
+    // Get the rotation argument (key "a" or positional "_0")
+    const auto& rotArgs = rotateNode->args();
+    Value rotVal;
+    {
+        auto it = rotArgs.find("a");
+        if (it == rotArgs.end()) it = rotArgs.find("_0");
+        if (it == rotArgs.end()) return info;
+        rotVal = it->second;
+    }
+
+    if (!rotVal.isVector() || rotVal.size() < 3) return info;
+
+    const std::string& loopVar = node.variable();
+    int varComponent = -1;
+
+    for (int i = 0; i < 3; ++i) {
+        if (valueReferencesVar(rotVal[i], loopVar)) {
+            if (varComponent != -1) return info;  // Variable used in multiple components
+            varComponent = i;
+            // Must be a simple direct reference to the variable
+            bool isSimple = false;
+            if (rotVal[i].isExpression() && rotVal[i].toString() == loopVar) {
+                isSimple = true;
+            } else if (rotVal[i].exprTree() &&
+                       rotVal[i].exprTree()->kind == ExprNode::Kind::VarRef &&
+                       rotVal[i].exprTree()->var_name == loopVar) {
+                isSimple = true;
+            }
+            if (!isSimple) return info;
+        } else {
+            // Constant component — extract its value
+            double val = 0;
+            if (rotVal[i].isNumber()) {
+                val = rotVal[i].toNumber();
+            } else if (rotVal[i].isExpression() && rotVal[i].exprTree()) {
+                // Can't use non-constant values in the static rotation
+                if (rotVal[i].exprTree()->hasVariableRefs()) return info;
+            }
+            info.otherRot[i] = val;
+        }
+    }
+
+    if (varComponent == -1) return info;
+
+    // Check that no children below the Rotate reference the loop variable
+    for (const auto& rotChild : child->children()) {
+        if (subtreeReferencesVar(rotChild, loopVar)) return info;
+    }
+
+    info.valid = true;
+    info.rotComponent = varComponent;
+    return info;
+}
+
+// ─── Scale mirror pattern detection (for vector loops) ───
+// Detects: for (var = [v0, v1, ...]) body where var is ONLY used in Scale transforms,
+// in exactly one component (e.g., scale([1, var, 1])). The body can be arbitrarily nested.
+struct ScaleArrayInfo {
+    bool valid = false;
+    int scaleComponent = -1;  // 0=X, 1=Y, 2=Z
+    std::vector<double> values;  // The vector values
+    double otherScale[3] = {1, 1, 1};  // Other (constant) scale components
+};
+
+// Scan a subtree to check if a variable is used ONLY in Scale transforms.
+// Returns the component index (0-2) if used consistently in one component, or -1 if invalid.
+struct ScaleUsageScan {
+    bool valid = true;
+    bool found = false;
+    int component = -1;
+    double otherScale[3] = {1, 1, 1};
+};
+
+static void scanScaleUsage(const ASTNodePtr& node, const std::string& varName, ScaleUsageScan& scan) {
+    if (!node || !scan.valid) return;
+
+    // If this is a ForLoop that shadows the variable, stop recursion
+    if (node->type() == ASTNode::Type::ForLoop) {
+        auto* loop = dynamic_cast<ForLoopNode*>(node.get());
+        if (loop && loop->variable() == varName) return;
+        // Check range for variable reference (would make it invalid)
+        if (loop && valueReferencesVar(loop->range(), varName)) {
+            scan.valid = false;
+            return;
+        }
+    }
+
+    if (node->type() == ASTNode::Type::Scale) {
+        auto* scaleNode = dynamic_cast<TransformNode*>(node.get());
+        if (scaleNode) {
+            const auto& args = scaleNode->args();
+            auto it = args.find("v");
+            if (it == args.end()) it = args.find("_0");
+            if (it != args.end() && it->second.isVector() && it->second.size() >= 3) {
+                const Value& scaleVal = it->second;
+                for (int i = 0; i < 3; ++i) {
+                    if (valueReferencesVar(scaleVal[i], varName)) {
+                        // Must be simple VarRef
+                        bool isSimple = (scaleVal[i].isExpression() && scaleVal[i].toString() == varName) ||
+                                        (scaleVal[i].exprTree() &&
+                                         scaleVal[i].exprTree()->kind == ExprNode::Kind::VarRef &&
+                                         scaleVal[i].exprTree()->var_name == varName);
+                        if (!isSimple) { scan.valid = false; return; }
+                        if (scan.component != -1 && scan.component != i) { scan.valid = false; return; }
+                        scan.component = i;
+                        scan.found = true;
+                        // Record other components
+                        for (int j = 0; j < 3; ++j) {
+                            if (j != i && scaleVal[j].isNumber()) {
+                                scan.otherScale[j] = scaleVal[j].toNumber();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // For non-Scale nodes, check if this node's arguments reference varName (invalid)
+        auto checkArgs = [&](const Arguments& args) {
+            for (const auto& kv : args) {
+                if (valueReferencesVar(kv.second, varName)) { scan.valid = false; return; }
+            }
+        };
+        switch (node->type()) {
+            case ASTNode::Type::Translate:
+            case ASTNode::Type::Rotate:
+            case ASTNode::Type::Mirror:
+            case ASTNode::Type::Color:
+            case ASTNode::Type::Offset:
+            case ASTNode::Type::Resize:
+            case ASTNode::Type::Multmatrix: {
+                auto* t = dynamic_cast<TransformNode*>(node.get());
+                if (t) checkArgs(t->args());
+                break;
+            }
+            case ASTNode::Type::Cube:
+            case ASTNode::Type::Sphere:
+            case ASTNode::Type::Cylinder:
+            case ASTNode::Type::Circle:
+            case ASTNode::Type::Square:
+            case ASTNode::Type::Polygon:
+            case ASTNode::Type::Text:
+            case ASTNode::Type::Polyhedron: {
+                auto* p = dynamic_cast<PrimitiveNode*>(node.get());
+                if (p) checkArgs(p->args());
+                break;
+            }
+            case ASTNode::Type::LinearExtrude:
+            case ASTNode::Type::RotateExtrude: {
+                auto* e = dynamic_cast<ExtrudeNode*>(node.get());
+                if (e) checkArgs(e->args());
+                break;
+            }
+            case ASTNode::Type::ModuleCall: {
+                auto* m = dynamic_cast<ModuleCallNode*>(node.get());
+                if (m) checkArgs(m->args());
+                break;
+            }
+            default: break;
+        }
+    }
+
+    if (!scan.valid) return;
+
+    // Recurse into children
+    for (const auto& child : node->children()) {
+        scanScaleUsage(child, varName, scan);
+    }
+}
+
+static ScaleArrayInfo detectScaleArrayPattern(ForLoopNode& node) {
+    ScaleArrayInfo info;
+
+    const Value& range = node.range();
+    if (!range.isVector()) return info;
+
+    // All vector elements must be constant numbers
+    for (size_t i = 0; i < range.size(); ++i) {
+        if (!range[i].isNumber()) return info;
+        info.values.push_back(range[i].toNumber());
+    }
+    if (info.values.size() < 2 || info.values.size() > 100) return info;
+
+    const std::string& loopVar = node.variable();
+
+    // Scan entire body subtree for variable usage
+    ScaleUsageScan scan;
+    for (const auto& child : node.children()) {
+        scanScaleUsage(child, loopVar, scan);
+    }
+
+    if (!scan.valid || !scan.found || scan.component == -1) return info;
+
+    info.valid = true;
+    info.scaleComponent = scan.component;
+    for (int i = 0; i < 3; ++i) info.otherScale[i] = scan.otherScale[i];
+    return info;
+}
+
+// ─── Data-driven instance array pattern detection (for range loops) ───
+// Detects: for (var = [start:step:end])
+//              translate([f(var), ...])
+//                  [constant_transforms]
+//                      single_primitive(with at most one var-dependent param)
+struct InstanceArrayInfo {
+    bool valid = false;
+
+    // Translate node (position depends on loop var)
+    TransformNode* translateNode = nullptr;
+
+    // Constant transforms between translate and primitive
+    std::vector<ASTNode*> constantChain;
+
+    // The terminal primitive
+    PrimitiveNode* primitiveNode = nullptr;
+
+    // Which primitive arg varies (if any) — key in Arguments map
+    std::string varyingPrimArg;
+};
+
+static InstanceArrayInfo detectInstanceArrayPattern(ForLoopNode& node) {
+    InstanceArrayInfo info;
+
+    const Value& range = node.range();
+    if (!range.isRange()) return info;
+
+    // Must have exactly one child (possibly wrapped in an implicit Union)
+    if (node.children().size() != 1) return info;
+
+    const std::string& loopVar = node.variable();
+    ASTNode* current = node.children()[0].get();
+
+    // Unwrap implicit Union/Intersection wrappers with single child
+    while (current && (current->type() == ASTNode::Type::Union ||
+                       current->type() == ASTNode::Type::Intersection) &&
+           current->children().size() == 1) {
+        current = current->children()[0].get();
+    }
+    if (!current) return info;
+
+    // First child must be Translate that references the loop variable
+    if (current->type() != ASTNode::Type::Translate) return info;
+    auto* translate = dynamic_cast<TransformNode*>(current);
+    if (!translate) return info;
+
+    bool translateRefVar = false;
+    for (const auto& kv : translate->args()) {
+        if (valueReferencesVar(kv.second, loopVar)) translateRefVar = true;
+    }
+    if (!translateRefVar) return info;
+
+    info.translateNode = translate;
+    if (current->children().size() != 1) return info;
+    current = current->children()[0].get();
+
+    // Walk through constant transforms (Rotate, Scale, Mirror that don't ref loop var)
+    while (current && current->children().size() == 1) {
+        bool isTransform = false;
+        switch (current->type()) {
+            case ASTNode::Type::Rotate:
+            case ASTNode::Type::Scale:
+            case ASTNode::Type::Mirror:
+                isTransform = true;
+                break;
+            default:
+                break;
+        }
+        if (!isTransform) break;
+
+        auto* tNode = dynamic_cast<TransformNode*>(current);
+        if (tNode) {
+            for (const auto& kv : tNode->args()) {
+                if (valueReferencesVar(kv.second, loopVar)) return info;  // Not constant
+            }
+        }
+
+        info.constantChain.push_back(current);
+        current = current->children()[0].get();
+    }
+
+    // Terminal must be a primitive with no children
+    auto* prim = dynamic_cast<PrimitiveNode*>(current);
+    if (!prim || !current->children().empty()) return info;
+
+    info.primitiveNode = prim;
+
+    // Check which primitive args reference the loop variable (at most one)
+    int varyingCount = 0;
+    for (const auto& kv : prim->args()) {
+        if (valueReferencesVar(kv.second, loopVar)) {
+            info.varyingPrimArg = kv.first;
+            varyingCount++;
+        }
+    }
+    if (varyingCount > 1) return info;
+
+    info.valid = true;
+    return info;
+}
+
 void BlenderGenerator::visit(ForLoopNode& node) {
     const Value& range = node.range();
 
     if (range.isRange()) {
+        // ─── Check for Instance on Points rotation array pattern ───
+        // Detect: for (var = [start:step:end]) rotate([..., var, ...]) { body }
+        // where body doesn't reference var. Emit as Geo Nodes Instance on Points
+        // instead of a Python loop.
+        RotationArrayInfo rotInfo = detectRotationArrayPattern(node);
+        if (rotInfo.valid) {
+            emit("# Rotation array (Instance on Points): " + node.variable() +
+                 " [" + pyDouble(rotInfo.rangeStart) + ":" + pyDouble(rotInfo.rangeStep) +
+                 ":" + pyDouble(rotInfo.rangeEnd) + "] — " +
+                 std::to_string(rotInfo.iterCount) + " instances");
+
+            // Get the Rotate node's children — this is the body geometry
+            auto& rotateChildren = node.children()[0]->children();
+
+            // Emit the body geometry (children of the rotate) without the loop variable
+            for (auto& bodyChild : rotateChildren) {
+                if (bodyChild) bodyChild->accept(*this);
+            }
+
+            // Now last_geo holds the base geometry. Instance it N times with rotation.
+
+            // Create N points at origin using MeshLine with zero offset
+            std::string lineId = newNodeId();
+            emit(lineId + " = nodes.new('GeometryNodeMeshLine')");
+            emit(lineId + ".location = (x_pos, y_pos - 200)");
+            emit(lineId + ".mode = 'OFFSET'");
+            emit(lineId + ".inputs['Count'].default_value = " + std::to_string(rotInfo.iterCount));
+            emit(lineId + ".inputs['Offset'].default_value = (0, 0, 0)");
+            emit("x_pos += 200");
+
+            // Instance on Points: place the base geometry on each point
+            std::string instanceId = newNodeId();
+            emit(instanceId + " = nodes.new('GeometryNodeInstanceOnPoints')");
+            emit(instanceId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + lineId + ".outputs['Mesh'], " + instanceId + ".inputs['Points'])");
+            emit("link_nodes(links, last_geo, 'Geometry', " + instanceId + ", 'Instance')");
+            emit("x_pos += 200");
+
+            // Compute per-instance rotation: Index * step + start (in radians)
+            std::string indexId = newNodeId();
+            emit(indexId + " = nodes.new('GeometryNodeInputIndex')");
+            emit(indexId + ".location = (x_pos, y_pos - 350)");
+
+            // Index * step_radians
+            double stepRad = rotInfo.rangeStep * M_PI / 180.0;
+            std::string mulId = newNodeId();
+            emit(mulId + " = nodes.new('ShaderNodeMath')");
+            emit(mulId + ".operation = 'MULTIPLY'");
+            emit(mulId + ".location = (x_pos, y_pos - 350)");
+            emit("links.new(" + indexId + ".outputs['Index'], " + mulId + ".inputs[0])");
+            emit(mulId + ".inputs[1].default_value = " + pyDouble(stepRad));
+
+            // + start_radians
+            double startRad = rotInfo.rangeStart * M_PI / 180.0;
+            std::string angleNodeId = mulId;
+            if (std::abs(startRad) > 0.0001) {
+                std::string addId = newNodeId();
+                emit(addId + " = nodes.new('ShaderNodeMath')");
+                emit(addId + ".operation = 'ADD'");
+                emit(addId + ".location = (x_pos, y_pos - 350)");
+                emit("links.new(" + mulId + ".outputs['Value'], " + addId + ".inputs[0])");
+                emit(addId + ".inputs[1].default_value = " + pyDouble(startRad));
+                angleNodeId = addId;
+            }
+
+            // Build rotation vector with the varying component and constant others
+            std::string combineId = newNodeId();
+            emit(combineId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combineId + ".location = (x_pos, y_pos - 200)");
+            const char* components[] = {"X", "Y", "Z"};
+            for (int i = 0; i < 3; ++i) {
+                if (i == rotInfo.rotComponent) {
+                    emit("links.new(" + angleNodeId + ".outputs['Value'], " +
+                         combineId + ".inputs['" + components[i] + "'])");
+                } else {
+                    double constRad = rotInfo.otherRot[i] * M_PI / 180.0;
+                    if (std::abs(constRad) > 0.0001) {
+                        emit(combineId + ".inputs['" + std::string(components[i]) +
+                             "'].default_value = " + pyDouble(constRad));
+                    }
+                }
+            }
+
+            // Rotate instances
+            std::string rotateInstId = newNodeId();
+            emit(rotateInstId + " = nodes.new('GeometryNodeRotateInstances')");
+            emit(rotateInstId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + instanceId + ".outputs['Instances'], " +
+                 rotateInstId + ".inputs['Instances'])");
+            emit("links.new(" + combineId + ".outputs['Vector'], " +
+                 rotateInstId + ".inputs['Rotation'])");
+            emit("x_pos += 200");
+
+            // Realize instances to produce actual mesh geometry
+            std::string realizeId = newNodeId();
+            emit(realizeId + " = nodes.new('GeometryNodeRealizeInstances')");
+            emit(realizeId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + rotateInstId + ".outputs['Instances'], " +
+                 realizeId + ".inputs['Geometry'])");
+            emit("last_geo = " + realizeId);
+            emit("x_pos += 200");
+            return;
+        }
+
+        // ─── Check for Data-driven Instance Array pattern ───
+        // Detect: for (var = [start:step:end]) translate([f(var),...]) [const_transforms] primitive(with optional var-dep param)
+        // Emit: template geometry + data mesh (bmesh) + InstanceOnPoints + ScaleInstances
+        InstanceArrayInfo instInfo = detectInstanceArrayPattern(node);
+        if (instInfo.valid) {
+            std::string loopVar = node.variable();
+            emit("# Data-driven instance array: " + loopVar);
+
+            // Temporarily add loop var to loop_variables_ so exprTreeToPython treats it as runtime
+            loop_variables_.insert(loopVar);
+
+            // ─── 1. Emit template geometry ───
+            // Emit the primitive with default varying parameter (1.0 for height/depth)
+            Arguments templateArgs = instInfo.primitiveNode->args();
+            if (!instInfo.varyingPrimArg.empty()) {
+                templateArgs[instInfo.varyingPrimArg] = Value(1.0);
+            }
+
+            // Emit template primitive
+            switch (instInfo.primitiveNode->type()) {
+                case ASTNode::Type::Cube: emitCube(templateArgs); break;
+                case ASTNode::Type::Sphere: emitSphere(templateArgs); break;
+                case ASTNode::Type::Cylinder: emitCylinder(templateArgs); break;
+                case ASTNode::Type::Circle: emitCircle(templateArgs); break;
+                case ASTNode::Type::Square: emitSquare(templateArgs); break;
+                case ASTNode::Type::Polygon: emitPolygon(templateArgs); break;
+                case ASTNode::Type::Text: emitText(templateArgs); break;
+                case ASTNode::Type::Polyhedron: emitPolyhedron(templateArgs); break;
+                default: break;
+            }
+            std::string templateGeo = "last_geo";
+
+            // Apply constant transforms (in order from inner to outer — reverse of chain)
+            for (auto it = instInfo.constantChain.rbegin(); it != instInfo.constantChain.rend(); ++it) {
+                auto* tNode = dynamic_cast<TransformNode*>(*it);
+                if (!tNode) continue;
+                switch ((*it)->type()) {
+                    case ASTNode::Type::Rotate: emitRotate(tNode->args()); break;
+                    case ASTNode::Type::Scale: emitScale(tNode->args()); break;
+                    case ASTNode::Type::Mirror: emitMirror(tNode->args()); break;
+                    default: break;
+                }
+            }
+            emit("_template_geo = last_geo");
+
+            // ─── 2. Emit Python data mesh creation ───
+            // Get position expressions from Translate arguments
+            const auto& transArgs = instInfo.translateNode->args();
+            Value transVal;
+            {
+                auto it2 = transArgs.find("v");
+                if (it2 == transArgs.end()) it2 = transArgs.find("_0");
+                if (it2 != transArgs.end()) transVal = it2->second;
+            }
+
+            // Build Python expressions for position components
+            std::string posExprs[3] = {"0", "0", "0"};
+            if (transVal.isVector() && transVal.size() >= 3) {
+                for (int i = 0; i < 3 && i < static_cast<int>(transVal.size()); ++i) {
+                    ExprNodePtr tree = getOrMakeLiteralTree(transVal[i]);
+                    posExprs[i] = exprTreeToPython(tree);
+                }
+            }
+
+            // Build Python expression for the varying primitive parameter (if any)
+            std::string varyingExpr;
+            if (!instInfo.varyingPrimArg.empty()) {
+                const auto& primArgs = instInfo.primitiveNode->args();
+                auto it2 = primArgs.find(instInfo.varyingPrimArg);
+                if (it2 != primArgs.end()) {
+                    ExprNodePtr tree = getOrMakeLiteralTree(it2->second);
+                    varyingExpr = exprTreeToPython(tree);
+                }
+            }
+
+            // Emit range computation
+            ExprNodePtr startTree = range.rangeStartExpr();
+            ExprNodePtr endTree = range.rangeEndExpr();
+            ExprNodePtr stepTree = range.rangeStepExpr();
+            if (startTree) startTree = resolveExprTree(Value::expressionWithTree("", startTree));
+            if (endTree) endTree = resolveExprTree(Value::expressionWithTree("", endTree));
+            if (stepTree) stepTree = resolveExprTree(Value::expressionWithTree("", stepTree));
+
+            std::string startPy = startTree ? exprTreeToPython(startTree) : pyDouble(range.rangeStart());
+            std::string endPy = endTree ? exprTreeToPython(endTree) : pyDouble(range.rangeEnd());
+            std::string stepPy = stepTree ? exprTreeToPython(stepTree) : pyDouble(range.rangeStep());
+
+            emit("import bmesh as _bmesh");
+            emit("_inst_n = max(0, int((" + endPy + " - " + startPy + ") / " + stepPy + ") + 1)");
+            emit("_inst_bm = _bmesh.new()");
+            emit("_inst_heights = []");
+            emit("for _inst_i in range(_inst_n):");
+            indent_++;
+            emit(loopVar + " = " + startPy + " + _inst_i * " + stepPy);
+            emit("_inst_bm.verts.new((" + posExprs[0] + ", " + posExprs[1] + ", " + posExprs[2] + "))");
+            if (!varyingExpr.empty()) {
+                emit("_inst_heights.append(" + varyingExpr + ")");
+            }
+            indent_--;
+
+            emit("_inst_mesh = bpy.data.meshes.new('inst_data_' + str(id(nodes)))");
+            emit("_inst_bm.to_mesh(_inst_mesh)");
+            emit("_inst_bm.free()");
+
+            // Store varying parameter as a named attribute
+            if (!varyingExpr.empty()) {
+                emit("if _inst_n > 0:");
+                indent_++;
+                emit("_inst_attr = _inst_mesh.attributes.new('inst_scale', 'FLOAT', 'POINT')");
+                emit("for _inst_i in range(_inst_n):");
+                indent_++;
+                emit("_inst_attr.data[_inst_i].value = _inst_heights[_inst_i]");
+                indent_--;
+                indent_--;
+            }
+
+            // Create data object
+            emit("_inst_obj = bpy.data.objects.new('inst_data_' + str(id(nodes)), _inst_mesh)");
+            emit("bpy.context.collection.objects.link(_inst_obj)");
+            emit("_inst_obj.hide_viewport = True");
+            emit("_inst_obj.hide_render = True");
+
+            // ─── 3. Emit instancing node tree ───
+            emit("if _inst_n > 0:");
+            indent_++;
+
+            // Object Info node to reference data mesh
+            std::string objInfoId = newNodeId();
+            emit(objInfoId + " = nodes.new('GeometryNodeObjectInfo')");
+            emit(objInfoId + ".location = (x_pos, y_pos - 200)");
+            emit(objInfoId + ".transform_space = 'RELATIVE'");
+            emit(objInfoId + ".inputs['Object'].default_value = _inst_obj");
+            emit("x_pos += 200");
+
+            // Instance on Points
+            std::string iopId = newNodeId();
+            emit(iopId + " = nodes.new('GeometryNodeInstanceOnPoints')");
+            emit(iopId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + objInfoId + ".outputs['Geometry'], " + iopId + ".inputs['Points'])");
+            emit("link_nodes(links, _template_geo, 'Geometry', " + iopId + ", 'Instance')");
+            emit("x_pos += 200");
+
+            std::string currentInstOutput = iopId;
+
+            // If there's a varying parameter, scale instances by it
+            if (!varyingExpr.empty()) {
+                // NamedAttribute to read the stored scale data
+                std::string namedAttrId = newNodeId();
+                emit(namedAttrId + " = nodes.new('GeometryNodeInputNamedAttribute')");
+                emit(namedAttrId + ".location = (x_pos, y_pos - 300)");
+                emit(namedAttrId + ".data_type = 'FLOAT'");
+                emit(namedAttrId + ".inputs['Name'].default_value = 'inst_scale'");
+
+                // Determine which axis to scale — for cylinder height it's Z
+                // (MeshCone creates geometry along Z axis from 0 to Depth)
+                std::string combineId = newNodeId();
+                emit(combineId + " = nodes.new('ShaderNodeCombineXYZ')");
+                emit(combineId + ".location = (x_pos, y_pos - 200)");
+                emit(combineId + ".inputs['X'].default_value = 1.0");
+                emit(combineId + ".inputs['Y'].default_value = 1.0");
+                emit("links.new(" + namedAttrId + ".outputs['Attribute'], " + combineId + ".inputs['Z'])");
+
+                std::string scaleInstId = newNodeId();
+                emit(scaleInstId + " = nodes.new('GeometryNodeScaleInstances')");
+                emit(scaleInstId + ".location = (x_pos, y_pos)");
+                emit("links.new(" + currentInstOutput + ".outputs['Instances'], " +
+                     scaleInstId + ".inputs['Instances'])");
+                emit("links.new(" + combineId + ".outputs['Vector'], " +
+                     scaleInstId + ".inputs['Scale'])");
+                emit("x_pos += 200");
+                currentInstOutput = scaleInstId;
+            }
+
+            // Realize instances
+            std::string realizeId = newNodeId();
+            emit(realizeId + " = nodes.new('GeometryNodeRealizeInstances')");
+            emit(realizeId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + currentInstOutput + ".outputs['Instances'], " +
+                 realizeId + ".inputs['Geometry'])");
+            emit("last_geo = " + realizeId);
+            emit("x_pos += 200");
+
+            indent_--;  // end of if _inst_n > 0
+            emit("else:");
+            indent_++;
+            emit("last_geo = None");
+            indent_--;
+
+            loop_variables_.erase(loopVar);
+            return;
+        }
+
+        // ─── Standard Python loop fallback ───
         emit("# For loop: " + node.variable());
         std::string loopVar = node.variable();
 
@@ -1230,6 +2000,127 @@ void BlenderGenerator::visit(ForLoopNode& node) {
 
         loop_variables_.erase(loopVar);
     } else if (range.isVector()) {
+        // ─── Check for Scale mirror array pattern ───
+        // Detect: for (var = [v0, v1, ...]) scale([..., var, ...]) { body }
+        // where body doesn't reference var. Emit as Instance on Points + ScaleInstances.
+        ScaleArrayInfo scaleInfo = detectScaleArrayPattern(node);
+        if (scaleInfo.valid) {
+            int N = static_cast<int>(scaleInfo.values.size());
+            emit("# Scale mirror array (Instance on Points): " + node.variable() +
+                 " — " + std::to_string(N) + " instances");
+
+            // Emit the body geometry with the loop variable set to 1.0 (neutral for scale)
+            // This way scale([1, var, 1]) becomes scale([1, 1, 1]) = identity
+            std::string loopVar = node.variable();
+            variables_[loopVar] = Value(1.0);
+            for (auto& bodyChild : node.children()) {
+                if (bodyChild) bodyChild->accept(*this);
+            }
+            variables_.erase(loopVar);
+
+            // Create N points at origin
+            std::string lineId = newNodeId();
+            emit(lineId + " = nodes.new('GeometryNodeMeshLine')");
+            emit(lineId + ".location = (x_pos, y_pos - 200)");
+            emit(lineId + ".mode = 'OFFSET'");
+            emit(lineId + ".inputs['Count'].default_value = " + std::to_string(N));
+            emit(lineId + ".inputs['Offset'].default_value = (0, 0, 0)");
+            emit("x_pos += 200");
+
+            // Instance on Points
+            std::string instanceId = newNodeId();
+            emit(instanceId + " = nodes.new('GeometryNodeInstanceOnPoints')");
+            emit(instanceId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + lineId + ".outputs['Mesh'], " + instanceId + ".inputs['Points'])");
+            emit("link_nodes(links, last_geo, 'Geometry', " + instanceId + ", 'Instance')");
+            emit("x_pos += 200");
+
+            // Compute per-instance scale using Index
+            // Check if values form a linear sequence: v0 + Index * step
+            bool isLinear = true;
+            double v0 = scaleInfo.values[0];
+            double step = (N >= 2) ? (scaleInfo.values[1] - scaleInfo.values[0]) : 0;
+            for (size_t i = 2; i < scaleInfo.values.size(); ++i) {
+                if (std::abs(scaleInfo.values[i] - scaleInfo.values[i-1] - step) > 0.0001) {
+                    isLinear = false;
+                    break;
+                }
+            }
+
+            std::string scaleValueId;
+            if (isLinear) {
+                // Linear: value = v0 + Index * step
+                std::string indexId = newNodeId();
+                emit(indexId + " = nodes.new('GeometryNodeInputIndex')");
+                emit(indexId + ".location = (x_pos, y_pos - 350)");
+
+                if (std::abs(step) > 0.0001) {
+                    std::string mulId = newNodeId();
+                    emit(mulId + " = nodes.new('ShaderNodeMath')");
+                    emit(mulId + ".operation = 'MULTIPLY'");
+                    emit(mulId + ".location = (x_pos + 150, y_pos - 350)");
+                    emit("links.new(" + indexId + ".outputs['Index'], " + mulId + ".inputs[0])");
+                    emit(mulId + ".inputs[1].default_value = " + pyDouble(step));
+
+                    if (std::abs(v0) > 0.0001) {
+                        std::string addId = newNodeId();
+                        emit(addId + " = nodes.new('ShaderNodeMath')");
+                        emit(addId + ".operation = 'ADD'");
+                        emit(addId + ".location = (x_pos + 300, y_pos - 350)");
+                        emit("links.new(" + mulId + ".outputs['Value'], " + addId + ".inputs[0])");
+                        emit(addId + ".inputs[1].default_value = " + pyDouble(v0));
+                        scaleValueId = addId;
+                    } else {
+                        scaleValueId = mulId;
+                    }
+                } else {
+                    // All values are the same — just use a constant
+                    scaleValueId = "";  // Will use default_value below
+                }
+            }
+
+            // Build CombineXYZ for scale vector
+            std::string combineId = newNodeId();
+            emit(combineId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combineId + ".location = (x_pos, y_pos - 200)");
+            const char* components[] = {"X", "Y", "Z"};
+            for (int i = 0; i < 3; ++i) {
+                if (i == scaleInfo.scaleComponent) {
+                    if (!scaleValueId.empty()) {
+                        emit("links.new(" + scaleValueId + ".outputs['Value'], " +
+                             combineId + ".inputs['" + components[i] + "'])");
+                    } else {
+                        emit(combineId + ".inputs['" + std::string(components[i]) +
+                             "'].default_value = " + pyDouble(v0));
+                    }
+                } else {
+                    emit(combineId + ".inputs['" + std::string(components[i]) +
+                         "'].default_value = " + pyDouble(scaleInfo.otherScale[i]));
+                }
+            }
+
+            // ScaleInstances
+            std::string scaleInstId = newNodeId();
+            emit(scaleInstId + " = nodes.new('GeometryNodeScaleInstances')");
+            emit(scaleInstId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + instanceId + ".outputs['Instances'], " +
+                 scaleInstId + ".inputs['Instances'])");
+            emit("links.new(" + combineId + ".outputs['Vector'], " +
+                 scaleInstId + ".inputs['Scale'])");
+            emit("x_pos += 200");
+
+            // Realize instances
+            std::string realizeId = newNodeId();
+            emit(realizeId + " = nodes.new('GeometryNodeRealizeInstances')");
+            emit(realizeId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + scaleInstId + ".outputs['Instances'], " +
+                 realizeId + ".inputs['Geometry'])");
+            emit("last_geo = " + realizeId);
+            emit("x_pos += 200");
+            return;
+        }
+
+        // ─── Standard Python vector loop fallback ───
         emit("# For loop over vector: " + node.variable());
         std::string loopVar = node.variable();
 
@@ -2584,19 +3475,31 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
             emit(filletId + ".inputs['Radius'].default_value = " + std::to_string(absOffset));
         }
 
-        // Try to set POLY mode with $fn-controlled count for corner resolution.
-        // Falls back to default BEZIER mode (smooth Bézier arcs) if unavailable.
-        int count = fnVal / 4;
-        if (count < 1) count = 1;
-        emit("try:");
-        indent_++;
-        emit(filletId + ".mode = 'POLY'");
-        emit(filletId + ".inputs['Count'].default_value = " + std::to_string(count));
-        indent_--;
-        emit("except:");
-        indent_++;
-        emit("pass  # BEZIER mode (default) creates smooth arcs");
-        indent_--;
+        // Set Poly mode with $fn-controlled count for corner resolution.
+        // In Blender 5.1+, mode is a menu input socket ('Bézier'/'Poly'), not a property.
+        emit(filletId + ".inputs['Mode'].default_value = 'Poly'");
+        // Count = max(1, $fn / 4)
+        ExprNodePtr fnTree = getOrMakeLiteralTree(fn);
+        if (fnTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(fnTree)) {
+            // Build $fn / 4 node tree, linked from group_input
+            ExprNodePtr fnDiv4 = ExprNode::makeBinary(ExprNode::Op::DIVIDE, fnTree, ExprNode::makeLiteral(4.0));
+            auto fnResult = emitExpressionNodeTree(fnDiv4);
+            // Clamp: max(result, 1) using Math node
+            std::string maxId = newNodeId();
+            emit(maxId + " = nodes.new('ShaderNodeMath')");
+            emit(maxId + ".operation = 'MAXIMUM'");
+            emit(maxId + ".location = (x_pos, y_pos)");
+            connectExprResult(fnResult, maxId, 0);
+            emit(maxId + ".inputs[1].default_value = 1");
+            emit("links.new(" + maxId + ".outputs['Value'], " + filletId + ".inputs['Count'])");
+        } else if (in_module_ && fnTree->hasVariableRefs() && exprTreeReferencesModuleParams(fnTree)) {
+            std::string fnPy = exprTreeToPython(fnTree);
+            emit(filletId + ".inputs['Count'].default_value = max(1, int(" + fnPy + ") // 4)");
+        } else {
+            int count = fnVal / 4;
+            if (count < 1) count = 1;
+            emit(filletId + ".inputs['Count'].default_value = " + std::to_string(count));
+        }
 
         emit("link_nodes(links, last_geo, 'Curve', " + filletId + ", 'Curve')");
         emit("last_geo = " + filletId);
@@ -2608,9 +3511,25 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
         emit(subdivId + ".location = (x_pos, y_pos)");
 
         // Use $fn/4 cuts per edge for consistent resolution
-        int cuts = fnVal / 4;
-        if (cuts < 1) cuts = 1;
-        emit(subdivId + ".inputs['Cuts'].default_value = " + std::to_string(cuts));
+        ExprNodePtr fnTreeD = getOrMakeLiteralTree(fn);
+        if (fnTreeD->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(fnTreeD)) {
+            ExprNodePtr fnDiv4 = ExprNode::makeBinary(ExprNode::Op::DIVIDE, fnTreeD, ExprNode::makeLiteral(4.0));
+            auto fnResult = emitExpressionNodeTree(fnDiv4);
+            std::string maxId = newNodeId();
+            emit(maxId + " = nodes.new('ShaderNodeMath')");
+            emit(maxId + ".operation = 'MAXIMUM'");
+            emit(maxId + ".location = (x_pos, y_pos)");
+            connectExprResult(fnResult, maxId, 0);
+            emit(maxId + ".inputs[1].default_value = 1");
+            emit("links.new(" + maxId + ".outputs['Value'], " + subdivId + ".inputs['Cuts'])");
+        } else if (in_module_ && fnTreeD->hasVariableRefs() && exprTreeReferencesModuleParams(fnTreeD)) {
+            std::string fnPy = exprTreeToPython(fnTreeD);
+            emit(subdivId + ".inputs['Cuts'].default_value = max(1, int(" + fnPy + ") // 4)");
+        } else {
+            int cuts = fnVal / 4;
+            if (cuts < 1) cuts = 1;
+            emit(subdivId + ".inputs['Cuts'].default_value = " + std::to_string(cuts));
+        }
         emit("link_nodes(links, last_geo, 'Curve', " + subdivId + ", 'Curve')");
         emit("last_geo = " + subdivId);
         emit("x_pos += 200");
@@ -3090,119 +4009,214 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
     bool hasTwist = std::abs(twistVal) > 0.001;
     bool hasScale = std::abs(scaleNum - 1.0) > 0.001;
 
-    emit("# Linear Extrude (CurveToMesh approach)");
+    ExprNodePtr heightTree = getOrMakeLiteralTree(height);
 
     // Save the 2D profile curve for use as the cross-section
     std::string profileGeo = "last_geo";
 
-    // Create a straight line path from Z=0 to Z=height
-    std::string lineId = newNodeId();
-    emit(lineId + " = nodes.new('GeometryNodeCurvePrimitiveLine')");
-    emit(lineId + ".location = (x_pos, y_pos - 200)");
-    emit(lineId + ".mode = 'POINTS'");
-    emit(lineId + ".inputs['Start'].default_value = (0, 0, 0)");
-    ExprNodePtr heightTree = getOrMakeLiteralTree(height);
-    if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
-        // Height linked from group_input — build CombineXYZ for End point
-        std::string combId = newNodeId();
-        emit(combId + " = nodes.new('ShaderNodeCombineXYZ')");
-        emit(combId + ".location = (x_pos, y_pos - 350)");
-        auto result = emitExpressionNodeTree(heightTree);
-        connectExprResultNamed(result, combId, "Z");
-        emit("links.new(" + combId + ".outputs['Vector'], " + lineId + ".inputs['End'])");
-    } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
-        std::string hPy = exprTreeToPython(heightTree);
-        emit(lineId + ".inputs['End'].default_value = (0, 0, " + hPy + ")");
+    if (!hasTwist && !hasScale) {
+        // FillCurve + ExtrudeMesh approach — handles compound curves (2D booleans with holes)
+        emit("# Linear Extrude (FillCurve + ExtrudeMesh approach)");
+
+        // FillCurve: fills the 2D profile, interpreting reversed inner curves as holes
+        std::string fillId = newNodeId();
+        emit(fillId + " = nodes.new('GeometryNodeFillCurve')");
+        emit(fillId + ".location = (x_pos, y_pos)");
+        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + fillId + ", 'Curve')");
+        emit("x_pos += 200");
+
+        // ExtrudeMesh: extrude all faces upward by height (face normal is +Z)
+        std::string extId = newNodeId();
+        emit(extId + " = nodes.new('GeometryNodeExtrudeMesh')");
+        emit(extId + ".location = (x_pos, y_pos)");
+        emit(extId + ".mode = 'FACES'");
+        emit("links.new(" + fillId + ".outputs['Mesh'], " + extId + ".inputs['Mesh'])");
+
+        // Set Offset Scale to height
+        if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
+            auto hResult = emitExpressionNodeTree(heightTree);
+            connectExprResultNamed(hResult, extId, "Offset Scale");
+        } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
+            std::string hPy = exprTreeToPython(heightTree);
+            emit(extId + ".inputs['Offset Scale'].default_value = " + hPy);
+        } else {
+            emit(extId + ".inputs['Offset Scale'].default_value = " + pyDouble(hVal));
+        }
+
+        emit("last_geo = " + extId);
+        emit("x_pos += 200");
     } else {
-        emit(lineId + ".inputs['End'].default_value = (0, 0, " + pyDouble(hVal) + ")");
-    }
-    emit("x_pos += 200");
+        // CurveToMesh approach — supports twist and scale (only works for simple single-spline profiles)
+        emit("# Linear Extrude (CurveToMesh approach)");
 
-    // Track the current path curve node/output
-    std::string pathCurve = lineId;
-    std::string pathOutput = "Curve";
-
-    // Subdivide the line for smooth twist/scale interpolation
-    if (hasTwist || hasScale) {
-        int fnVal = static_cast<int>(evaluateExpr(fn));
-        int segments = std::max(fnVal, static_cast<int>(std::abs(twistVal) / 5.0));
-        if (segments < 8) segments = 8;
-
-        std::string subdivId = newNodeId();
-        emit(subdivId + " = nodes.new('GeometryNodeSubdivideCurve')");
-        emit(subdivId + ".location = (x_pos, y_pos - 200)");
-        emit(subdivId + ".inputs['Cuts'].default_value = " + std::to_string(segments));
-        emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + subdivId + ".inputs['Curve'])");
-        pathCurve = subdivId;
-        pathOutput = "Curve";
+        // Create a straight line path from Z=0 to Z=height
+        std::string lineId = newNodeId();
+        emit(lineId + " = nodes.new('GeometryNodeCurvePrimitiveLine')");
+        emit(lineId + ".location = (x_pos, y_pos - 200)");
+        emit(lineId + ".mode = 'POINTS'");
+        emit(lineId + ".inputs['Start'].default_value = (0, 0, 0)");
+        if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
+            // Height linked from group_input — build CombineXYZ for End point
+            std::string combId = newNodeId();
+            emit(combId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combId + ".location = (x_pos, y_pos - 350)");
+            auto result = emitExpressionNodeTree(heightTree);
+            connectExprResultNamed(result, combId, "Z");
+            emit("links.new(" + combId + ".outputs['Vector'], " + lineId + ".inputs['End'])");
+        } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
+            std::string hPy = exprTreeToPython(heightTree);
+            emit(lineId + ".inputs['End'].default_value = (0, 0, " + hPy + ")");
+        } else {
+            emit(lineId + ".inputs['End'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+        }
         emit("x_pos += 200");
-    }
 
-    // Apply twist using SetCurveTilt with SplineParameter
-    if (hasTwist) {
-        // SplineParameter gives 0..1 along the spline
-        std::string paramId = newNodeId();
-        emit(paramId + " = nodes.new('GeometryNodeSplineParameter')");
-        emit(paramId + ".location = (x_pos, y_pos - 350)");
+        // Track the current path curve node/output
+        std::string pathCurve = lineId;
+        std::string pathOutput = "Curve";
 
-        // Multiply factor by twist angle in radians
-        double twistRad = twistVal * M_PI / 180.0;
-        std::string mulId = newNodeId();
-        emit(mulId + " = nodes.new('ShaderNodeMath')");
-        emit(mulId + ".operation = 'MULTIPLY'");
-        emit(mulId + ".location = (x_pos, y_pos - 350)");
-        emit("links.new(" + paramId + ".outputs['Factor'], " + mulId + ".inputs[0])");
-        emit(mulId + ".inputs[1].default_value = " + pyDouble(twistRad));
+        // Subdivide the line for smooth twist/scale interpolation
+        {
+            int fnVal = static_cast<int>(evaluateExpr(fn));
+            int segments = std::max(fnVal, static_cast<int>(std::abs(twistVal) / 5.0));
+            if (segments < 8) segments = 8;
 
-        // Set the tilt on the path curve
-        std::string tiltId = newNodeId();
-        emit(tiltId + " = nodes.new('GeometryNodeSetCurveTilt')");
-        emit(tiltId + ".location = (x_pos, y_pos - 200)");
-        emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + tiltId + ".inputs['Curve'])");
-        emit("links.new(" + mulId + ".outputs['Value'], " + tiltId + ".inputs['Tilt'])");
-        pathCurve = tiltId;
-        pathOutput = "Curve";
+            std::string subdivId = newNodeId();
+            emit(subdivId + " = nodes.new('GeometryNodeSubdivideCurve')");
+            emit(subdivId + ".location = (x_pos, y_pos - 200)");
+            emit(subdivId + ".inputs['Cuts'].default_value = " + std::to_string(segments));
+            emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + subdivId + ".inputs['Curve'])");
+            pathCurve = subdivId;
+            pathOutput = "Curve";
+            emit("x_pos += 200");
+        }
+
+        // Apply twist using SetCurveTilt with SplineParameter
+        if (hasTwist) {
+            // SplineParameter gives 0..1 along the spline
+            std::string paramId = newNodeId();
+            emit(paramId + " = nodes.new('GeometryNodeSplineParameter')");
+            emit(paramId + ".location = (x_pos, y_pos - 350)");
+
+            // Multiply factor by twist angle in radians
+            double twistRad = twistVal * M_PI / 180.0;
+            std::string mulId = newNodeId();
+            emit(mulId + " = nodes.new('ShaderNodeMath')");
+            emit(mulId + ".operation = 'MULTIPLY'");
+            emit(mulId + ".location = (x_pos, y_pos - 350)");
+            emit("links.new(" + paramId + ".outputs['Factor'], " + mulId + ".inputs[0])");
+            emit(mulId + ".inputs[1].default_value = " + pyDouble(twistRad));
+
+            // Set the tilt on the path curve
+            std::string tiltId = newNodeId();
+            emit(tiltId + " = nodes.new('GeometryNodeSetCurveTilt')");
+            emit(tiltId + ".location = (x_pos, y_pos - 200)");
+            emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + tiltId + ".inputs['Curve'])");
+            emit("links.new(" + mulId + ".outputs['Value'], " + tiltId + ".inputs['Tilt'])");
+            pathCurve = tiltId;
+            pathOutput = "Curve";
+            emit("x_pos += 200");
+        }
+
+        // CurveToMesh: sweep the 2D profile along the line path
+        std::string ctmId = newNodeId();
+        emit(ctmId + " = nodes.new('GeometryNodeCurveToMesh')");
+        emit(ctmId + ".location = (x_pos, y_pos)");
+        emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + ctmId + ".inputs['Curve'])");
+        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + ctmId + ", 'Profile Curve')");
+        emit(ctmId + ".inputs['Fill Caps'].default_value = True");
+        emit("last_geo = " + ctmId);
         emit("x_pos += 200");
+
+        // Apply scale after CurveToMesh using SetPosition
+        // scaleFactor = 1 + (Z / height) * (targetScale - 1)
+        // New position: (X * scaleFactor, Y * scaleFactor, Z)
+        if (hasScale) {
+            emit("# Scale extrusion: taper XY based on Z position");
+
+            // Position → SeparateXYZ
+            std::string posId = newNodeId();
+            emit(posId + " = nodes.new('GeometryNodeInputPosition')");
+            emit(posId + ".location = (x_pos, y_pos - 400)");
+
+            std::string sepId = newNodeId();
+            emit(sepId + " = nodes.new('ShaderNodeSeparateXYZ')");
+            emit(sepId + ".location = (x_pos + 150, y_pos - 400)");
+            emit("links.new(" + posId + ".outputs['Position'], " + sepId + ".inputs['Vector'])");
+
+            // Z / height → factor along extrusion (0 at base, 1 at top)
+            std::string divId = newNodeId();
+            emit(divId + " = nodes.new('ShaderNodeMath')");
+            emit(divId + ".operation = 'DIVIDE'");
+            emit(divId + ".location = (x_pos + 300, y_pos - 400)");
+            emit("links.new(" + sepId + ".outputs['Z'], " + divId + ".inputs[0])");
+
+            // Use the height value for division
+            if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
+                auto hResult = emitExpressionNodeTree(heightTree);
+                if (hResult.nodeId == "__literal__") {
+                    emit(divId + ".inputs[1].default_value = " + pyDouble(hResult.literalValue));
+                } else {
+                    emit("links.new(" + hResult.nodeId + ".outputs['" + hResult.socketName + "'], " +
+                         divId + ".inputs[1])");
+                }
+            } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
+                std::string hPy = exprTreeToPython(heightTree);
+                emit(divId + ".inputs[1].default_value = " + hPy);
+            } else {
+                emit(divId + ".inputs[1].default_value = " + pyDouble(hVal));
+            }
+
+            // factor * (scale - 1)
+            double scaleMinusOne = scaleNum - 1.0;
+            std::string mulFactorId = newNodeId();
+            emit(mulFactorId + " = nodes.new('ShaderNodeMath')");
+            emit(mulFactorId + ".operation = 'MULTIPLY'");
+            emit(mulFactorId + ".location = (x_pos + 450, y_pos - 400)");
+            emit("links.new(" + divId + ".outputs['Value'], " + mulFactorId + ".inputs[0])");
+            emit(mulFactorId + ".inputs[1].default_value = " + pyDouble(scaleMinusOne));
+
+            // + 1 → scaleFactor
+            std::string addOneId = newNodeId();
+            emit(addOneId + " = nodes.new('ShaderNodeMath')");
+            emit(addOneId + ".operation = 'ADD'");
+            emit(addOneId + ".location = (x_pos + 600, y_pos - 400)");
+            emit("links.new(" + mulFactorId + ".outputs['Value'], " + addOneId + ".inputs[0])");
+            emit(addOneId + ".inputs[1].default_value = 1.0");
+
+            // X * scaleFactor
+            std::string mulXId = newNodeId();
+            emit(mulXId + " = nodes.new('ShaderNodeMath')");
+            emit(mulXId + ".operation = 'MULTIPLY'");
+            emit(mulXId + ".location = (x_pos + 750, y_pos - 350)");
+            emit("links.new(" + sepId + ".outputs['X'], " + mulXId + ".inputs[0])");
+            emit("links.new(" + addOneId + ".outputs['Value'], " + mulXId + ".inputs[1])");
+
+            // Y * scaleFactor
+            std::string mulYId = newNodeId();
+            emit(mulYId + " = nodes.new('ShaderNodeMath')");
+            emit(mulYId + ".operation = 'MULTIPLY'");
+            emit(mulYId + ".location = (x_pos + 750, y_pos - 450)");
+            emit("links.new(" + sepId + ".outputs['Y'], " + mulYId + ".inputs[0])");
+            emit("links.new(" + addOneId + ".outputs['Value'], " + mulYId + ".inputs[1])");
+
+            // CombineXYZ(scaled_x, scaled_y, original_z) → SetPosition
+            std::string combineId = newNodeId();
+            emit(combineId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combineId + ".location = (x_pos + 900, y_pos - 400)");
+            emit("links.new(" + mulXId + ".outputs['Value'], " + combineId + ".inputs['X'])");
+            emit("links.new(" + mulYId + ".outputs['Value'], " + combineId + ".inputs['Y'])");
+            emit("links.new(" + sepId + ".outputs['Z'], " + combineId + ".inputs['Z'])");
+
+            std::string setposId = newNodeId();
+            emit(setposId + " = nodes.new('GeometryNodeSetPosition')");
+            emit(setposId + ".location = (x_pos + 1050, y_pos)");
+            emit("link_nodes(links, last_geo, 'Geometry', " + setposId + ", 'Geometry')");
+            emit("links.new(" + combineId + ".outputs['Vector'], " + setposId + ".inputs['Position'])");
+            emit("last_geo = " + setposId);
+            emit("x_pos += 1200");
+        }
     }
-
-    // Apply scale using SetCurveRadius with SplineParameter interpolation
-    if (hasScale) {
-        // SplineParameter gives 0..1 along the spline
-        std::string paramId = newNodeId();
-        emit(paramId + " = nodes.new('GeometryNodeSplineParameter')");
-        emit(paramId + ".location = (x_pos, y_pos - 350)");
-
-        // Lerp from 1.0 at bottom to scaleNum at top: 1.0 + factor * (scale - 1.0)
-        // Use MapRange: from (0,1) to (1, scale)
-        std::string mapId = newNodeId();
-        emit(mapId + " = nodes.new('ShaderNodeMapRange')");
-        emit(mapId + ".location = (x_pos, y_pos - 350)");
-        emit("links.new(" + paramId + ".outputs['Factor'], " + mapId + ".inputs['Value'])");
-        emit(mapId + ".inputs['From Min'].default_value = 0.0");
-        emit(mapId + ".inputs['From Max'].default_value = 1.0");
-        emit(mapId + ".inputs['To Min'].default_value = 1.0");
-        emit(mapId + ".inputs['To Max'].default_value = " + pyDouble(scaleNum));
-
-        // Set the radius on the path curve
-        std::string radiusId = newNodeId();
-        emit(radiusId + " = nodes.new('GeometryNodeSetCurveRadius')");
-        emit(radiusId + ".location = (x_pos, y_pos - 200)");
-        emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + radiusId + ".inputs['Curve'])");
-        emit("links.new(" + mapId + ".outputs['Result'], " + radiusId + ".inputs['Radius'])");
-        pathCurve = radiusId;
-        pathOutput = "Curve";
-        emit("x_pos += 200");
-    }
-
-    // CurveToMesh: sweep the 2D profile along the line path
-    std::string ctmId = newNodeId();
-    emit(ctmId + " = nodes.new('GeometryNodeCurveToMesh')");
-    emit(ctmId + ".location = (x_pos, y_pos)");
-    emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + ctmId + ".inputs['Curve'])");
-    emit("link_nodes(links, " + profileGeo + ", 'Curve', " + ctmId + ", 'Profile Curve')");
-    emit(ctmId + ".inputs['Fill Caps'].default_value = True");
-    emit("last_geo = " + ctmId);
-    emit("x_pos += 200");
 
     // Handle center=true — translate by -height/2 in Z
     bool centerVal = center.toBool() || isSimpleVariableRef(center);
