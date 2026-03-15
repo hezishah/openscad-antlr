@@ -2539,8 +2539,6 @@ void BlenderGenerator::emitMirror(const Arguments& args) {
 }
 
 void BlenderGenerator::emitOffset(const Arguments& args) {
-    std::string nodeId = newNodeId();
-
     Value r = getArg(args, "r", getPositionalArg(args, 0, Value()));
     Value delta = getArg(args, "delta", Value());
 
@@ -2568,8 +2566,8 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
     emit("# Offset");
 
     if (useRounding) {
-        // r mode: use FilletCurve to round corners, then offset outward.
-        // Default BEZIER mode creates smooth circular arcs at each corner.
+        // r mode: first fillet corners for rounding, then offset the curve.
+        // FilletCurve rounds corners with the specified radius.
         std::string filletId = newNodeId();
         emit(filletId + " = nodes.new('GeometryNodeFilletCurve')");
         emit(filletId + ".location = (x_pos, y_pos)");
@@ -3080,86 +3078,159 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
 // Extrude generators
 void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
-    std::string nodeId = newNodeId();
-
     Value height = getArg(args, "height", getPositionalArg(args, 0, Value(1.0)));
     Value twist = getArg(args, "twist", Value(0.0));
     Value scale_val = getArg(args, "scale", Value(1.0));
     Value center = getArg(args, "center", Value(false));
+    Value fn = resolveFn(args);
 
-    emit("# Linear Extrude");
+    double hVal = height.isExpression() ? evaluateExpr(height) : height.toNumber();
+    double twistVal = twist.isExpression() ? evaluateExpr(twist) : twist.toNumber();
+    double scaleNum = scale_val.isExpression() ? evaluateExpr(scale_val) : scale_val.toNumber();
+    bool hasTwist = std::abs(twistVal) > 0.001;
+    bool hasScale = std::abs(scaleNum - 1.0) > 0.001;
 
-    // Fill the curve to create a mesh face for extrusion.
-    // We need two fills: one becomes the bottom cap (flipped normals),
-    // one gets extruded to create sides + top.
-    std::string fillId = newNodeId();
-    emit(fillId + " = nodes.new('GeometryNodeFillCurve')");
-    emit(fillId + ".location = (x_pos, y_pos)");
-    emit("link_nodes(links, last_geo, 'Curve', " + fillId + ", 'Curve')");
-    emit("x_pos += 200");
+    emit("# Linear Extrude (CurveToMesh approach)");
 
-    // Bottom cap: fill the same curve again and flip normals to face downward
-    std::string fillBottomId = newNodeId();
-    emit(fillBottomId + " = nodes.new('GeometryNodeFillCurve')");
-    emit(fillBottomId + ".location = (x_pos, y_pos - 200)");
-    emit("link_nodes(links, last_geo, 'Curve', " + fillBottomId + ", 'Curve')");
-    std::string flipId = newNodeId();
-    emit(flipId + " = nodes.new('GeometryNodeFlipFaces')");
-    emit(flipId + ".location = (x_pos, y_pos - 200)");
-    emit("links.new(" + fillBottomId + ".outputs['Mesh'], " + flipId + ".inputs['Mesh'])");
+    // Save the 2D profile curve for use as the cross-section
+    std::string profileGeo = "last_geo";
 
-    // Extrude with Individual=False for proper solid extrusion
-    emit(nodeId + " = nodes.new('GeometryNodeExtrudeMesh')");
-    emit(nodeId + ".location = (x_pos, y_pos)");
-    emit(nodeId + ".inputs['Individual'].default_value = False");
-
-    // Set offset direction (0,0,1) and use Offset Scale for height
-    emit(nodeId + ".inputs['Offset'].default_value = (0, 0, 1)");
+    // Create a straight line path from Z=0 to Z=height
+    std::string lineId = newNodeId();
+    emit(lineId + " = nodes.new('GeometryNodeCurvePrimitiveLine')");
+    emit(lineId + ".location = (x_pos, y_pos - 200)");
+    emit(lineId + ".mode = 'POINTS'");
+    emit(lineId + ".inputs['Start'].default_value = (0, 0, 0)");
     ExprNodePtr heightTree = getOrMakeLiteralTree(height);
     if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
+        // Height linked from group_input — build CombineXYZ for End point
+        std::string combId = newNodeId();
+        emit(combId + " = nodes.new('ShaderNodeCombineXYZ')");
+        emit(combId + ".location = (x_pos, y_pos - 350)");
         auto result = emitExpressionNodeTree(heightTree);
-        connectExprResultNamed(result, nodeId, "Offset Scale");
+        connectExprResultNamed(result, combId, "Z");
+        emit("links.new(" + combId + ".outputs['Vector'], " + lineId + ".inputs['End'])");
     } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
-        emit(nodeId + ".inputs['Offset Scale'].default_value = " +
-             exprTreeToPython(heightTree));
+        std::string hPy = exprTreeToPython(heightTree);
+        emit(lineId + ".inputs['End'].default_value = (0, 0, " + hPy + ")");
     } else {
-        double hVal = height.isExpression() ? evaluateExpr(height) : height.toNumber();
-        emit(nodeId + ".inputs['Offset Scale'].default_value = " +
-             std::to_string(hVal));
+        emit(lineId + ".inputs['End'].default_value = (0, 0, " + pyDouble(hVal) + ")");
     }
-    emit("link_nodes(links, " + fillId + ", 'Mesh', " + nodeId + ", 'Mesh')");
     emit("x_pos += 200");
 
-    // Track the last node from the extrude chain (may be ScaleElements or ExtrudeMesh)
-    std::string extrudeLastId = nodeId;
+    // Track the current path curve node/output
+    std::string pathCurve = lineId;
+    std::string pathOutput = "Curve";
 
-    // Handle scale parameter — scale the top face
-    double scaleNum = scale_val.isExpression() ? evaluateExpr(scale_val) : scale_val.toNumber();
-    if (scaleNum != 1.0) {
-        std::string scaleId = newNodeId();
-        emit("# Scale top face for linear_extrude(scale=" + std::to_string(scaleNum) + ")");
-        emit(scaleId + " = nodes.new('GeometryNodeScaleElements')");
-        emit(scaleId + ".location = (x_pos, y_pos)");
-        emit(scaleId + ".inputs['Scale'].default_value = " + std::to_string(scaleNum));
-        emit("links.new(" + nodeId + ".outputs['Mesh'], " + scaleId + ".inputs['Geometry'])");
-        emit("links.new(" + nodeId + ".outputs['Top'], " + scaleId + ".inputs['Selection'])");
-        extrudeLastId = scaleId;
+    // Subdivide the line for smooth twist/scale interpolation
+    if (hasTwist || hasScale) {
+        int fnVal = static_cast<int>(evaluateExpr(fn));
+        int segments = std::max(fnVal, static_cast<int>(std::abs(twistVal) / 5.0));
+        if (segments < 8) segments = 8;
+
+        std::string subdivId = newNodeId();
+        emit(subdivId + " = nodes.new('GeometryNodeSubdivideCurve')");
+        emit(subdivId + ".location = (x_pos, y_pos - 200)");
+        emit(subdivId + ".inputs['Cuts'].default_value = " + std::to_string(segments));
+        emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + subdivId + ".inputs['Curve'])");
+        pathCurve = subdivId;
+        pathOutput = "Curve";
         emit("x_pos += 200");
     }
 
-    // Join bottom cap with extruded mesh and merge overlapping vertices
-    std::string joinId = newNodeId();
-    emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-    emit(joinId + ".location = (x_pos, y_pos)");
-    emit("links.new(" + flipId + ".outputs['Mesh'], " + joinId + ".inputs['Geometry'])");
-    emit("link_nodes(links, " + extrudeLastId + ", 'Geometry', " + joinId + ", 'Geometry')");
-    std::string mergeId = newNodeId();
-    emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
-    emit(mergeId + ".location = (x_pos, y_pos)");
-    emit(mergeId + ".inputs['Distance'].default_value = 0.001");
-    emit("links.new(" + joinId + ".outputs['Geometry'], " + mergeId + ".inputs['Geometry'])");
-    emit("last_geo = " + mergeId);
+    // Apply twist using SetCurveTilt with SplineParameter
+    if (hasTwist) {
+        // SplineParameter gives 0..1 along the spline
+        std::string paramId = newNodeId();
+        emit(paramId + " = nodes.new('GeometryNodeSplineParameter')");
+        emit(paramId + ".location = (x_pos, y_pos - 350)");
+
+        // Multiply factor by twist angle in radians
+        double twistRad = twistVal * M_PI / 180.0;
+        std::string mulId = newNodeId();
+        emit(mulId + " = nodes.new('ShaderNodeMath')");
+        emit(mulId + ".operation = 'MULTIPLY'");
+        emit(mulId + ".location = (x_pos, y_pos - 350)");
+        emit("links.new(" + paramId + ".outputs['Factor'], " + mulId + ".inputs[0])");
+        emit(mulId + ".inputs[1].default_value = " + pyDouble(twistRad));
+
+        // Set the tilt on the path curve
+        std::string tiltId = newNodeId();
+        emit(tiltId + " = nodes.new('GeometryNodeSetCurveTilt')");
+        emit(tiltId + ".location = (x_pos, y_pos - 200)");
+        emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + tiltId + ".inputs['Curve'])");
+        emit("links.new(" + mulId + ".outputs['Value'], " + tiltId + ".inputs['Tilt'])");
+        pathCurve = tiltId;
+        pathOutput = "Curve";
+        emit("x_pos += 200");
+    }
+
+    // Apply scale using SetCurveRadius with SplineParameter interpolation
+    if (hasScale) {
+        // SplineParameter gives 0..1 along the spline
+        std::string paramId = newNodeId();
+        emit(paramId + " = nodes.new('GeometryNodeSplineParameter')");
+        emit(paramId + ".location = (x_pos, y_pos - 350)");
+
+        // Lerp from 1.0 at bottom to scaleNum at top: 1.0 + factor * (scale - 1.0)
+        // Use MapRange: from (0,1) to (1, scale)
+        std::string mapId = newNodeId();
+        emit(mapId + " = nodes.new('ShaderNodeMapRange')");
+        emit(mapId + ".location = (x_pos, y_pos - 350)");
+        emit("links.new(" + paramId + ".outputs['Factor'], " + mapId + ".inputs['Value'])");
+        emit(mapId + ".inputs['From Min'].default_value = 0.0");
+        emit(mapId + ".inputs['From Max'].default_value = 1.0");
+        emit(mapId + ".inputs['To Min'].default_value = 1.0");
+        emit(mapId + ".inputs['To Max'].default_value = " + pyDouble(scaleNum));
+
+        // Set the radius on the path curve
+        std::string radiusId = newNodeId();
+        emit(radiusId + " = nodes.new('GeometryNodeSetCurveRadius')");
+        emit(radiusId + ".location = (x_pos, y_pos - 200)");
+        emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + radiusId + ".inputs['Curve'])");
+        emit("links.new(" + mapId + ".outputs['Result'], " + radiusId + ".inputs['Radius'])");
+        pathCurve = radiusId;
+        pathOutput = "Curve";
+        emit("x_pos += 200");
+    }
+
+    // CurveToMesh: sweep the 2D profile along the line path
+    std::string ctmId = newNodeId();
+    emit(ctmId + " = nodes.new('GeometryNodeCurveToMesh')");
+    emit(ctmId + ".location = (x_pos, y_pos)");
+    emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + ctmId + ".inputs['Curve'])");
+    emit("link_nodes(links, " + profileGeo + ", 'Curve', " + ctmId + ", 'Profile Curve')");
+    emit(ctmId + ".inputs['Fill Caps'].default_value = True");
+    emit("last_geo = " + ctmId);
     emit("x_pos += 200");
+
+    // Handle center=true — translate by -height/2 in Z
+    bool centerVal = center.toBool() || isSimpleVariableRef(center);
+    if (centerVal) {
+        emitBlank();
+        emit("# Translate for center=true");
+        std::string transId = newNodeId();
+        emit(transId + " = nodes.new('GeometryNodeTransform')");
+        emit(transId + ".location = (x_pos, y_pos)");
+
+        if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
+            ExprNodePtr negHalfH = ExprNode::makeBinary(
+                ExprNode::Op::DIVIDE,
+                ExprNode::makeUnary(ExprNode::Op::NEGATE, heightTree),
+                ExprNode::makeLiteral(2.0));
+            emitScalarToVectorInput(transId, "Translation", negHalfH, 2, 0.0, 0.0, 0.0);
+        } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
+            std::string hPy = exprTreeToPython(heightTree);
+            emit(transId + ".inputs['Translation'].default_value = (0, 0, -(" + hPy + ") / 2)");
+        } else {
+            emit(transId + ".inputs['Translation'].default_value = (0, 0, " +
+                 pyDouble(-hVal / 2.0) + ")");
+        }
+
+        emit("link_nodes(links, last_geo, 'Mesh', " + transId + ", 'Geometry')");
+        emit("last_geo = " + transId);
+        emit("x_pos += 200");
+    }
 }
 
 void BlenderGenerator::emitRotateExtrude(const Arguments& args) {
