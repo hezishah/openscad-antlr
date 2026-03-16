@@ -884,15 +884,15 @@ extern const std::vector<std::string>& get_include_paths();
 extern const std::string& get_current_file_dir();
 
 static std::string resolve_include_file(const std::string& filename, const std::string& from_dir) {
-    // 1. Try relative to the referring file's directory
-    if (!from_dir.empty()) {
-        std::string path = from_dir + "/" + filename;
+    // 1. Try each include path first (allows filtered library overrides)
+    for (const auto& p : get_include_paths()) {
+        std::string path = p + "/" + filename;
         FILE* test = fopen(path.c_str(), "r");
         if (test) { fclose(test); return path; }
     }
-    // 2. Try each include path
-    for (const auto& p : get_include_paths()) {
-        std::string path = p + "/" + filename;
+    // 2. Try relative to the referring file's directory
+    if (!from_dir.empty()) {
+        std::string path = from_dir + "/" + filename;
         FILE* test = fopen(path.c_str(), "r");
         if (test) { fclose(test); return path; }
     }

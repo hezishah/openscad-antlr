@@ -75,18 +75,16 @@ WS          [ \t\r]+
     FILE* f = nullptr;
     std::string resolved_path;
 
-    /* 1. Try relative to current file's directory */
-    if (!current_file_dir.empty()) {
+    /* 1. Try each include path first (allows filtered library overrides) */
+    for (const auto& path : include_paths) {
+        resolved_path = path + "/" + include_filename;
+        f = fopen(resolved_path.c_str(), "r");
+        if (f) break;
+    }
+    /* 2. Try relative to current file's directory */
+    if (!f && !current_file_dir.empty()) {
         resolved_path = current_file_dir + "/" + include_filename;
         f = fopen(resolved_path.c_str(), "r");
-    }
-    /* 2. Try each include path */
-    if (!f) {
-        for (const auto& path : include_paths) {
-            resolved_path = path + "/" + include_filename;
-            f = fopen(resolved_path.c_str(), "r");
-            if (f) break;
-        }
     }
     /* 3. Try as absolute path */
     if (!f) {
