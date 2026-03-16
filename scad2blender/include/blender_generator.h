@@ -61,6 +61,7 @@ private:
     std::map<std::string, Value> variables_;
     std::set<std::string> eval_visiting_;  // Guard against infinite recursion in evaluateExprTree
     bool in_module_ = false;
+    bool in_hull_ = false;
     bool module_uses_children_ = false;
     std::set<std::string> current_module_params_;  // Parameter names of the module being emitted
     std::set<std::string> loop_variables_;            // Active for-loop variable names

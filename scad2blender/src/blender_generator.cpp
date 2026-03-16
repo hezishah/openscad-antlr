@@ -1107,10 +1107,14 @@ void BlenderGenerator::visit(TransformNode& node) {
             processChildren(node);
             emitOffset(node.args());
             break;
-        case ASTNode::Type::Hull:
+        case ASTNode::Type::Hull: {
+            bool wasInHull = in_hull_;
+            in_hull_ = true;
             processChildren(node);
+            in_hull_ = wasInHull;
             emitHull(node.args());
             break;
+        }
         case ASTNode::Type::Minkowski:
             processChildren(node);
             emitMinkowski(node.args());
@@ -2240,6 +2244,35 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         }
 
         // Link each iteration's result into the join node
+        emit("if last_geo is not None:");
+        indent_++;
+        emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+        indent_--;
+
+        indent_--;
+
+        emit("last_geo = " + joinId);
+
+        loop_variables_.erase(loopVar);
+    } else if (range.isExpression() && range.exprTree()) {
+        // Expression-based range (e.g., for (j = i[2]) where i is an outer loop variable)
+        // Emit as Python for loop using the expression's Python representation
+        std::string loopVar = node.variable();
+        loop_variables_.insert(loopVar);
+
+        std::string joinId = newNodeId();
+        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+        emit(joinId + ".location = (x_pos, y_pos)");
+
+        std::string rangeExpr = exprTreeToPython(range.exprTree());
+        emit("for " + loopVar + " in " + rangeExpr + ":");
+        indent_++;
+
+        for (auto& child : node.children()) {
+            if (!child) continue;
+            child->accept(*this);
+        }
+
         emit("if last_geo is not None:");
         indent_++;
         emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
@@ -3528,6 +3561,15 @@ void BlenderGenerator::emitMirror(const Arguments& args) {
     emit("link_nodes(links, last_geo, 'Geometry', " + nodeId + ", 'Geometry')");
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
+
+    // Negative scale flips face normals — add FlipFaces to fix winding order
+    std::string flipId = newNodeId();
+    emit("# FlipFaces to fix normals after mirror");
+    emit(flipId + " = nodes.new('GeometryNodeFlipFaces')");
+    emit(flipId + ".location = (x_pos, y_pos)");
+    emit("link_nodes(links, last_geo, 'Geometry', " + flipId + ", 'Geometry')");
+    emit("last_geo = " + flipId);
+    emit("x_pos += 200");
 }
 
 void BlenderGenerator::emitOffset(const Arguments& args) {
@@ -3885,6 +3927,26 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         return;
     }
 
+    // Inside hull(), use JoinGeometry instead of boolean operations
+    // ConvexHull only needs point data — boolean UNION is unnecessary and can produce non-manifold artifacts
+    if (in_hull_ && blenderOp == "UNION") {
+        std::string joinId = newNodeId();
+        emit("# Union (JoinGeometry for hull)");
+        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+        emit(joinId + ".location = (x_pos, y_pos)");
+
+        for (auto& child : actualChildren) {
+            child->accept(*this);
+            emit("if last_geo is not None:");
+            indent_++;
+            emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+            indent_--;
+        }
+
+        emit("last_geo = " + joinId);
+        return;
+    }
+
     // Use a unique counter for this boolean scope to avoid variable name collisions
     int boolScopeId = node_counter_++;
 
@@ -4018,6 +4080,20 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 indent_--;  // end if last_geo is not None
             }
         }  // end 3D DIFFERENCE path
+
+        // Clean up near-coincident vertices from boolean operations
+        // EXACT solver can produce nearly-duplicate vertices that cause non-manifold edges
+        std::string mergeId = newNodeId();
+        emit("# MergeByDistance to clean up boolean artifacts");
+        emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
+        emit(mergeId + ".location = (x_pos, y_pos)");
+        emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
+        emit("if " + firstGeo + " is not None:");
+        indent_++;
+        emit("links.new(" + firstGeo + ".outputs[0], " + mergeId + ".inputs['Geometry'])");
+        emit(firstGeo + " = " + mergeId);
+        indent_--;
+        emit("x_pos += 200");
     } else {
         // UNION and INTERSECT: use geometry nodes mesh boolean
 
