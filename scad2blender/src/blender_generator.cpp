@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <fstream>
 namespace scad2blender {
 
 // Convert a double to a Python-safe string, handling NaN and infinity
@@ -1000,13 +1001,20 @@ void BlenderGenerator::emitFooter() {
     emit("# Clean up temporary boolean objects");
     emit("for _o in list(bpy.data.objects):");
     indent_++;
-    emit("if _o.name.startswith('_diff_'):");
+    emit("if _o.name.startswith('_diff_') or _o.name.startswith('_dxf_'):");
     indent_++;
     emit("_mesh = _o.data");
     emit("bpy.data.objects.remove(_o, do_unlink=True)");
     emit("if _mesh and _mesh.users == 0:");
     indent_++;
+    emit("if isinstance(_mesh, bpy.types.Mesh):");
+    indent_++;
     emit("bpy.data.meshes.remove(_mesh)");
+    indent_--;
+    emit("elif isinstance(_mesh, bpy.types.Curve):");
+    indent_++;
+    emit("bpy.data.curves.remove(_mesh)");
+    indent_--;
     indent_--;
     indent_--;
     indent_--;
@@ -1072,6 +1080,9 @@ void BlenderGenerator::visit(PrimitiveNode& node) {
             break;
         case ASTNode::Type::Text:
             emitText(node.args());
+            break;
+        case ASTNode::Type::Import:
+            emitImport(node.args());
             break;
         default:
             emit("# Unsupported primitive type");
@@ -2230,10 +2241,17 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         // Track loop variable
         loop_variables_.insert(loopVar);
 
-        // Create a JoinGeometry node to accumulate geometry from each iteration
-        std::string joinId = newNodeId();
-        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinId + ".location = (x_pos, y_pos)");
+        // When inside a DIFFERENCE tool, chain booleans per iteration instead of JoinGeometry
+        bool chainDiff = !diff_chain_base_.empty();
+        std::string chainBase = diff_chain_base_;
+        std::string joinId;
+
+        if (!chainDiff) {
+            // Create a JoinGeometry node to accumulate geometry from each iteration
+            joinId = newNodeId();
+            emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+            emit(joinId + ".location = (x_pos, y_pos)");
+        }
 
         emit("for " + loopVar + " in " + range.toPython() + ":");
         indent_++;
@@ -2243,15 +2261,37 @@ void BlenderGenerator::visit(ForLoopNode& node) {
             child->accept(*this);
         }
 
-        // Link each iteration's result into the join node
-        emit("if last_geo is not None:");
-        indent_++;
-        emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
-        indent_--;
+        if (chainDiff) {
+            // Chain DIFFERENCE: base -= each iteration's geometry
+            emit("if last_geo is not None:");
+            indent_++;
+            std::string boolId = newNodeId();
+            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+            emit(boolId + ".location = (x_pos, y_pos)");
+            emit(boolId + ".operation = 'DIFFERENCE'");
+            emit(boolId + ".solver = 'EXACT'");
+            emit("links.new(" + chainBase + ".outputs[0], " + boolId + ".inputs[0])");
+            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+            emit(chainBase + " = " + boolId);
+            emit("x_pos += 200");
+            emit("y_pos -= 50");
+            indent_--;
+        } else {
+            // Link each iteration's result into the join node
+            emit("if last_geo is not None:");
+            indent_++;
+            emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+            indent_--;
+        }
 
         indent_--;
 
-        emit("last_geo = " + joinId);
+        if (chainDiff) {
+            emit("last_geo = " + chainBase);
+            diff_chain_base_.clear();  // Signal that chaining was used
+        } else {
+            emit("last_geo = " + joinId);
+        }
 
         loop_variables_.erase(loopVar);
     } else if (range.isExpression() && range.exprTree()) {
@@ -2260,9 +2300,15 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         std::string loopVar = node.variable();
         loop_variables_.insert(loopVar);
 
-        std::string joinId = newNodeId();
-        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinId + ".location = (x_pos, y_pos)");
+        bool chainDiff2 = !diff_chain_base_.empty();
+        std::string chainBase2 = diff_chain_base_;
+        std::string joinId;
+
+        if (!chainDiff2) {
+            joinId = newNodeId();
+            emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+            emit(joinId + ".location = (x_pos, y_pos)");
+        }
 
         std::string rangeExpr = exprTreeToPython(range.exprTree());
         emit("for " + loopVar + " in " + rangeExpr + ":");
@@ -2273,14 +2319,35 @@ void BlenderGenerator::visit(ForLoopNode& node) {
             child->accept(*this);
         }
 
-        emit("if last_geo is not None:");
-        indent_++;
-        emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
-        indent_--;
+        if (chainDiff2) {
+            emit("if last_geo is not None:");
+            indent_++;
+            std::string boolId = newNodeId();
+            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+            emit(boolId + ".location = (x_pos, y_pos)");
+            emit(boolId + ".operation = 'DIFFERENCE'");
+            emit(boolId + ".solver = 'EXACT'");
+            emit("links.new(" + chainBase2 + ".outputs[0], " + boolId + ".inputs[0])");
+            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+            emit(chainBase2 + " = " + boolId);
+            emit("x_pos += 200");
+            emit("y_pos -= 50");
+            indent_--;
+        } else {
+            emit("if last_geo is not None:");
+            indent_++;
+            emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+            indent_--;
+        }
 
         indent_--;
 
-        emit("last_geo = " + joinId);
+        if (chainDiff2) {
+            emit("last_geo = " + chainBase2);
+            diff_chain_base_.clear();
+        } else {
+            emit("last_geo = " + joinId);
+        }
 
         loop_variables_.erase(loopVar);
     } else {
@@ -3572,6 +3639,223 @@ void BlenderGenerator::emitMirror(const Arguments& args) {
     emit("x_pos += 200");
 }
 
+// ─── DXF Import ────────────────────────────────────────────────────────────
+
+// Simple DXF LINE entity
+struct DxfLine {
+    double x1, y1, x2, y2;
+    std::string layer;
+};
+
+// Parse DXF file and extract LINE entities
+static std::vector<DxfLine> parseDxfLines(const std::string& filepath) {
+    std::vector<DxfLine> lines;
+    std::ifstream file(filepath);
+    if (!file.is_open()) return lines;
+
+    std::string groupCode, value;
+    bool inEntities = false;
+    bool inLine = false;
+    DxfLine current;
+    current.x1 = current.y1 = current.x2 = current.y2 = 0;
+
+    while (std::getline(file, groupCode)) {
+        // Trim whitespace
+        while (!groupCode.empty() && (groupCode.front() == ' ' || groupCode.front() == '\t'))
+            groupCode.erase(groupCode.begin());
+        while (!groupCode.empty() && (groupCode.back() == '\r' || groupCode.back() == '\n'))
+            groupCode.pop_back();
+
+        if (!std::getline(file, value)) break;
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+            value.erase(value.begin());
+        while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
+            value.pop_back();
+
+        int code = 0;
+        try { code = std::stoi(groupCode); } catch (...) { continue; }
+
+        if (code == 2 && value == "ENTITIES") { inEntities = true; continue; }
+        if (code == 0 && value == "ENDSEC" && inEntities) {
+            if (inLine) lines.push_back(current);
+            break;
+        }
+        if (!inEntities) continue;
+
+        if (code == 0) {
+            if (inLine) {
+                lines.push_back(current);
+                current = DxfLine();
+                current.x1 = current.y1 = current.x2 = current.y2 = 0;
+            }
+            inLine = (value == "LINE");
+            continue;
+        }
+
+        if (!inLine) continue;
+
+        if (code == 8) current.layer = value;
+        else if (code == 10) current.x1 = std::stod(value);
+        else if (code == 20) current.y1 = std::stod(value);
+        else if (code == 11) current.x2 = std::stod(value);
+        else if (code == 21) current.y2 = std::stod(value);
+    }
+
+    return lines;
+}
+
+// Chain LINE endpoints into ordered polygon points
+static std::vector<std::pair<double, double>> chainLines(const std::vector<DxfLine>& lines) {
+    if (lines.empty()) return {};
+
+    // Build adjacency: for each endpoint, find connected line endpoints
+    std::vector<std::pair<double, double>> points;
+    std::vector<bool> used(lines.size(), false);
+
+    // Start with the first line
+    used[0] = true;
+    points.push_back({lines[0].x1, lines[0].y1});
+    points.push_back({lines[0].x2, lines[0].y2});
+
+    auto close = [](double a, double b) { return std::abs(a - b) < 0.001; };
+    auto ptMatch = [&](double x1, double y1, double x2, double y2) {
+        return close(x1, x2) && close(y1, y2);
+    };
+
+    bool found = true;
+    while (found) {
+        found = false;
+        double lastX = points.back().first;
+        double lastY = points.back().second;
+
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (used[i]) continue;
+            if (ptMatch(lastX, lastY, lines[i].x1, lines[i].y1)) {
+                points.push_back({lines[i].x2, lines[i].y2});
+                used[i] = true;
+                found = true;
+                break;
+            }
+            if (ptMatch(lastX, lastY, lines[i].x2, lines[i].y2)) {
+                points.push_back({lines[i].x1, lines[i].y1});
+                used[i] = true;
+                found = true;
+                break;
+            }
+        }
+    }
+
+    // Remove last point if it matches first (closed polygon)
+    if (points.size() > 2) {
+        auto& f = points.front();
+        auto& l = points.back();
+        if (close(f.first, l.first) && close(f.second, l.second)) {
+            points.pop_back();
+        }
+    }
+
+    return points;
+}
+
+void BlenderGenerator::emitImport(const Arguments& args) {
+    Value fileVal = getArg(args, "file", getPositionalArg(args, 0, Value()));
+    Value layerVal = getArg(args, "layer", Value());
+
+    if (fileVal.isUndefined() || !fileVal.isString()) {
+        emit("# Import: no file specified");
+        return;
+    }
+
+    std::string filename = fileVal.toString();
+    // Remove quotes if present
+    if (filename.size() >= 2 && filename.front() == '"' && filename.back() == '"') {
+        filename = filename.substr(1, filename.size() - 2);
+    }
+
+    // Check if it's a DXF file
+    std::string ext = filename;
+    size_t dotPos = ext.rfind('.');
+    if (dotPos != std::string::npos) {
+        ext = ext.substr(dotPos + 1);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    }
+
+    if (ext != "dxf") {
+        emit("# Import: unsupported file type: " + filename);
+        return;
+    }
+
+    // Resolve file path
+    std::string filepath = filename;
+    if (!source_dir_.empty() && filename[0] != '/') {
+        filepath = source_dir_ + "/" + filename;
+    }
+
+    // Parse DXF
+    auto allLines = parseDxfLines(filepath);
+    if (allLines.empty()) {
+        emit("# Import: could not read DXF file: " + filepath);
+        return;
+    }
+
+    // Filter by layer if specified
+    std::string layer;
+    if (!layerVal.isUndefined()) {
+        layer = layerVal.toString();
+        if (layer.size() >= 2 && layer.front() == '"' && layer.back() == '"') {
+            layer = layer.substr(1, layer.size() - 2);
+        }
+    }
+
+    std::vector<DxfLine> layerLines;
+    for (auto& l : allLines) {
+        if (layer.empty() || l.layer == layer) {
+            layerLines.push_back(l);
+        }
+    }
+
+    if (layerLines.empty()) {
+        emit("# Import: no LINE entities found on layer '" + layer + "' in " + filename);
+        return;
+    }
+
+    // Chain lines into polygon points
+    auto points = chainLines(layerLines);
+    if (points.size() < 3) {
+        emit("# Import: could not chain lines into polygon on layer '" + layer + "'");
+        return;
+    }
+
+    int N = static_cast<int>(points.size());
+    emit("# Import DXF: " + filename + " layer=" + layer + " (" + std::to_string(N) + " points)");
+
+    // Create a single connected polyline spline via bpy.data.curves.
+    // This is essential for CurveToMesh (rotate_extrude) which needs a single
+    // connected spline, not disconnected segments.
+    std::string objVar = newNodeId() + "_dxf_obj";
+    emit("_cd = bpy.data.curves.new('_dxf_" + layer + "', type='CURVE')");
+    emit("_cd.dimensions = '3D'");
+    emit("_sp = _cd.splines.new('POLY')");
+    emit("_sp.points.add(" + std::to_string(N - 1) + ")");
+    for (int i = 0; i < N; i++) {
+        emit("_sp.points[" + std::to_string(i) + "].co = (" +
+             pyDouble(points[i].first) + ", " +
+             pyDouble(points[i].second) + ", 0, 1)");
+    }
+    emit("_sp.use_cyclic_u = True");
+    emit(objVar + " = bpy.data.objects.new('_dxf_" + layer + "', _cd)");
+    emit("bpy.context.collection.objects.link(" + objVar + ")");
+
+    // Use ObjectInfo to bring the curve into the node tree
+    std::string objInfoId = newNodeId();
+    emit(objInfoId + " = nodes.new('GeometryNodeObjectInfo')");
+    emit(objInfoId + ".location = (x_pos, y_pos)");
+    emit(objInfoId + ".transform_space = 'RELATIVE'");
+    emit(objInfoId + ".inputs['Object'].default_value = " + objVar);
+    emit("last_geo = " + objInfoId);
+    emit("x_pos += 200");
+}
+
 void BlenderGenerator::emitOffset(const Arguments& args) {
     Value r = getArg(args, "r", getPositionalArg(args, 0, Value()));
     Value delta = getArg(args, "delta", Value());
@@ -4011,6 +4295,8 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             // Chain one boolean per tool: (((base - tool1) - tool2) - tool3)
 
             // Helper: check if a node outputs curve geometry (2D)
+            // Note: JoinGeometry is excluded because it can contain mesh data
+            // (e.g., for-loop collecting boolean results)
             std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
             emit("def " + isCurveHelper + "(geo_node):");
             indent_++;
@@ -4020,8 +4306,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
             emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
             emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
-            emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
-            emit("               'GeometryNodeJoinGeometry'}");
+            emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve'}");
             emit("return geo_node.bl_idname in curve_types");
             indent_--;
 
@@ -4064,6 +4349,21 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 emit("else:");
                 indent_++;
 
+                // If the tool is a JoinGeometry (e.g., from a for-loop), merge
+                // overlapping parts with UNION first to avoid EXACT solver failures.
+                std::string unionedTool = "last_geo";
+                std::string unionId = newNodeId();
+                emit("if last_geo.bl_idname == 'GeometryNodeJoinGeometry':");
+                indent_++;
+                emit(unionId + " = nodes.new('GeometryNodeMeshBoolean')");
+                emit(unionId + ".location = (x_pos, y_pos)");
+                emit(unionId + ".operation = 'UNION'");
+                emit(unionId + ".solver = 'EXACT'");
+                emit("links.new(last_geo.outputs[0], " + unionId + ".inputs[1])");
+                emit("last_geo = " + unionId);
+                emit("x_pos += 200");
+                indent_--;
+
                 std::string boolId = newNodeId();
                 emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
                 emit(boolId + ".location = (x_pos, y_pos)");
@@ -4098,6 +4398,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         // UNION and INTERSECT: use geometry nodes mesh boolean
 
         // Helper: check if a node outputs curve geometry (2D)
+        // Note: JoinGeometry is excluded because it can contain mesh data
         std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
         emit("def " + isCurveHelper + "(geo_node):");
         indent_++;
@@ -4107,8 +4408,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
         emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
         emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
-        emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
-        emit("               'GeometryNodeJoinGeometry'}");
+        emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve'}");
         emit("return geo_node.bl_idname in curve_types");
         indent_--;
 
@@ -4222,66 +4522,16 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         }
         emit("x_pos += 200");
 
-        // Side walls: CurveToMesh WITHOUT Fill Caps
+        // CurveToMesh with Fill Caps = True (handles simple and compound curves)
         std::string ctmId = newNodeId();
         emit(ctmId + " = nodes.new('GeometryNodeCurveToMesh')");
         emit(ctmId + ".location = (x_pos, y_pos)");
         emit("links.new(" + lineId + ".outputs['Curve'], " + ctmId + ".inputs['Curve'])");
         emit("link_nodes(links, " + profileGeo + ", 'Curve', " + ctmId + ", 'Profile Curve')");
-        emit(ctmId + ".inputs['Fill Caps'].default_value = False");
+        emit(ctmId + ".inputs['Fill Caps'].default_value = True");
 
-        // Bottom cap: FillCurve + FlipFaces (normals face -Z)
-        std::string fillBotId = newNodeId();
-        emit(fillBotId + " = nodes.new('GeometryNodeFillCurve')");
-        emit(fillBotId + ".location = (x_pos, y_pos - 400)");
-        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + fillBotId + ", 'Curve')");
-        std::string flipBotId = newNodeId();
-        emit(flipBotId + " = nodes.new('GeometryNodeFlipFaces')");
-        emit(flipBotId + ".location = (x_pos + 200, y_pos - 400)");
-        emit("links.new(" + fillBotId + ".outputs['Mesh'], " + flipBotId + ".inputs['Mesh'])");
-
-        // Top cap: FillCurve + Transform to Z=height (normals face +Z)
-        std::string fillTopId = newNodeId();
-        emit(fillTopId + " = nodes.new('GeometryNodeFillCurve')");
-        emit(fillTopId + ".location = (x_pos, y_pos - 600)");
-        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + fillTopId + ", 'Curve')");
-        std::string xformTopId = newNodeId();
-        emit(xformTopId + " = nodes.new('GeometryNodeTransform')");
-        emit(xformTopId + ".location = (x_pos + 200, y_pos - 600)");
-        emit("links.new(" + fillTopId + ".outputs['Mesh'], " + xformTopId + ".inputs['Geometry'])");
-        // Set top cap translation to (0, 0, height)
-        if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
-            // Re-use the CombineXYZ approach for height
-            std::string combTopId = newNodeId();
-            emit(combTopId + " = nodes.new('ShaderNodeCombineXYZ')");
-            emit(combTopId + ".location = (x_pos + 200, y_pos - 750)");
-            auto result2 = emitExpressionNodeTree(heightTree);
-            connectExprResultNamed(result2, combTopId, "Z");
-            emit("links.new(" + combTopId + ".outputs['Vector'], " + xformTopId + ".inputs['Translation'])");
-        } else if (!heightEndExpr.empty()) {
-            emit(xformTopId + ".inputs['Translation'].default_value = (0, 0, " + heightEndExpr + ")");
-        } else {
-            emit(xformTopId + ".inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
-        }
+        emit("last_geo = " + ctmId);
         emit("x_pos += 200");
-
-        // Join walls + caps
-        std::string joinAllId = newNodeId();
-        emit(joinAllId + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinAllId + ".location = (x_pos, y_pos)");
-        emit("links.new(" + ctmId + ".outputs['Mesh'], " + joinAllId + ".inputs['Geometry'])");
-        emit("links.new(" + flipBotId + ".outputs['Mesh'], " + joinAllId + ".inputs['Geometry'])");
-        emit("link_nodes(links, " + xformTopId + ", 'Geometry', " + joinAllId + ", 'Geometry')");
-
-        // Merge by distance to weld shared edge loops
-        std::string mergeId = newNodeId();
-        emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
-        emit(mergeId + ".location = (x_pos + 200, y_pos)");
-        emit("links.new(" + joinAllId + ".outputs['Geometry'], " + mergeId + ".inputs['Geometry'])");
-        emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
-
-        emit("last_geo = " + mergeId);
-        emit("x_pos += 400");
     } else {
         // CurveToMesh approach — supports twist and scale (only works for simple single-spline profiles)
         emit("# Linear Extrude (CurveToMesh approach)");
@@ -4553,6 +4803,17 @@ void BlenderGenerator::emitRotateExtrude(const Arguments& args) {
     }
 
     emit("last_geo = " + ctmId);
+    emit("x_pos += 200");
+
+    // Clean up degenerate faces from pole vertices (where profile has x=0,
+    // creating zero-radius points on the revolution axis)
+    std::string mergeId = newNodeId();
+    emit("# MergeByDistance to clean pole vertices");
+    emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
+    emit(mergeId + ".location = (x_pos, y_pos)");
+    emit("links.new(" + ctmId + ".outputs['Mesh'], " + mergeId + ".inputs['Geometry'])");
+    emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
+    emit("last_geo = " + mergeId);
     emit("x_pos += 200");
 }
 

@@ -880,6 +880,7 @@ int main(int argc, char* argv[]) {
 
     // Generate Blender Python code
     scad2blender::BlenderGenerator generator;
+    generator.setSourceDir(input_dir);
     std::string pythonCode = generator.generate(g_root);
 
     // Output the result
