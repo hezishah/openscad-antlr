@@ -90,6 +90,12 @@ static const int MAX_EVAL_DEPTH = 100;
 static bool g_in_function_def = false;
 static std::vector<bool> g_in_function_def_stack;  // save/restore stack for nesting
 
+// Track module-local variables assigned from bare literals (e.g. height = 20).
+// When referenced later in the same module body, these produce VarRef expression
+// trees so that the code generator can link them to group_input sockets.
+static std::set<std::string> g_module_literal_vars;
+static std::vector<std::set<std::string>> g_module_literal_vars_stack;
+
 // Ordered let-binding capture: argument_list appends entries here
 // so that the let() rule can reconstruct insertion order
 static std::vector<std::pair<std::string, Value>> g_ordered_args;
@@ -1221,6 +1227,22 @@ statement:
             storeVal = Value::expressionWithTree(std::to_string($3->toNumber()), $3->exprTree());
         }
         set_variable(*$1, storeVal);
+        // Track bare-literal assignments inside module bodies so that later
+        // references produce VarRef expression trees for parametric linking
+        if (g_in_function_def && !storeVal.isExpression() &&
+            (storeVal.isNumber() || storeVal.isBool()) &&
+            (!storeVal.exprTree() || !storeVal.exprTree()->hasVariableRefs())) {
+            bool isBareLiteral = true;
+            if ($3->exprTree() && $3->exprTree()->hasVariableRefs()) {
+                isBareLiteral = false;
+            }
+            if ($3->isExpression()) {
+                isBareLiteral = false;
+            }
+            if (isBareLiteral) {
+                g_module_literal_vars.insert(*$1);
+            }
+        }
         $$ = new AssignmentNode(*$1, storeVal);
         delete $1;
         delete $3;
@@ -1307,12 +1329,16 @@ module_stmt:
         // inside the body are deferred instead of eagerly evaluated
         g_in_function_def_stack.push_back(g_in_function_def);
         g_in_function_def = true;
+        g_module_literal_vars_stack.push_back(g_module_literal_vars);
+        g_module_literal_vars.clear();
         for (const auto& param : *$4) {
             set_variable(param, Value::expressionWithTree(param, ExprNode::makeVarRef(param)));
         }
     } child_statement {
         g_in_function_def = g_in_function_def_stack.back();
         g_in_function_def_stack.pop_back();
+        g_module_literal_vars = g_module_literal_vars_stack.back();
+        g_module_literal_vars_stack.pop_back();
         pop_scope();  // restore scope
         auto node = new ModuleNode(*$2, *$4);
         // Use the saved defaults (from before body parsing)
@@ -2091,6 +2117,14 @@ expr:
                     v.exprTree()->kind == ExprNode::Kind::VarRef &&
                     !v.exprTree()->left && !v.exprTree()->right;
                 if (!isBareVarRef) {
+                    // Check if this is a module-local literal variable that should
+                    // be treated as symbolic for parametric group_input linking
+                    if (g_module_literal_vars.count(*$1)) {
+                        // Return as VarRef expression (like a module parameter)
+                        auto tree = ExprNode::makeVarRef(*$1);
+                        $$ = new Value(Value::expressionWithTree(*$1, tree));
+                        delete $1;
+                    } else {
                     // Concrete value — return it with its expression tree
                     $$ = new Value(v);
                     // Ensure it has an expression tree for code generation
@@ -2113,6 +2147,7 @@ expr:
                         }
                     }
                     delete $1;
+                    }
                 } else {
                     // Module parameter — keep as VarRef expression
                     auto tree = ExprNode::makeVarRef(*$1);
@@ -2295,45 +2330,75 @@ expr:
     }
     | expr '*' expr {
         if ($1->isExpression() || $3->isExpression()) {
-            // Try to resolve Expression operands to concrete values first
-            // so that Vector * Expression (scalar) works correctly
-            Value resolvedL = *$1, resolvedR = *$3;
-            if ($1->isExpression() && $1->exprTree()) {
-                std::map<std::string, Value> _bindings(current_scope().begin(), current_scope().end());
-                Value r = evaluate_expr_tree($1->exprTree(), _bindings);
-                if (r.isNumber() || r.isVector()) resolvedL = r;
-            }
-            if ($3->isExpression() && $3->exprTree()) {
-                std::map<std::string, Value> _bindings(current_scope().begin(), current_scope().end());
-                Value r = evaluate_expr_tree($3->exprTree(), _bindings);
-                if (r.isNumber() || r.isVector()) resolvedR = r;
-            }
-            // If both resolved to concrete types, compute directly
-            if (resolvedL.isNumber() && resolvedR.isNumber()) {
-                $$ = new Value(resolvedL.toNumber() * resolvedR.toNumber());
-                $$->setExprTree(ExprNode::makeLiteral(resolvedL.toNumber() * resolvedR.toNumber()));
-            } else if (resolvedL.isVector() && resolvedR.isNumber()) {
-                double s = resolvedR.toNumber();
-                Vector v;
-                for (size_t i = 0; i < resolvedL.size(); i++) {
-                    if (resolvedL[i].isNumber()) v.push_back(Value(resolvedL[i].toNumber() * s));
-                    else v.push_back(resolvedL[i]);
-                }
-                $$ = new Value(v);
-            } else if (resolvedL.isNumber() && resolvedR.isVector()) {
-                double s = resolvedL.toNumber();
-                Vector v;
-                for (size_t i = 0; i < resolvedR.size(); i++) {
-                    if (resolvedR[i].isNumber()) v.push_back(Value(resolvedR[i].toNumber() * s));
-                    else v.push_back(resolvedR[i]);
-                }
-                $$ = new Value(v);
-            } else {
-                // Can't fully resolve — build expression tree
+            // Check if either operand has VarRef trees that should be preserved
+            bool hasVarRefs = ($1->exprTree() && $1->exprTree()->hasVariableRefs()) ||
+                              ($3->exprTree() && $3->exprTree()->hasVariableRefs());
+
+            if (hasVarRefs && !$1->isVector() && !$3->isVector()) {
+                // Scalar * scalar with VarRefs: preserve expression tree (like + and - rules)
                 auto ltree = $1->exprTree() ? $1->exprTree() : ExprNode::makeLiteral($1->isNumber() ? $1->toNumber() : 0.0);
                 auto rtree = $3->exprTree() ? $3->exprTree() : ExprNode::makeLiteral($3->isNumber() ? $3->toNumber() : 0.0);
                 auto tree = ExprNode::makeBinary(ExprNode::Op::MULTIPLY, ltree, rtree);
                 $$ = new Value(Value::expressionWithTree("(" + $1->toPython() + " * " + $3->toPython() + ")", tree));
+            } else {
+                // Try to resolve Expression operands to concrete values
+                // so that Vector * Expression (scalar) works correctly
+                Value resolvedL = *$1, resolvedR = *$3;
+                if ($1->isExpression() && $1->exprTree()) {
+                    std::map<std::string, Value> _bindings(current_scope().begin(), current_scope().end());
+                    Value r = evaluate_expr_tree($1->exprTree(), _bindings);
+                    if (r.isNumber() || r.isVector()) resolvedL = r;
+                }
+                if ($3->isExpression() && $3->exprTree()) {
+                    std::map<std::string, Value> _bindings(current_scope().begin(), current_scope().end());
+                    Value r = evaluate_expr_tree($3->exprTree(), _bindings);
+                    if (r.isNumber() || r.isVector()) resolvedR = r;
+                }
+                // If both resolved to concrete types, compute directly
+                if (resolvedL.isNumber() && resolvedR.isNumber()) {
+                    $$ = new Value(resolvedL.toNumber() * resolvedR.toNumber());
+                    $$->setExprTree(ExprNode::makeLiteral(resolvedL.toNumber() * resolvedR.toNumber()));
+                } else if (resolvedL.isVector() && resolvedR.isNumber()) {
+                    double s = resolvedR.toNumber();
+                    ExprNodePtr sTree = $3->exprTree();
+                    Vector v;
+                    for (size_t i = 0; i < resolvedL.size(); i++) {
+                        if (resolvedL[i].isNumber()) {
+                            Value elem(resolvedL[i].toNumber() * s);
+                            ExprNodePtr elemTree = resolvedL[i].exprTree();
+                            if (sTree && sTree->hasVariableRefs()) {
+                                ExprNodePtr et = elemTree ? elemTree : ExprNode::makeLiteral(resolvedL[i].toNumber());
+                                elem.setExprTree(ExprNode::makeBinary(ExprNode::Op::MULTIPLY, et, sTree));
+                            }
+                            v.push_back(elem);
+                        }
+                        else v.push_back(resolvedL[i]);
+                    }
+                    $$ = new Value(v);
+                } else if (resolvedL.isNumber() && resolvedR.isVector()) {
+                    double s = resolvedL.toNumber();
+                    ExprNodePtr sTree = $1->exprTree();
+                    Vector v;
+                    for (size_t i = 0; i < resolvedR.size(); i++) {
+                        if (resolvedR[i].isNumber()) {
+                            Value elem(resolvedR[i].toNumber() * s);
+                            ExprNodePtr elemTree = resolvedR[i].exprTree();
+                            if (sTree && sTree->hasVariableRefs()) {
+                                ExprNodePtr et = elemTree ? elemTree : ExprNode::makeLiteral(resolvedR[i].toNumber());
+                                elem.setExprTree(ExprNode::makeBinary(ExprNode::Op::MULTIPLY, sTree, et));
+                            }
+                            v.push_back(elem);
+                        }
+                        else v.push_back(resolvedR[i]);
+                    }
+                    $$ = new Value(v);
+                } else {
+                    // Can't fully resolve — build expression tree
+                    auto ltree = $1->exprTree() ? $1->exprTree() : ExprNode::makeLiteral($1->isNumber() ? $1->toNumber() : 0.0);
+                    auto rtree = $3->exprTree() ? $3->exprTree() : ExprNode::makeLiteral($3->isNumber() ? $3->toNumber() : 0.0);
+                    auto tree = ExprNode::makeBinary(ExprNode::Op::MULTIPLY, ltree, rtree);
+                    $$ = new Value(Value::expressionWithTree("(" + $1->toPython() + " * " + $3->toPython() + ")", tree));
+                }
             }
         } else if ($1->isNumber() && $3->isNumber()) {
             $$ = new Value($1->toNumber() * $3->toNumber());

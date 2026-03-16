@@ -66,9 +66,8 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
                 if (call) calledModules.insert(call->name());
             }
         }
-        // For each called module, promote its direct constant assignments.
-        // The module body may be wrapped in an implicit Union, so recurse
-        // into container nodes (Union/Difference/Intersection) to find assignments.
+        // For each called module, promote its direct constant assignments
+        // that are bare literals (not computed from other variables).
         std::function<void(ASTNode&)> promoteAssignments = [&](ASTNode& container) {
             for (auto& mc : container.children()) {
                 if (!mc) continue;
@@ -87,7 +86,11 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
                     if (val.exprTree() && val.exprTree()->hasVariableRefs()) {
                         isSimple = false;
                     }
-                    if (isSimple && !val.isExpression()) {
+                    // Skip expression-type values (derived from other variables at parse time)
+                    if (val.isExpression()) {
+                        isSimple = false;
+                    }
+                    if (isSimple) {
                         variables_[assign->name()] = val;
                         top_level_vars_.insert(assign->name());
                     }
