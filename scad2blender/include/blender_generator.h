@@ -75,7 +75,6 @@ private:
     std::vector<std::set<std::string>> parent_module_params_stack_; // Stack of parent module param names
     std::map<std::string, std::vector<std::string>> captured_parent_params_; // module_name -> captured parent params
     std::string source_dir_;  // Directory of the source .scad file for resolving relative paths
-    std::string diff_chain_base_;  // When non-empty, for-loops chain DIFFERENCE booleans against this variable
 
     // User-defined function table (collected from AST FunctionNode nodes)
     struct FuncDef {

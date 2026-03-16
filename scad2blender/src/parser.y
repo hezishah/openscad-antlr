@@ -15,6 +15,8 @@
 #include <stack>
 #include <cmath>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <libgen.h>
 #include "ast.h"
 #include "value.h"
@@ -666,8 +668,155 @@ static std::vector<ExprNodePtr> args_to_expr_trees(const Arguments& args) {
     return result;
 }
 
+// ─── DXF dimension/cross-point extraction ───────────────────────────────────
+// Implements OpenSCAD's dxf_dim() and dxf_cross() built-in functions.
+
+// Forward declarations (defined later in this file)
+extern const std::vector<std::string>& get_include_paths();
+extern const std::string& get_current_file_dir();
+static std::string resolve_include_file(const std::string& filename, const std::string& from_dir);
+
+struct DxfDimension {
+    std::string name;
+    double x1, y1, x2, y2;  // Definition points (group codes 13/23 and 14/24)
+};
+
+struct DxfLine {
+    std::string layer;
+    double x1, y1, x2, y2;  // Start/end points
+};
+
+// Parse a DXF file and extract DIMENSION entities and LINE entities
+static void parse_dxf_entities(const std::string& filepath,
+                               std::vector<DxfDimension>& dims,
+                               std::vector<DxfLine>& dxf_lines) {
+    std::ifstream file(filepath);
+    if (!file.is_open()) return;
+
+    std::vector<std::pair<std::string,std::string>> pairs;
+    std::string code_line, val_line;
+    while (std::getline(file, code_line) && std::getline(file, val_line)) {
+        // Trim whitespace
+        auto trim = [](std::string& s) {
+            size_t start = s.find_first_not_of(" \t\r\n");
+            size_t end = s.find_last_not_of(" \t\r\n");
+            s = (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
+        };
+        trim(code_line);
+        trim(val_line);
+        pairs.push_back({code_line, val_line});
+    }
+
+    for (size_t i = 0; i < pairs.size(); i++) {
+        if (pairs[i].first == "0" && pairs[i].second == "DIMENSION") {
+            DxfDimension dim = {};
+            for (size_t j = i + 1; j < pairs.size() && !(pairs[j].first == "0"); j++) {
+                const auto& code = pairs[j].first;
+                const auto& val = pairs[j].second;
+                if (code == "1") dim.name = val;
+                else if (code == "13") dim.x1 = std::stod(val);
+                else if (code == "23") dim.y1 = std::stod(val);
+                else if (code == "14") dim.x2 = std::stod(val);
+                else if (code == "24") dim.y2 = std::stod(val);
+            }
+            dims.push_back(dim);
+        }
+        else if (pairs[i].first == "0" && pairs[i].second == "LINE") {
+            DxfLine ln = {};
+            for (size_t j = i + 1; j < pairs.size() && !(pairs[j].first == "0"); j++) {
+                const auto& code = pairs[j].first;
+                const auto& val = pairs[j].second;
+                if (code == "8") ln.layer = val;
+                else if (code == "10") ln.x1 = std::stod(val);
+                else if (code == "20") ln.y1 = std::stod(val);
+                else if (code == "11") ln.x2 = std::stod(val);
+                else if (code == "21") ln.y2 = std::stod(val);
+            }
+            dxf_lines.push_back(ln);
+        }
+    }
+}
+
+// dxf_dim: returns the distance between the two definition points of a named DIMENSION entity
+static Value eval_dxf_dim(const Arguments& args) {
+    std::string filename, dim_name;
+    for (const auto& kv : args) {
+        if (kv.first == "file") filename = kv.second.toString();
+        else if (kv.first == "name") dim_name = kv.second.toString();
+    }
+    if (filename.empty() || dim_name.empty()) return Value();
+
+    std::string resolved = resolve_include_file(filename, get_current_file_dir());
+    if (resolved.empty()) return Value();
+
+    std::vector<DxfDimension> dims;
+    std::vector<DxfLine> lines;
+    parse_dxf_entities(resolved, dims, lines);
+
+    for (const auto& d : dims) {
+        if (d.name == dim_name) {
+            double dist = std::sqrt((d.x2 - d.x1) * (d.x2 - d.x1) + (d.y2 - d.y1) * (d.y2 - d.y1));
+            return Value(dist);
+        }
+    }
+    return Value();
+}
+
+// dxf_cross: returns the intersection point of two LINE entities on the given layer
+static Value eval_dxf_cross(const Arguments& args) {
+    std::string filename, layer;
+    for (const auto& kv : args) {
+        if (kv.first == "file") filename = kv.second.toString();
+        else if (kv.first == "layer") layer = kv.second.toString();
+    }
+    if (filename.empty() || layer.empty()) return Value();
+
+    std::string resolved = resolve_include_file(filename, get_current_file_dir());
+    if (resolved.empty()) return Value();
+
+    std::vector<DxfDimension> dims;
+    std::vector<DxfLine> lines;
+    parse_dxf_entities(resolved, dims, lines);
+
+    // Collect LINE entities on the given layer
+    std::vector<DxfLine> layer_lines;
+    for (const auto& ln : lines) {
+        if (ln.layer == layer) layer_lines.push_back(ln);
+    }
+    if (layer_lines.size() < 2) return Value();
+
+    // Find intersection of first two lines
+    const auto& l1 = layer_lines[0];
+    const auto& l2 = layer_lines[1];
+    double dx1 = l1.x2 - l1.x1, dy1 = l1.y2 - l1.y1;
+    double dx2 = l2.x2 - l2.x1, dy2 = l2.y2 - l2.y1;
+    double denom = dx1 * dy2 - dy1 * dx2;
+    if (std::abs(denom) < 1e-12) return Value();  // Parallel lines
+
+    double t = ((l2.x1 - l1.x1) * dy2 - (l2.y1 - l1.y1) * dx2) / denom;
+    double ix = l1.x1 + t * dx1;
+    double iy = l1.y1 + t * dy1;
+
+    return Value(Vector{Value(ix), Value(iy)});
+}
+
 // Entry point from grammar: try to fully evaluate a function call
 static Value try_evaluate_function(const std::string& name, const Arguments& args) {
+    // Handle DXF built-in functions early (they use named args, not user-defined)
+    if (name == "dxf_dim") {
+        Value result = eval_dxf_dim(args);
+        if (result.isNumber()) {
+            result.setExprTree(ExprNode::makeLiteral(result.toNumber()));
+            return result;
+        }
+        return Value();  // Return undef if DXF parsing fails
+    }
+    if (name == "dxf_cross") {
+        Value result = eval_dxf_cross(args);
+        if (result.isVector()) return result;
+        return Value();
+    }
+
     // Extract ExprNode trees from positional args in numeric order
     auto arg_trees = args_to_expr_trees(args);
 

@@ -2241,17 +2241,10 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         // Track loop variable
         loop_variables_.insert(loopVar);
 
-        // When inside a DIFFERENCE tool, chain booleans per iteration instead of JoinGeometry
-        bool chainDiff = !diff_chain_base_.empty();
-        std::string chainBase = diff_chain_base_;
-        std::string joinId;
-
-        if (!chainDiff) {
-            // Create a JoinGeometry node to accumulate geometry from each iteration
-            joinId = newNodeId();
-            emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-            emit(joinId + ".location = (x_pos, y_pos)");
-        }
+        // Create a JoinGeometry node to accumulate geometry from each iteration
+        std::string joinId = newNodeId();
+        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+        emit(joinId + ".location = (x_pos, y_pos)");
 
         emit("for " + loopVar + " in " + range.toPython() + ":");
         indent_++;
@@ -2261,37 +2254,15 @@ void BlenderGenerator::visit(ForLoopNode& node) {
             child->accept(*this);
         }
 
-        if (chainDiff) {
-            // Chain DIFFERENCE: base -= each iteration's geometry
-            emit("if last_geo is not None:");
-            indent_++;
-            std::string boolId = newNodeId();
-            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
-            emit(boolId + ".location = (x_pos, y_pos)");
-            emit(boolId + ".operation = 'DIFFERENCE'");
-            emit(boolId + ".solver = 'EXACT'");
-            emit("links.new(" + chainBase + ".outputs[0], " + boolId + ".inputs[0])");
-            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
-            emit(chainBase + " = " + boolId);
-            emit("x_pos += 200");
-            emit("y_pos -= 50");
-            indent_--;
-        } else {
-            // Link each iteration's result into the join node
-            emit("if last_geo is not None:");
-            indent_++;
-            emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
-            indent_--;
-        }
+        // Link each iteration's result into the join node
+        emit("if last_geo is not None:");
+        indent_++;
+        emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+        indent_--;
 
         indent_--;
 
-        if (chainDiff) {
-            emit("last_geo = " + chainBase);
-            diff_chain_base_.clear();  // Signal that chaining was used
-        } else {
-            emit("last_geo = " + joinId);
-        }
+        emit("last_geo = " + joinId);
 
         loop_variables_.erase(loopVar);
     } else if (range.isExpression() && range.exprTree()) {
@@ -2300,15 +2271,9 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         std::string loopVar = node.variable();
         loop_variables_.insert(loopVar);
 
-        bool chainDiff2 = !diff_chain_base_.empty();
-        std::string chainBase2 = diff_chain_base_;
-        std::string joinId;
-
-        if (!chainDiff2) {
-            joinId = newNodeId();
-            emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-            emit(joinId + ".location = (x_pos, y_pos)");
-        }
+        std::string joinId = newNodeId();
+        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+        emit(joinId + ".location = (x_pos, y_pos)");
 
         std::string rangeExpr = exprTreeToPython(range.exprTree());
         emit("for " + loopVar + " in " + rangeExpr + ":");
@@ -2319,35 +2284,14 @@ void BlenderGenerator::visit(ForLoopNode& node) {
             child->accept(*this);
         }
 
-        if (chainDiff2) {
-            emit("if last_geo is not None:");
-            indent_++;
-            std::string boolId = newNodeId();
-            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
-            emit(boolId + ".location = (x_pos, y_pos)");
-            emit(boolId + ".operation = 'DIFFERENCE'");
-            emit(boolId + ".solver = 'EXACT'");
-            emit("links.new(" + chainBase2 + ".outputs[0], " + boolId + ".inputs[0])");
-            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
-            emit(chainBase2 + " = " + boolId);
-            emit("x_pos += 200");
-            emit("y_pos -= 50");
-            indent_--;
-        } else {
-            emit("if last_geo is not None:");
-            indent_++;
-            emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
-            indent_--;
-        }
+        emit("if last_geo is not None:");
+        indent_++;
+        emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+        indent_--;
 
         indent_--;
 
-        if (chainDiff2) {
-            emit("last_geo = " + chainBase2);
-            diff_chain_base_.clear();
-        } else {
-            emit("last_geo = " + joinId);
-        }
+        emit("last_geo = " + joinId);
 
         loop_variables_.erase(loopVar);
     } else {
@@ -3641,26 +3585,46 @@ void BlenderGenerator::emitMirror(const Arguments& args) {
 
 // ─── DXF Import ────────────────────────────────────────────────────────────
 
-// Simple DXF LINE entity
-struct DxfLine {
-    double x1, y1, x2, y2;
+// DXF entity types we care about
+struct DxfSegment {
+    enum Type { LINE_SEG, ARC_SEG, CIRCLE_SEG };
+    Type type;
     std::string layer;
+    // LINE: (x1,y1)-(x2,y2)
+    double x1, y1, x2, y2;
+    // ARC/CIRCLE: center (cx,cy), radius, start_angle, end_angle (degrees)
+    double cx, cy, radius, startAngle, endAngle;
 };
 
-// Parse DXF file and extract LINE entities
-static std::vector<DxfLine> parseDxfLines(const std::string& filepath) {
-    std::vector<DxfLine> lines;
+// Parse DXF file and extract LINE, ARC, and CIRCLE entities
+static std::vector<DxfSegment> parseDxfEntities(const std::string& filepath) {
+    std::vector<DxfSegment> segments;
     std::ifstream file(filepath);
-    if (!file.is_open()) return lines;
+    if (!file.is_open()) return segments;
 
     std::string groupCode, value;
     bool inEntities = false;
-    bool inLine = false;
-    DxfLine current;
-    current.x1 = current.y1 = current.x2 = current.y2 = 0;
+    std::string currentEntityType;
+    DxfSegment current = {};
+
+    auto resetCurrent = [&]() {
+        current = {};
+    };
+
+    auto flushEntity = [&]() {
+        if (currentEntityType == "LINE") {
+            current.type = DxfSegment::LINE_SEG;
+            segments.push_back(current);
+        } else if (currentEntityType == "ARC") {
+            current.type = DxfSegment::ARC_SEG;
+            segments.push_back(current);
+        } else if (currentEntityType == "CIRCLE") {
+            current.type = DxfSegment::CIRCLE_SEG;
+            segments.push_back(current);
+        }
+    };
 
     while (std::getline(file, groupCode)) {
-        // Trim whitespace
         while (!groupCode.empty() && (groupCode.front() == ' ' || groupCode.front() == '\t'))
             groupCode.erase(groupCode.begin());
         while (!groupCode.empty() && (groupCode.back() == '\r' || groupCode.back() == '\n'))
@@ -3677,89 +3641,176 @@ static std::vector<DxfLine> parseDxfLines(const std::string& filepath) {
 
         if (code == 2 && value == "ENTITIES") { inEntities = true; continue; }
         if (code == 0 && value == "ENDSEC" && inEntities) {
-            if (inLine) lines.push_back(current);
+            flushEntity();
             break;
         }
         if (!inEntities) continue;
 
         if (code == 0) {
-            if (inLine) {
-                lines.push_back(current);
-                current = DxfLine();
-                current.x1 = current.y1 = current.x2 = current.y2 = 0;
-            }
-            inLine = (value == "LINE");
+            flushEntity();
+            currentEntityType = value;
+            resetCurrent();
             continue;
         }
 
-        if (!inLine) continue;
-
         if (code == 8) current.layer = value;
-        else if (code == 10) current.x1 = std::stod(value);
-        else if (code == 20) current.y1 = std::stod(value);
+        else if (code == 10) { current.x1 = std::stod(value); current.cx = std::stod(value); }
+        else if (code == 20) { current.y1 = std::stod(value); current.cy = std::stod(value); }
         else if (code == 11) current.x2 = std::stod(value);
         else if (code == 21) current.y2 = std::stod(value);
+        else if (code == 40) current.radius = std::stod(value);
+        else if (code == 50) current.startAngle = std::stod(value);
+        else if (code == 51) current.endAngle = std::stod(value);
     }
 
-    return lines;
+    return segments;
 }
 
-// Chain LINE endpoints into ordered polygon points
-static std::vector<std::pair<double, double>> chainLines(const std::vector<DxfLine>& lines) {
-    if (lines.empty()) return {};
+// Tessellate an arc into polyline points (start and end points included)
+static std::vector<std::pair<double, double>> tessellateArc(
+    double cx, double cy, double radius, double startDeg, double endDeg, int numSegs = 32) {
+    std::vector<std::pair<double, double>> pts;
+    double startRad = startDeg * M_PI / 180.0;
+    double endRad = endDeg * M_PI / 180.0;
+    // ARC goes counter-clockwise from startAngle to endAngle
+    if (endRad <= startRad) endRad += 2.0 * M_PI;
+    for (int i = 0; i <= numSegs; i++) {
+        double t = static_cast<double>(i) / numSegs;
+        double angle = startRad + t * (endRad - startRad);
+        pts.push_back({cx + radius * cos(angle), cy + radius * sin(angle)});
+    }
+    return pts;
+}
 
-    // Build adjacency: for each endpoint, find connected line endpoints
-    std::vector<std::pair<double, double>> points;
-    std::vector<bool> used(lines.size(), false);
+// Tessellate a full circle
+static std::vector<std::pair<double, double>> tessellateCircle(
+    double cx, double cy, double radius, int numSegs = 64) {
+    std::vector<std::pair<double, double>> pts;
+    for (int i = 0; i < numSegs; i++) {
+        double angle = 2.0 * M_PI * i / numSegs;
+        pts.push_back({cx + radius * cos(angle), cy + radius * sin(angle)});
+    }
+    return pts;
+}
 
-    // Start with the first line
-    used[0] = true;
-    points.push_back({lines[0].x1, lines[0].y1});
-    points.push_back({lines[0].x2, lines[0].y2});
+// Convert a segment to a pair of endpoints (for LINEs and ARCs, used in chaining)
+static std::pair<std::pair<double,double>, std::pair<double,double>> segmentEndpoints(const DxfSegment& seg) {
+    if (seg.type == DxfSegment::LINE_SEG) {
+        return {{seg.x1, seg.y1}, {seg.x2, seg.y2}};
+    } else if (seg.type == DxfSegment::ARC_SEG) {
+        double startRad = seg.startAngle * M_PI / 180.0;
+        double endRad = seg.endAngle * M_PI / 180.0;
+        double sx = seg.cx + seg.radius * cos(startRad);
+        double sy = seg.cy + seg.radius * sin(startRad);
+        double ex = seg.cx + seg.radius * cos(endRad);
+        double ey = seg.cy + seg.radius * sin(endRad);
+        return {{sx, sy}, {ex, ey}};
+    }
+    return {{0,0},{0,0}};
+}
 
-    auto close = [](double a, double b) { return std::abs(a - b) < 0.001; };
+// Get tessellated points for a segment (in forward direction)
+static std::vector<std::pair<double,double>> segmentPoints(const DxfSegment& seg, bool reverse = false) {
+    std::vector<std::pair<double,double>> pts;
+    if (seg.type == DxfSegment::LINE_SEG) {
+        if (reverse) {
+            pts.push_back({seg.x2, seg.y2});
+            pts.push_back({seg.x1, seg.y1});
+        } else {
+            pts.push_back({seg.x1, seg.y1});
+            pts.push_back({seg.x2, seg.y2});
+        }
+    } else if (seg.type == DxfSegment::ARC_SEG) {
+        pts = tessellateArc(seg.cx, seg.cy, seg.radius, seg.startAngle, seg.endAngle);
+        if (reverse) std::reverse(pts.begin(), pts.end());
+    }
+    return pts;
+}
+
+// Chain segments (LINEs and ARCs) into ordered polygon points
+// Returns multiple chains if there are disconnected loops
+static std::vector<std::vector<std::pair<double, double>>> chainSegments(const std::vector<DxfSegment>& segs) {
+    if (segs.empty()) return {};
+
+    auto close = [](double a, double b) { return std::abs(a - b) < 0.01; };
     auto ptMatch = [&](double x1, double y1, double x2, double y2) {
         return close(x1, x2) && close(y1, y2);
     };
 
-    bool found = true;
-    while (found) {
-        found = false;
-        double lastX = points.back().first;
-        double lastY = points.back().second;
+    std::vector<bool> used(segs.size(), false);
+    std::vector<std::vector<std::pair<double,double>>> chains;
 
-        for (size_t i = 0; i < lines.size(); i++) {
-            if (used[i]) continue;
-            if (ptMatch(lastX, lastY, lines[i].x1, lines[i].y1)) {
-                points.push_back({lines[i].x2, lines[i].y2});
-                used[i] = true;
-                found = true;
-                break;
-            }
-            if (ptMatch(lastX, lastY, lines[i].x2, lines[i].y2)) {
-                points.push_back({lines[i].x1, lines[i].y1});
-                used[i] = true;
-                found = true;
+    while (true) {
+        // Find first unused non-circle segment
+        int startIdx = -1;
+        for (size_t i = 0; i < segs.size(); i++) {
+            if (!used[i] && segs[i].type != DxfSegment::CIRCLE_SEG) {
+                startIdx = static_cast<int>(i);
                 break;
             }
         }
+        if (startIdx < 0) break;
+
+        std::vector<std::pair<double,double>> chain;
+        used[startIdx] = true;
+        auto pts = segmentPoints(segs[startIdx]);
+        for (auto& p : pts) chain.push_back(p);
+
+        bool found = true;
+        while (found) {
+            found = false;
+            double lastX = chain.back().first;
+            double lastY = chain.back().second;
+
+            for (size_t i = 0; i < segs.size(); i++) {
+                if (used[i] || segs[i].type == DxfSegment::CIRCLE_SEG) continue;
+                auto [ep1, ep2] = segmentEndpoints(segs[i]);
+                if (ptMatch(lastX, lastY, ep1.first, ep1.second)) {
+                    used[i] = true;
+                    auto npts = segmentPoints(segs[i], false);
+                    // Skip first point (it matches last)
+                    for (size_t j = 1; j < npts.size(); j++) chain.push_back(npts[j]);
+                    found = true;
+                    break;
+                }
+                if (ptMatch(lastX, lastY, ep2.first, ep2.second)) {
+                    used[i] = true;
+                    auto npts = segmentPoints(segs[i], true);
+                    for (size_t j = 1; j < npts.size(); j++) chain.push_back(npts[j]);
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        // Remove last point if it matches first (closed polygon)
+        if (chain.size() > 2) {
+            auto& f = chain.front();
+            auto& l = chain.back();
+            if (close(f.first, l.first) && close(f.second, l.second)) {
+                chain.pop_back();
+            }
+        }
+
+        if (chain.size() >= 3) chains.push_back(chain);
     }
 
-    // Remove last point if it matches first (closed polygon)
-    if (points.size() > 2) {
-        auto& f = points.front();
-        auto& l = points.back();
-        if (close(f.first, l.first) && close(f.second, l.second)) {
-            points.pop_back();
+    // Handle standalone circles
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (!used[i] && segs[i].type == DxfSegment::CIRCLE_SEG) {
+            auto pts = tessellateCircle(segs[i].cx, segs[i].cy, segs[i].radius);
+            if (pts.size() >= 3) chains.push_back(pts);
+            used[i] = true;
         }
     }
 
-    return points;
+    return chains;
 }
 
 void BlenderGenerator::emitImport(const Arguments& args) {
     Value fileVal = getArg(args, "file", getPositionalArg(args, 0, Value()));
     Value layerVal = getArg(args, "layer", Value());
+    Value originVal = getArg(args, "origin", Value());
 
     if (fileVal.isUndefined() || !fileVal.isString()) {
         emit("# Import: no file specified");
@@ -3767,12 +3818,10 @@ void BlenderGenerator::emitImport(const Arguments& args) {
     }
 
     std::string filename = fileVal.toString();
-    // Remove quotes if present
     if (filename.size() >= 2 && filename.front() == '"' && filename.back() == '"') {
         filename = filename.substr(1, filename.size() - 2);
     }
 
-    // Check if it's a DXF file
     std::string ext = filename;
     size_t dotPos = ext.rfind('.');
     if (dotPos != std::string::npos) {
@@ -3792,8 +3841,8 @@ void BlenderGenerator::emitImport(const Arguments& args) {
     }
 
     // Parse DXF
-    auto allLines = parseDxfLines(filepath);
-    if (allLines.empty()) {
+    auto allSegments = parseDxfEntities(filepath);
+    if (allSegments.empty()) {
         emit("# Import: could not read DXF file: " + filepath);
         return;
     }
@@ -3807,42 +3856,66 @@ void BlenderGenerator::emitImport(const Arguments& args) {
         }
     }
 
-    std::vector<DxfLine> layerLines;
-    for (auto& l : allLines) {
-        if (layer.empty() || l.layer == layer) {
-            layerLines.push_back(l);
+    std::vector<DxfSegment> layerSegs;
+    for (auto& s : allSegments) {
+        if (layer.empty() || s.layer == layer) {
+            layerSegs.push_back(s);
         }
     }
 
-    if (layerLines.empty()) {
-        emit("# Import: no LINE entities found on layer '" + layer + "' in " + filename);
+    if (layerSegs.empty()) {
+        emit("# Import: no entities found on layer '" + layer + "' in " + filename);
         return;
     }
 
-    // Chain lines into polygon points
-    auto points = chainLines(layerLines);
-    if (points.size() < 3) {
-        emit("# Import: could not chain lines into polygon on layer '" + layer + "'");
+    // Get origin offset
+    double originX = 0, originY = 0;
+    if (!originVal.isUndefined() && originVal.isVector() && originVal.size() >= 2) {
+        originX = originVal[0].toNumber();
+        originY = originVal[1].toNumber();
+    }
+
+    // Chain segments into polygon(s)
+    auto chains = chainSegments(layerSegs);
+    if (chains.empty()) {
+        emit("# Import: could not chain entities into polygon on layer '" + layer + "'");
         return;
     }
 
-    int N = static_cast<int>(points.size());
-    emit("# Import DXF: " + filename + " layer=" + layer + " (" + std::to_string(N) + " points)");
+    // Apply origin offset to all points
+    for (auto& chain : chains) {
+        for (auto& pt : chain) {
+            pt.first -= originX;
+            pt.second -= originY;
+        }
+    }
 
-    // Create a single connected polyline spline via bpy.data.curves.
-    // This is essential for CurveToMesh (rotate_extrude) which needs a single
-    // connected spline, not disconnected segments.
+    // Emit each chain as a separate spline in the same curve object
+    int totalPoints = 0;
+    for (auto& chain : chains) totalPoints += static_cast<int>(chain.size());
+
+    emit("# Import DXF: " + filename + " layer=" + layer +
+         " (" + std::to_string(chains.size()) + " chain(s), " +
+         std::to_string(totalPoints) + " points)");
+
     std::string objVar = newNodeId() + "_dxf_obj";
     emit("_cd = bpy.data.curves.new('_dxf_" + layer + "', type='CURVE')");
     emit("_cd.dimensions = '3D'");
-    emit("_sp = _cd.splines.new('POLY')");
-    emit("_sp.points.add(" + std::to_string(N - 1) + ")");
-    for (int i = 0; i < N; i++) {
-        emit("_sp.points[" + std::to_string(i) + "].co = (" +
-             pyDouble(points[i].first) + ", " +
-             pyDouble(points[i].second) + ", 0, 1)");
+
+    for (size_t c = 0; c < chains.size(); c++) {
+        auto& points = chains[c];
+        int N = static_cast<int>(points.size());
+        std::string spVar = (c == 0) ? "_sp" : "_sp" + std::to_string(c);
+        emit(spVar + " = _cd.splines.new('POLY')");
+        emit(spVar + ".points.add(" + std::to_string(N - 1) + ")");
+        for (int i = 0; i < N; i++) {
+            emit(spVar + ".points[" + std::to_string(i) + "].co = (" +
+                 pyDouble(points[i].first) + ", " +
+                 pyDouble(points[i].second) + ", 0, 1)");
+        }
+        emit(spVar + ".use_cyclic_u = True");
     }
-    emit("_sp.use_cyclic_u = True");
+
     emit(objVar + " = bpy.data.objects.new('_dxf_" + layer + "', _cd)");
     emit("bpy.context.collection.objects.link(" + objVar + ")");
 
