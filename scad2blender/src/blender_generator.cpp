@@ -1162,7 +1162,10 @@ void BlenderGenerator::visit(BooleanNode& node) {
 }
 
 void BlenderGenerator::visit(ExtrudeNode& node) {
+    bool wasInExtrude = in_extrude_;
+    in_extrude_ = true;
     processChildren(node);
+    in_extrude_ = wasInExtrude;
 
     switch (node.type()) {
         case ASTNode::Type::LinearExtrude:
@@ -3992,6 +3995,7 @@ void BlenderGenerator::emitImport(const Arguments& args) {
     Value fileVal = getArg(args, "file", getPositionalArg(args, 0, Value()));
     Value layerVal = getArg(args, "layer", Value());
     Value originVal = getArg(args, "origin", Value());
+    Value scaleVal = getArg(args, "scale", Value(1.0));
 
     if (fileVal.isUndefined() || !fileVal.isString()) {
         emit("# Import: no file specified");
@@ -4079,11 +4083,13 @@ void BlenderGenerator::emitImport(const Arguments& args) {
         return;
     }
 
-    // Apply origin offset to all points
+    // Apply origin offset and scale to all points
+    double dxfScale = 1.0;
+    if (scaleVal.isNumber()) dxfScale = scaleVal.toNumber();
     for (auto& chain : chains) {
         for (auto& pt : chain) {
-            pt.first -= originX;
-            pt.second -= originY;
+            pt.first = (pt.first - originX) * dxfScale;
+            pt.second = (pt.second - originY) * dxfScale;
         }
     }
 
@@ -4556,6 +4562,23 @@ static bool is2DGeometry(const ASTNodePtr& node) {
         case ASTNode::Type::Offset:
         case ASTNode::Type::Projection:
             return true;
+        case ASTNode::Type::Import: {
+            // DXF imports are 2D
+            auto* prim = dynamic_cast<PrimitiveNode*>(node.get());
+            if (prim) {
+                Value fileVal = getArg(prim->args(), "file", getPositionalArg(prim->args(), 0, Value()));
+                if (fileVal.isString()) {
+                    std::string fn = fileVal.toString();
+                    size_t dot = fn.rfind('.');
+                    if (dot != std::string::npos) {
+                        std::string ext = fn.substr(dot + 1);
+                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                        if (ext == "dxf") return true;
+                    }
+                }
+            }
+            return false;
+        }
         case ASTNode::Type::Translate:
         case ASTNode::Type::Rotate:
         case ASTNode::Type::Scale:
@@ -4680,6 +4703,85 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         }
 
         emit("last_geo = " + joinId);
+        return;
+    }
+
+    // Check if this is a 2D boolean outside of an extrude context
+    // In that case, fill all 2D curves to flat mesh and use standard MeshBoolean
+    bool is2DSource = !actualChildren.empty() && is2DGeometry(actualChildren[0]);
+    if (is2DSource && !in_extrude_) {
+        int boolScopeId = node_counter_++;
+        emit("# " + opName + " (2D mesh boolean)");
+
+        std::string firstGeo = "bool_first_" + std::to_string(boolScopeId);
+        emit(firstGeo + " = None");
+
+        // Helper: fill curve geometry to mesh for 2D boolean
+        // Uses inverse check: skip fill only for known mesh-producing nodes
+        std::string fillHelper = "ensure_mesh_" + std::to_string(boolScopeId);
+        emit("def " + fillHelper + "(geo_node):");
+        indent_++;
+        emit("nonlocal x_pos, y_pos");
+        emit("if geo_node is None: return geo_node");
+        emit("mesh_types = {'GeometryNodeMeshBoolean', 'GeometryNodeFillCurve',");
+        emit("              'GeometryNodeMeshCube', 'GeometryNodeMeshCylinder',");
+        emit("              'GeometryNodeMeshCone', 'GeometryNodeMeshGrid',");
+        emit("              'GeometryNodeMeshIcoSphere', 'GeometryNodeMeshUVSphere',");
+        emit("              'GeometryNodeMeshLine', 'GeometryNodeImportSTL',");
+        emit("              'GeometryNodeExtrudeMesh', 'GeometryNodeSubdivideMesh'}");
+        emit("if geo_node.bl_idname in mesh_types:");
+        indent_++;
+        emit("return geo_node");
+        indent_--;
+        emit("fill = nodes.new('GeometryNodeFillCurve')");
+        emit("fill.location = (x_pos, y_pos)");
+        emit("links.new(geo_out(geo_node), fill.inputs['Curve'])");
+        emit("x_pos += 200");
+        emit("return fill");
+        indent_--;
+
+        // Process first child
+        actualChildren[0]->accept(*this);
+        emit("last_geo = " + fillHelper + "(last_geo)");
+        emit(firstGeo + " = last_geo");
+
+        for (size_t i = 1; i < actualChildren.size(); ++i) {
+            actualChildren[i]->accept(*this);
+
+            emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+            indent_++;
+            emit("last_geo = " + fillHelper + "(last_geo)");
+
+            emit("if " + firstGeo + " is None:");
+            indent_++;
+            emit(firstGeo + " = last_geo");
+            indent_--;
+            emit("else:");
+            indent_++;
+
+            std::string boolId = newNodeId();
+            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+            emit(boolId + ".location = (x_pos, y_pos)");
+            emit(boolId + ".operation = '" + blenderOp + "'");
+            emit(boolId + ".solver = 'EXACT'");
+
+            if (blenderOp == "DIFFERENCE") {
+                // DIFFERENCE: base -> inputs[0], tool -> inputs[1]
+                emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[0])");
+                emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
+            } else {
+                // UNION/INTERSECT: both operands -> inputs[1] (multi-input)
+                emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[1])");
+                emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
+            }
+            emit(firstGeo + " = " + boolId);
+            emit("x_pos += 200");
+            emit("y_pos -= 50");
+            indent_--;  // end else
+            indent_--;  // end if last_geo is not None
+        }
+
+        emit("last_geo = " + firstGeo);
         return;
     }
 
@@ -4847,7 +4949,39 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         indent_--;
         emit("x_pos += 200");
     } else {
-        // UNION and INTERSECT: use geometry nodes mesh boolean
+        // UNION and INTERSECT
+        bool is2D = is2DGeometry(actualChildren[0]);
+
+        if (is2D && blenderOp == "UNION") {
+            // 2D UNION: simply join curves together
+            emit("# " + opName + " (2D curve join)");
+
+            actualChildren[0]->accept(*this);
+            emit(firstGeo + " = last_geo");
+
+            for (size_t i = 1; i < actualChildren.size(); ++i) {
+                actualChildren[i]->accept(*this);
+                emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+                indent_++;
+                emit("if " + firstGeo + " is None:");
+                indent_++;
+                emit(firstGeo + " = last_geo");
+                indent_--;
+                emit("else:");
+                indent_++;
+                std::string joinId = newNodeId();
+                emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+                emit(joinId + ".location = (x_pos, y_pos)");
+                emit("link_nodes(links, " + firstGeo + ", 'Geometry', " + joinId + ", 'Geometry')");
+                emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+                emit(firstGeo + " = " + joinId);
+                emit("x_pos += 200");
+                indent_--;
+                indent_--;
+                emit("y_pos -= 50");
+            }
+        } else {
+        // 3D (or 2D INTERSECT) path: use geometry nodes mesh boolean
 
         // Helper: check if a node outputs curve geometry (2D)
         // Note: JoinGeometry is excluded because it can contain mesh data
@@ -4919,6 +5053,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             indent_--;  // end else
             indent_--;  // end if last_geo is not None
         }
+        } // end else (3D path)
     }
 
     emit("last_geo = " + firstGeo);
