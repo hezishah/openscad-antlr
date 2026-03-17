@@ -3612,71 +3612,179 @@ struct DxfSegment {
     double cx, cy, radius, startAngle, endAngle;
 };
 
-// Parse DXF file and extract LINE, ARC, and CIRCLE entities
+// Parse DXF file and extract LINE, ARC, and CIRCLE entities (with INSERT/BLOCK expansion)
 static std::vector<DxfSegment> parseDxfEntities(const std::string& filepath) {
     std::vector<DxfSegment> segments;
     std::ifstream file(filepath);
     if (!file.is_open()) return segments;
 
-    std::string groupCode, value;
-    bool inEntities = false;
-    std::string currentEntityType;
-    DxfSegment current = {};
-
-    auto resetCurrent = [&]() {
-        current = {};
-    };
-
-    auto flushEntity = [&]() {
-        if (currentEntityType == "LINE") {
-            current.type = DxfSegment::LINE_SEG;
-            segments.push_back(current);
-        } else if (currentEntityType == "ARC") {
-            current.type = DxfSegment::ARC_SEG;
-            segments.push_back(current);
-        } else if (currentEntityType == "CIRCLE") {
-            current.type = DxfSegment::CIRCLE_SEG;
-            segments.push_back(current);
-        }
-    };
-
-    while (std::getline(file, groupCode)) {
-        while (!groupCode.empty() && (groupCode.front() == ' ' || groupCode.front() == '\t'))
-            groupCode.erase(groupCode.begin());
-        while (!groupCode.empty() && (groupCode.back() == '\r' || groupCode.back() == '\n'))
-            groupCode.pop_back();
-
-        if (!std::getline(file, value)) break;
-        while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
-            value.erase(value.begin());
-        while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
-            value.pop_back();
-
+    // Read all code/value pairs
+    std::vector<std::pair<int,std::string>> pairs;
+    std::string codeLine, valLine;
+    while (std::getline(file, codeLine) && std::getline(file, valLine)) {
+        auto trim = [](std::string& s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+        };
+        trim(codeLine); trim(valLine);
         int code = 0;
-        try { code = std::stoi(groupCode); } catch (...) { continue; }
+        try { code = std::stoi(codeLine); } catch (...) { continue; }
+        pairs.push_back({code, valLine});
+    }
 
-        if (code == 2 && value == "ENTITIES") { inEntities = true; continue; }
-        if (code == 0 && value == "ENDSEC" && inEntities) {
-            flushEntity();
-            break;
+    // Helper to parse entities from a range of pairs into a vector
+    auto parseSegments = [](const std::vector<std::pair<int,std::string>>& pairs,
+                            size_t start, size_t end, const std::string& defaultLayer) {
+        std::vector<DxfSegment> segs;
+        std::string entityType;
+        DxfSegment cur = {};
+        auto flush = [&]() {
+            if (entityType == "LINE") { cur.type = DxfSegment::LINE_SEG; if (cur.layer.empty()) cur.layer = defaultLayer; segs.push_back(cur); }
+            else if (entityType == "ARC") { cur.type = DxfSegment::ARC_SEG; if (cur.layer.empty()) cur.layer = defaultLayer; segs.push_back(cur); }
+            else if (entityType == "CIRCLE") { cur.type = DxfSegment::CIRCLE_SEG; if (cur.layer.empty()) cur.layer = defaultLayer; segs.push_back(cur); }
+        };
+        for (size_t i = start; i < end; i++) {
+            int code = pairs[i].first;
+            const std::string& val = pairs[i].second;
+            if (code == 0) {
+                flush();
+                entityType = val;
+                cur = {};
+                continue;
+            }
+            if (code == 8) cur.layer = val;
+            else if (code == 10) { cur.x1 = std::stod(val); cur.cx = std::stod(val); }
+            else if (code == 20) { cur.y1 = std::stod(val); cur.cy = std::stod(val); }
+            else if (code == 11) cur.x2 = std::stod(val);
+            else if (code == 21) cur.y2 = std::stod(val);
+            else if (code == 40) cur.radius = std::stod(val);
+            else if (code == 50) cur.startAngle = std::stod(val);
+            else if (code == 51) cur.endAngle = std::stod(val);
         }
-        if (!inEntities) continue;
+        flush();
+        return segs;
+    };
 
-        if (code == 0) {
-            flushEntity();
-            currentEntityType = value;
-            resetCurrent();
-            continue;
+    // Pass 1: Find section boundaries
+    size_t blocksStart = 0, blocksEnd = 0, entitiesStart = 0, entitiesEnd = 0;
+    for (size_t i = 0; i < pairs.size(); i++) {
+        if (pairs[i].first == 2 && pairs[i].second == "BLOCKS") blocksStart = i + 1;
+        if (pairs[i].first == 2 && pairs[i].second == "ENTITIES") entitiesStart = i + 1;
+        if (pairs[i].first == 0 && pairs[i].second == "ENDSEC") {
+            if (entitiesStart > 0 && entitiesEnd == 0 && i > entitiesStart) entitiesEnd = i;
+            else if (blocksStart > 0 && blocksEnd == 0 && i > blocksStart) blocksEnd = i;
         }
+    }
 
-        if (code == 8) current.layer = value;
-        else if (code == 10) { current.x1 = std::stod(value); current.cx = std::stod(value); }
-        else if (code == 20) { current.y1 = std::stod(value); current.cy = std::stod(value); }
-        else if (code == 11) current.x2 = std::stod(value);
-        else if (code == 21) current.y2 = std::stod(value);
-        else if (code == 40) current.radius = std::stod(value);
-        else if (code == 50) current.startAngle = std::stod(value);
-        else if (code == 51) current.endAngle = std::stod(value);
+    // Pass 2: Parse blocks
+    struct DxfBlock {
+        std::string name;
+        std::vector<DxfSegment> entities;
+    };
+    std::map<std::string, DxfBlock> blocks;
+    if (blocksStart > 0 && blocksEnd > blocksStart) {
+        size_t i = blocksStart;
+        while (i < blocksEnd) {
+            // Find BLOCK entity
+            if (pairs[i].first == 0 && pairs[i].second == "BLOCK") {
+                DxfBlock block;
+                i++;
+                // Read block properties until first sub-entity or ENDBLK
+                size_t blockBodyStart = 0;
+                while (i < blocksEnd) {
+                    if (pairs[i].first == 2 && block.name.empty()) block.name = pairs[i].second;
+                    if (pairs[i].first == 0) { blockBodyStart = i; break; }
+                    i++;
+                }
+                // Find ENDBLK
+                size_t blockEnd = blockBodyStart;
+                while (blockEnd < blocksEnd) {
+                    if (pairs[blockEnd].first == 0 && pairs[blockEnd].second == "ENDBLK") break;
+                    blockEnd++;
+                }
+                if (blockBodyStart > 0 && blockEnd > blockBodyStart) {
+                    block.entities = parseSegments(pairs, blockBodyStart, blockEnd, "0");
+                }
+                if (!block.name.empty() && !block.entities.empty()) {
+                    blocks[block.name] = block;
+                }
+                i = blockEnd + 1;
+            } else {
+                i++;
+            }
+        }
+    }
+
+    // Pass 3: Parse ENTITIES section (direct entities)
+    if (entitiesStart > 0 && entitiesEnd > entitiesStart) {
+        segments = parseSegments(pairs, entitiesStart, entitiesEnd, "0");
+
+        // Also look for INSERT entities and expand them
+        struct InsertRef {
+            std::string blockName, layer;
+            double x = 0, y = 0, rotation = 0, xscale = 1, yscale = 1;
+        };
+        std::vector<InsertRef> inserts;
+        std::string entityType;
+        InsertRef curInsert;
+        bool inInsert = false;
+        for (size_t i = entitiesStart; i < entitiesEnd; i++) {
+            if (pairs[i].first == 0) {
+                if (inInsert) inserts.push_back(curInsert);
+                inInsert = (pairs[i].second == "INSERT");
+                curInsert = InsertRef{};
+                continue;
+            }
+            if (!inInsert) continue;
+            int code = pairs[i].first;
+            const std::string& val = pairs[i].second;
+            if (code == 2) curInsert.blockName = val;
+            else if (code == 8) curInsert.layer = val;
+            else if (code == 10) curInsert.x = std::stod(val);
+            else if (code == 20) curInsert.y = std::stod(val);
+            else if (code == 41) curInsert.xscale = std::stod(val);
+            else if (code == 42) curInsert.yscale = std::stod(val);
+            else if (code == 50) curInsert.rotation = std::stod(val);
+        }
+        if (inInsert) inserts.push_back(curInsert);
+
+        // Expand INSERT references
+        for (const auto& ins : inserts) {
+            auto it = blocks.find(ins.blockName);
+            if (it == blocks.end()) continue;
+
+            double rotRad = ins.rotation * M_PI / 180.0;
+            double cosR = cos(rotRad), sinR = sin(rotRad);
+
+            auto transform = [&](double x, double y) -> std::pair<double,double> {
+                double sx = x * ins.xscale;
+                double sy = y * ins.yscale;
+                double rx = sx * cosR - sy * sinR;
+                double ry = sx * sinR + sy * cosR;
+                return {rx + ins.x, ry + ins.y};
+            };
+
+            for (const auto& seg : it->second.entities) {
+                DxfSegment transformed = seg;
+                transformed.layer = ins.layer.empty() ? seg.layer : ins.layer;
+                if (seg.type == DxfSegment::LINE_SEG) {
+                    auto [nx1, ny1] = transform(seg.x1, seg.y1);
+                    auto [nx2, ny2] = transform(seg.x2, seg.y2);
+                    transformed.x1 = nx1; transformed.y1 = ny1;
+                    transformed.x2 = nx2; transformed.y2 = ny2;
+                } else if (seg.type == DxfSegment::ARC_SEG || seg.type == DxfSegment::CIRCLE_SEG) {
+                    auto [ncx, ncy] = transform(seg.cx, seg.cy);
+                    transformed.cx = ncx; transformed.cy = ncy;
+                    transformed.radius = seg.radius * std::abs(ins.xscale);
+                    if (seg.type == DxfSegment::ARC_SEG) {
+                        transformed.startAngle = seg.startAngle + ins.rotation;
+                        transformed.endAngle = seg.endAngle + ins.rotation;
+                    }
+                }
+                segments.push_back(transformed);
+            }
+        }
     }
 
     return segments;
