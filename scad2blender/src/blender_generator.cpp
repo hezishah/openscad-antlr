@@ -333,6 +333,19 @@ void BlenderGenerator::emitHelperFunctions() {
     indent_--;
     emitBlank();
 
+    // Helper to get geometry output socket from any node
+    emit("def geo_out(node):");
+    indent_++;
+    emit("\"\"\"Get the geometry output socket from a node (handles ObjectInfo etc.)\"\"\"");
+    emit("for name in ['Geometry', 'Mesh', 'Curve']:");
+    indent_++;
+    emit("s = node.outputs.get(name)");
+    emit("if s is not None: return s");
+    indent_--;
+    emit("return node.outputs[0]");
+    indent_--;
+    emitBlank();
+
     // OpenSCAD rands() helper
     emit("def _scad_rands(min_val, max_val, num, seed=None):");
     indent_++;
@@ -1001,7 +1014,7 @@ void BlenderGenerator::emitFooter() {
     emit("# Clean up temporary boolean objects");
     emit("for _o in list(bpy.data.objects):");
     indent_++;
-    emit("if _o.name.startswith('_diff_') or _o.name.startswith('_dxf_'):");
+    emit("if _o.name.startswith('_diff_') or _o.name.startswith('_dxf_') or _o.name.startswith('_surf_'):");
     indent_++;
     emit("_mesh = _o.data");
     emit("bpy.data.objects.remove(_o, do_unlink=True)");
@@ -1083,6 +1096,9 @@ void BlenderGenerator::visit(PrimitiveNode& node) {
             break;
         case ASTNode::Type::Import:
             emitImport(node.args());
+            break;
+        case ASTNode::Type::Surface:
+            emitSurface(node.args());
             break;
         default:
             emit("# Unsupported primitive type");
@@ -3929,6 +3945,188 @@ void BlenderGenerator::emitImport(const Arguments& args) {
     emit("x_pos += 200");
 }
 
+// ─── Surface (heightmap from .dat file) ────────────────────────────────────
+
+// Parse an Octave-format .dat file into a 2D grid of doubles
+static std::vector<std::vector<double>> parseSurfaceData(const std::string& filepath) {
+    std::vector<std::vector<double>> grid;
+    std::ifstream file(filepath);
+    if (!file.is_open()) return grid;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip comment lines
+        if (line.empty() || line[0] == '#') continue;
+        // Parse space-separated values
+        std::vector<double> row;
+        std::istringstream iss(line);
+        double val;
+        while (iss >> val) {
+            row.push_back(val);
+        }
+        if (!row.empty()) grid.push_back(row);
+    }
+    return grid;
+}
+
+void BlenderGenerator::emitSurface(const Arguments& args) {
+    Value fileVal = getArg(args, "file", getPositionalArg(args, 0, Value()));
+    Value centerVal = getArg(args, "center", Value(false));
+
+    if (fileVal.isUndefined() || !fileVal.isString()) {
+        emit("# Surface: no file specified");
+        return;
+    }
+
+    std::string filename = fileVal.toString();
+    if (filename.size() >= 2 && filename.front() == '"' && filename.back() == '"') {
+        filename = filename.substr(1, filename.size() - 2);
+    }
+
+    // Resolve file path
+    std::string filepath = filename;
+    if (!source_dir_.empty() && filename[0] != '/') {
+        filepath = source_dir_ + "/" + filename;
+    }
+
+    auto grid = parseSurfaceData(filepath);
+    if (grid.empty()) {
+        emit("# Surface: could not read data file: " + filepath);
+        return;
+    }
+
+    int rows = static_cast<int>(grid.size());
+    int cols = static_cast<int>(grid[0].size());
+
+    // Find minimum value for ground plane
+    double minZ = grid[0][0];
+    for (const auto& row : grid) {
+        for (double v : row) {
+            if (v < minZ) minZ = v;
+        }
+    }
+
+    bool center = false;
+    if (!centerVal.isUndefined()) {
+        if (centerVal.isBool()) center = centerVal.toBool();
+        else if (centerVal.isNumber()) center = centerVal.toNumber() != 0;
+    }
+
+    emit("# Surface heightmap: " + filename + " (" + std::to_string(rows) + "x" + std::to_string(cols) + ")");
+
+    // Create the mesh via bmesh in Python, then wrap in ObjectInfo
+    std::string objVar = newNodeId() + "_surf_obj";
+    emit("import bmesh as _bmesh");
+    emit("_bm = _bmesh.new()");
+
+    // Emit vertices: one per grid point, with Z = height value
+    // OpenSCAD surface: each data point at integer x,y coordinates
+    double offsetX = center ? -(cols - 1) / 2.0 : 0;
+    double offsetY = center ? -(rows - 1) / 2.0 : 0;
+
+    emit("_surf_verts = []");
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            double x = c + offsetX;
+            double y = r + offsetY;
+            double z = (c < static_cast<int>(grid[r].size())) ? grid[r][c] : 0;
+            emit("_surf_verts.append(_bm.verts.new((" +
+                 pyDouble(x) + ", " + pyDouble(y) + ", " + pyDouble(z) + ")))");
+        }
+    }
+    emit("_bm.verts.ensure_lookup_table()");
+
+    // Emit faces: quads connecting adjacent grid points
+    // Also add bottom faces (z=0 plane) and side walls for a solid mesh
+    for (int r = 0; r < rows - 1; r++) {
+        for (int c = 0; c < cols - 1; c++) {
+            int i00 = r * cols + c;
+            int i10 = r * cols + (c + 1);
+            int i01 = (r + 1) * cols + c;
+            int i11 = (r + 1) * cols + (c + 1);
+            emit("_bm.faces.new([_surf_verts[" + std::to_string(i00) + "], _surf_verts[" +
+                 std::to_string(i10) + "], _surf_verts[" + std::to_string(i11) + "], _surf_verts[" +
+                 std::to_string(i01) + "]])");
+        }
+    }
+
+    // Add bottom plane at z=minZ (ground plane at minimum data value)
+    int baseStart = rows * cols;
+    emit("_base_verts = []");
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            double x = c + offsetX;
+            double y = r + offsetY;
+            emit("_base_verts.append(_bm.verts.new((" +
+                 pyDouble(x) + ", " + pyDouble(y) + ", " + pyDouble(minZ) + ")))");
+        }
+    }
+    emit("_bm.verts.ensure_lookup_table()");
+
+    // Bottom faces (reversed winding for outward normal)
+    for (int r = 0; r < rows - 1; r++) {
+        for (int c = 0; c < cols - 1; c++) {
+            int i00 = baseStart + r * cols + c;
+            int i10 = baseStart + r * cols + (c + 1);
+            int i01 = baseStart + (r + 1) * cols + c;
+            int i11 = baseStart + (r + 1) * cols + (c + 1);
+            emit("_bm.faces.new([_bm.verts[" + std::to_string(i00) + "], _bm.verts[" +
+                 std::to_string(i01) + "], _bm.verts[" + std::to_string(i11) + "], _bm.verts[" +
+                 std::to_string(i10) + "]])");
+        }
+    }
+
+    // Side walls: connect top edge vertices to bottom edge vertices
+    // Front edge (r=0)
+    for (int c = 0; c < cols - 1; c++) {
+        int t0 = c, t1 = c + 1;
+        int b0 = baseStart + c, b1 = baseStart + c + 1;
+        emit("_bm.faces.new([_bm.verts[" + std::to_string(t0) + "], _bm.verts[" +
+             std::to_string(b0) + "], _bm.verts[" + std::to_string(b1) + "], _bm.verts[" +
+             std::to_string(t1) + "]])");
+    }
+    // Back edge (r=rows-1)
+    for (int c = 0; c < cols - 1; c++) {
+        int t0 = (rows-1) * cols + c, t1 = (rows-1) * cols + c + 1;
+        int b0 = baseStart + (rows-1) * cols + c, b1 = baseStart + (rows-1) * cols + c + 1;
+        emit("_bm.faces.new([_bm.verts[" + std::to_string(t0) + "], _bm.verts[" +
+             std::to_string(t1) + "], _bm.verts[" + std::to_string(b1) + "], _bm.verts[" +
+             std::to_string(b0) + "]])");
+    }
+    // Left edge (c=0)
+    for (int r = 0; r < rows - 1; r++) {
+        int t0 = r * cols, t1 = (r+1) * cols;
+        int b0 = baseStart + r * cols, b1 = baseStart + (r+1) * cols;
+        emit("_bm.faces.new([_bm.verts[" + std::to_string(t0) + "], _bm.verts[" +
+             std::to_string(t1) + "], _bm.verts[" + std::to_string(b1) + "], _bm.verts[" +
+             std::to_string(b0) + "]])");
+    }
+    // Right edge (c=cols-1)
+    for (int r = 0; r < rows - 1; r++) {
+        int t0 = r * cols + (cols-1), t1 = (r+1) * cols + (cols-1);
+        int b0 = baseStart + r * cols + (cols-1), b1 = baseStart + (r+1) * cols + (cols-1);
+        emit("_bm.faces.new([_bm.verts[" + std::to_string(t0) + "], _bm.verts[" +
+             std::to_string(b0) + "], _bm.verts[" + std::to_string(b1) + "], _bm.verts[" +
+             std::to_string(t1) + "]])");
+    }
+
+    // Convert bmesh to mesh object
+    emit("_surf_mesh = bpy.data.meshes.new('_surf_" + filename + "')");
+    emit("_bm.to_mesh(_surf_mesh)");
+    emit("_bm.free()");
+    emit(objVar + " = bpy.data.objects.new('_surf_" + filename + "', _surf_mesh)");
+    emit("bpy.context.collection.objects.link(" + objVar + ")");
+
+    // Use ObjectInfo to bring it into the node tree
+    std::string objInfoId = newNodeId();
+    emit(objInfoId + " = nodes.new('GeometryNodeObjectInfo')");
+    emit(objInfoId + ".location = (x_pos, y_pos)");
+    emit(objInfoId + ".transform_space = 'RELATIVE'");
+    emit(objInfoId + ".inputs['Object'].default_value = " + objVar);
+    emit("last_geo = " + objInfoId);
+    emit("x_pos += 200");
+}
+
 void BlenderGenerator::emitOffset(const Arguments& args) {
     Value r = getArg(args, "r", getPositionalArg(args, 0, Value()));
     Value delta = getArg(args, "delta", Value());
@@ -4432,7 +4630,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 emit(unionId + ".location = (x_pos, y_pos)");
                 emit(unionId + ".operation = 'UNION'");
                 emit(unionId + ".solver = 'EXACT'");
-                emit("links.new(last_geo.outputs[0], " + unionId + ".inputs[1])");
+                emit("links.new(geo_out(last_geo), " + unionId + ".inputs[1])");
                 emit("last_geo = " + unionId);
                 emit("x_pos += 200");
                 indent_--;
@@ -4444,8 +4642,8 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 emit(boolId + ".solver = 'EXACT'");
 
                 // DIFFERENCE: base -> inputs[0], tool -> inputs[1]
-                emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[0])");
-                emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+                emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[0])");
+                emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
                 emit(firstGeo + " = " + boolId);
                 emit("x_pos += 200");
                 emit("y_pos -= 50");
@@ -4463,7 +4661,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
         emit("if " + firstGeo + " is not None:");
         indent_++;
-        emit("links.new(" + firstGeo + ".outputs[0], " + mergeId + ".inputs['Geometry'])");
+        emit("links.new(geo_out(" + firstGeo + "), " + mergeId + ".inputs['Geometry'])");
         emit(firstGeo + " = " + mergeId);
         indent_--;
         emit("x_pos += 200");
@@ -4532,8 +4730,8 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
             // In Blender 5.1+, UNION/INTERSECT use inputs[1] as multi-input
             // (inputs[0] is disabled). Both operands go to inputs[1].
-            emit("links.new(" + firstGeo + ".outputs[0], " + boolId + ".inputs[1])");
-            emit("links.new(last_geo.outputs[0], " + boolId + ".inputs[1])");
+            emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[1])");
+            emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
             emit(firstGeo + " = " + boolId);
             emit("x_pos += 200");
             emit("y_pos -= 50");

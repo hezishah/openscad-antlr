@@ -106,6 +106,7 @@ private:
     void emitSquare(const Arguments& args);
     void emitText(const Arguments& args);
     void emitImport(const Arguments& args);
+    void emitSurface(const Arguments& args);
 
     // Transform generators
     void emitTranslate(const Arguments& args);
