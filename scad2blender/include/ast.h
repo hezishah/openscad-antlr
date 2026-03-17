@@ -227,11 +227,14 @@ public:
 
     const std::string& variable() const { return variable_; }
     const Value& range() const { return range_; }
+    bool isIntersect() const { return intersect_; }
+    void setIntersect(bool v) { intersect_ = v; }
     void accept(ASTVisitor& visitor) override;
 
 private:
     std::string variable_;
     Value range_;
+    bool intersect_ = false;
 };
 
 /**

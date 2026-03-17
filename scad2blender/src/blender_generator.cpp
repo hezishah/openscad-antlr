@@ -2257,28 +2257,67 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         // Track loop variable
         loop_variables_.insert(loopVar);
 
-        // Create a JoinGeometry node to accumulate geometry from each iteration
-        std::string joinId = newNodeId();
-        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinId + ".location = (x_pos, y_pos)");
+        if (node.isIntersect()) {
+            // intersection_for: intersect each iteration's geometry
+            std::string firstGeo = newNodeId() + "_isect_first";
+            emit(firstGeo + " = None");
 
-        emit("for " + loopVar + " in " + range.toPython() + ":");
-        indent_++;
+            emit("for " + loopVar + " in " + range.toPython() + ":");
+            indent_++;
 
-        for (auto& child : node.children()) {
-            if (!child) continue;
-            child->accept(*this);
+            for (auto& child : node.children()) {
+                if (!child) continue;
+                child->accept(*this);
+            }
+
+            emit("if last_geo is not None:");
+            indent_++;
+            emit("if " + firstGeo + " is None:");
+            indent_++;
+            emit(firstGeo + " = last_geo");
+            indent_--;
+            emit("else:");
+            indent_++;
+            std::string boolId = newNodeId();
+            emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+            emit(boolId + ".location = (x_pos, y_pos)");
+            emit(boolId + ".operation = 'INTERSECT'");
+            emit(boolId + ".solver = 'EXACT'");
+            emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[1])");
+            emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
+            emit(firstGeo + " = " + boolId);
+            emit("x_pos += 200");
+            emit("y_pos -= 50");
+            indent_--;
+            indent_--;
+
+            indent_--;
+
+            emit("last_geo = " + firstGeo);
+        } else {
+            // Create a JoinGeometry node to accumulate geometry from each iteration
+            std::string joinId = newNodeId();
+            emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+            emit(joinId + ".location = (x_pos, y_pos)");
+
+            emit("for " + loopVar + " in " + range.toPython() + ":");
+            indent_++;
+
+            for (auto& child : node.children()) {
+                if (!child) continue;
+                child->accept(*this);
+            }
+
+            // Link each iteration's result into the join node
+            emit("if last_geo is not None:");
+            indent_++;
+            emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
+            indent_--;
+
+            indent_--;
+
+            emit("last_geo = " + joinId);
         }
-
-        // Link each iteration's result into the join node
-        emit("if last_geo is not None:");
-        indent_++;
-        emit("link_nodes(links, last_geo, 'Geometry', " + joinId + ", 'Geometry')");
-        indent_--;
-
-        indent_--;
-
-        emit("last_geo = " + joinId);
 
         loop_variables_.erase(loopVar);
     } else if (range.isExpression() && range.exprTree()) {
@@ -3513,10 +3552,28 @@ void BlenderGenerator::emitRotate(const Arguments& args) {
                 }
             }
         } else {
-            // No axis vector — Z-axis rotation by default
+            // No axis vector — Z-axis rotation by default, or Euler if variable is a vector
             if (angleIsRuntime) {
-                if (exprTreeReferencesModuleParams(aTree)) {
-                    std::string pyExpr = exprTreeToPython(aTree);
+                std::string pyExpr = exprTreeToPython(aTree);
+                // Check if the variable might be a vector at runtime (e.g., loop variable in intersection_for)
+                bool mightBeVector = false;
+                if (aTree && aTree->kind == ExprNode::Kind::VarRef &&
+                    loop_variables_.count(aTree->var_name)) {
+                    mightBeVector = true;
+                }
+
+                if (mightBeVector) {
+                    // Emit runtime check: if vector, use as Euler XYZ; if scalar, use as Z rotation
+                    emit("if isinstance(" + pyExpr + ", (list, tuple)):");
+                    indent_++;
+                    emit(nodeId + ".inputs['Rotation'].default_value = (math.radians(" +
+                         pyExpr + "[0]), math.radians(" + pyExpr + "[1]), math.radians(" + pyExpr + "[2]))");
+                    indent_--;
+                    emit("else:");
+                    indent_++;
+                    emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, math.radians(" + pyExpr + "))");
+                    indent_--;
+                } else if (exprTreeReferencesModuleParams(aTree)) {
                     emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, math.radians(" + pyExpr + "))");
                 } else {
                     ExprNodePtr radTree = ExprNode::makeBinary(

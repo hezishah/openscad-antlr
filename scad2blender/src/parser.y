@@ -1244,7 +1244,7 @@ static void prescan_variables_internal(FILE* f, const std::string& file_dir) {
 %token TOK_COLOR TOK_OFFSET TOK_RESIZE TOK_MULTMATRIX
 
 /* Boolean operations */
-%token TOK_UNION TOK_DIFFERENCE TOK_INTERSECTION
+%token TOK_UNION TOK_DIFFERENCE TOK_INTERSECTION TOK_INTERSECTION_FOR
 
 /* Extrusions */
 %token TOK_LINEAR_EXTRUDE TOK_ROTATE_EXTRUDE
@@ -1444,6 +1444,14 @@ statement:
     | '#' for_statement { $$ = $2; if ($$) $$->setDebug(true); }
     | '%' for_statement { $$ = $2; if ($$) $$->setBackground(true); }
     | '*' for_statement { $$ = $2; if ($$) $$->setDisabled(true); }
+    | TOK_INTERSECTION_FOR '(' TOK_ID '=' expr ')' child_statement {
+        auto node = new ForLoopNode(*$3, *$5);
+        node->setIntersect(true);
+        if ($7) node->addChild(ASTNodePtr($7));
+        $$ = node;
+        delete $3;
+        delete $5;
+    }
     | TOK_ECHO '(' arguments ')' ';' {
         // echo() is ignored - just parse and discard
         delete $3;
@@ -1964,6 +1972,14 @@ child_statement:
     | '#' for_statement { $$ = $2; if ($$) $$->setDebug(true); }
     | '%' for_statement { $$ = $2; if ($$) $$->setBackground(true); }
     | '*' for_statement { $$ = $2; if ($$) $$->setDisabled(true); }
+    | TOK_INTERSECTION_FOR '(' TOK_ID '=' expr ')' child_statement {
+        auto node = new ForLoopNode(*$3, *$5);
+        node->setIntersect(true);
+        if ($7) node->addChild(ASTNodePtr($7));
+        $$ = node;
+        delete $3;
+        delete $5;
+    }
     | TOK_ID '=' expr ';' {
         // Assignment as child_statement
         set_variable(*$1, *$3);

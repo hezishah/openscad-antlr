@@ -169,6 +169,7 @@ WS          [ \t\r]+
  /* Built-in modules - Boolean operations */
 "union"                     { return TOK_UNION; }
 "difference"                { return TOK_DIFFERENCE; }
+"intersection_for"          { return TOK_INTERSECTION_FOR; }
 "intersection"              { return TOK_INTERSECTION; }
 
  /* Built-in modules - Extrusions */
