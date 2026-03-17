@@ -3845,6 +3845,22 @@ void BlenderGenerator::emitImport(const Arguments& args) {
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     }
 
+    if (ext == "stl") {
+        // Use Geometry Nodes "Import STL" node
+        std::string filepath = filename;
+        if (!source_dir_.empty() && filename[0] != '/') {
+            filepath = source_dir_ + "/" + filename;
+        }
+        emit("# Import STL: " + filename);
+        std::string importId = newNodeId();
+        emit(importId + " = nodes.new('GeometryNodeImportSTL')");
+        emit(importId + ".location = (x_pos, y_pos)");
+        emit(importId + ".inputs['Path'].default_value = '" + filepath + "'");
+        emit("last_geo = " + importId);
+        emit("x_pos += 200");
+        return;
+    }
+
     if (ext != "dxf") {
         emit("# Import: unsupported file type: " + filename);
         return;
