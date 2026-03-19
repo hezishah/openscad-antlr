@@ -13,7 +13,9 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <chrono>
 #include <algorithm>
+#include <regex>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <libgen.h>
@@ -149,6 +151,30 @@ static std::string readFile(const std::string& path) {
     if (!in) return "";
     return std::string((std::istreambuf_iterator<char>(in)),
                         std::istreambuf_iterator<char>());
+}
+
+// Rename identifiers that start with a digit (e.g., "12ptStar") to "_12ptStar"
+// OpenSCAD allows this but our parser doesn't, so we fix it in preprocessing.
+static std::string fixDigitPrefixedNames(const std::string& content) {
+    // Match: "module <digit>..." and function calls to digit-prefixed names
+    std::regex moduleDigitName(R"(\bmodule\s+(\d))");
+    std::string result = std::regex_replace(content, moduleDigitName, "module _$1");
+    // Also fix calls to these renamed modules (standalone identifier starting with digit followed by '(')
+    // We need to find all digit-prefixed module names first
+    std::regex moduleDefPattern(R"(\bmodule\s+_(\d\w*)\s*\()");
+    std::smatch match;
+    std::set<std::string> digitModules;
+    std::string tmp = result;
+    while (std::regex_search(tmp, match, moduleDefPattern)) {
+        digitModules.insert(match[1].str());
+        tmp = match.suffix().str();
+    }
+    // Replace calls: "12ptStar(" -> "_12ptStar("
+    for (const auto& name : digitModules) {
+        std::regex callPattern("\\b(" + name + ")\\s*\\(");
+        result = std::regex_replace(result, callPattern, "_$1(");
+    }
+    return result;
 }
 
 // Split content into lines
@@ -726,6 +752,10 @@ static void prefilterLibraries(const std::string& inputFile,
             out << filtered;
             out.close();
 
+            // Debug: also save to /tmp for inspection
+            std::ofstream dbg("/tmp/filtered_" + incFile);
+            if (dbg) { dbg << filtered; dbg.close(); }
+
             auto filteredLines = splitLines(filtered);
             if (verbose) {
                 std::cerr << "Filtered " << incFile << ": "
@@ -805,8 +835,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Open input file
-    FILE* input = fopen(inputFile.c_str(), "r");
+    // Open and preprocess input file
+    std::string inputContent = readFile(inputFile);
+    if (inputContent.empty()) {
+        std::cerr << "Error: Cannot open input file: " << inputFile << "\n";
+        return 1;
+    }
+    inputContent = fixDigitPrefixedNames(inputContent);
+
+    // Write preprocessed content to a temp file for the parser
+    std::string preprocessedPath = inputFile;
+    bool usedPreprocessedFile = false;
+    if (inputContent != readFile(inputFile)) {
+        if (g_temp_dir.empty()) {
+            g_temp_dir = createTempDir();
+        }
+        preprocessedPath = g_temp_dir + "/preprocessed.scad";
+        std::ofstream ppOut(preprocessedPath);
+        ppOut << inputContent;
+        ppOut.close();
+        usedPreprocessedFile = true;
+    }
+
+    FILE* input = fopen(preprocessedPath.c_str(), "r");
     if (!input) {
         std::cerr << "Error: Cannot open input file: " << inputFile << "\n";
         return 1;
@@ -855,15 +906,19 @@ int main(int argc, char* argv[]) {
     prescan_variables(input);
 
     // Parse the input
+    auto t0 = std::chrono::steady_clock::now();
     int parseResult = yyparse();
+    auto t1 = std::chrono::steady_clock::now();
     fclose(input);
+    if (verbose) std::cerr << "Parse time: " << std::chrono::duration_cast<std::chrono::milliseconds>(t1-t0).count() << " ms\n";
 
     // Clean up temp directory
     if (!g_temp_dir.empty()) {
+        if (verbose) std::cerr << "Temp dir: " << g_temp_dir << "\n";
         cleanupTempDir(g_temp_dir);
     }
 
-    if (parseResult != 0) {
+    if (parseResult != 0 && !g_root) {
         std::cerr << "Error: Parsing failed\n";
         return 1;
     }

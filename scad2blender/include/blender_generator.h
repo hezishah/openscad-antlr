@@ -65,6 +65,10 @@ private:
     bool in_module_ = false;
     bool in_hull_ = false;
     bool in_extrude_ = false;
+    bool has_3d_geometry_ = false;  // Set when any 3D primitive or extrusion is emitted
+    int eval_steps_ = 0;
+    int eval_call_count_ = 0;
+    static const int MAX_EVAL_STEPS = 500;
     bool module_uses_children_ = false;
     std::set<std::string> current_module_params_;  // Parameter names of the module being emitted
     std::set<std::string> loop_variables_;            // Active for-loop variable names
@@ -81,6 +85,7 @@ private:
     struct FuncDef {
         std::vector<std::string> params;
         ExprNodePtr body;
+        std::map<std::string, ExprNodePtr> defaults;  // param name → default expr tree
     };
     std::map<std::string, FuncDef> functions_;
 
@@ -111,6 +116,7 @@ private:
 
     // Transform generators
     void emitTranslate(const Arguments& args);
+    void emitMultmatrix(const Arguments& args);
     void emitRotate(const Arguments& args);
     void emitScale(const Arguments& args);
     void emitMirror(const Arguments& args);
@@ -178,6 +184,7 @@ private:
 
     // Convert expression tree to a Python expression string using Python-level variables
     std::string exprTreeToPython(const ExprNodePtr& tree);
+    std::string exprTreeToPythonInner(const ExprNodePtr& tree);
 
     // Check if an expression tree contains a call to a specific function
     bool exprTreeCallsFunction(const ExprNodePtr& tree, const std::string& funcName);

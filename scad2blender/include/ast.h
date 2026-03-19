@@ -294,11 +294,14 @@ public:
     const std::vector<std::string>& parameters() const { return parameters_; }
     const ExprNodePtr& body() const { return body_; }
     void setBody(const ExprNodePtr& body) { body_ = body; }
+    const std::map<std::string, ExprNodePtr>& paramDefaults() const { return param_defaults_; }
+    void setParamDefault(const std::string& name, const ExprNodePtr& expr) { param_defaults_[name] = expr; }
     void accept(ASTVisitor& visitor) override;
 private:
     std::string name_;
     std::vector<std::string> parameters_;
     ExprNodePtr body_;
+    std::map<std::string, ExprNodePtr> param_defaults_;
 };
 
 /**

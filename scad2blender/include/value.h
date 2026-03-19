@@ -84,7 +84,7 @@ public:
 
     // Constructors
     Value() : type_(Type::Undefined) {}
-    Value(bool b) : type_(Type::Boolean), bool_val_(b) {}
+    Value(bool b) : type_(Type::Boolean), bool_val_(b), num_val_(b ? 1.0 : 0.0) {}
     Value(double d) : type_(Type::Number), num_val_(d) {}
     Value(int i) : type_(Type::Number), num_val_(static_cast<double>(i)) {}
     Value(const std::string& s) : type_(Type::String), str_val_(s) {}

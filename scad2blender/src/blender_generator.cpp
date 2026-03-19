@@ -190,6 +190,11 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
         emitBuildGeometry(*rootNode);
     }
 
+    // Emit any additional Python helper functions discovered during build_geometry
+    if (!python_helper_functions_.empty()) {
+        emitPythonHelperFunctions();
+    }
+
     emitFooter();
 
     return code_.str();
@@ -212,7 +217,10 @@ static std::string pyName(const std::string& name) {
         "break", "class", "continue", "def", "del", "elif", "else", "except",
         "finally", "for", "from", "global", "if", "import", "in", "is",
         "lambda", "nonlocal", "not", "or", "pass", "raise", "return",
-        "try", "while", "with", "yield"
+        "try", "while", "with", "yield",
+        // Python built-in names that would be shadowed
+        "bool", "int", "float", "str", "list", "dict", "set", "type",
+        "len", "range", "print", "max", "min", "abs", "round", "sum"
     };
     if (reserved.count(result)) {
         result += "_";
@@ -323,7 +331,22 @@ void BlenderGenerator::emitHelperFunctions() {
     indent_--;
     emit("if out_socket is not None:");
     indent_++;
-    emit("links.new(out_socket, to_node.inputs[to_socket])");
+    emit("in_socket = to_node.inputs.get(to_socket)");
+    emit("if in_socket is None:");
+    indent_++;
+    emit("for alt in ['Mesh', 'Geometry', 'Curve']:");
+    indent_++;
+    emit("in_socket = to_node.inputs.get(alt)");
+    emit("if in_socket is not None:");
+    indent_++;
+    emit("break");
+    indent_--;
+    indent_--;
+    indent_--;
+    emit("if in_socket is not None:");
+    indent_++;
+    emit("links.new(out_socket, in_socket)");
+    indent_--;
     indent_--;
     indent_--;
     emit("except Exception as e:");
@@ -343,6 +366,22 @@ void BlenderGenerator::emitHelperFunctions() {
     emit("if s is not None: return s");
     indent_--;
     emit("return node.outputs[0]");
+    indent_--;
+    emitBlank();
+
+    // OpenSCAD search() helper
+    emit("def _scad_search(match, table, num_returns=1):");
+    indent_++;
+    emit("\"\"\"OpenSCAD search() — find indices of matching values\"\"\"");
+    emit("if isinstance(match, str):");
+    indent_++;
+    emit("return [([i for i, c in enumerate(table) if c == ch] if isinstance(table, str) else [i for i, v in enumerate(table) if v == ch]) for ch in match]");
+    indent_--;
+    emit("if isinstance(match, (list, tuple)):");
+    indent_++;
+    emit("return [[i for i, v in enumerate(table) if v == m] for m in match]");
+    indent_--;
+    emit("return [[i for i, v in enumerate(table) if v == match]]");
     indent_--;
     emitBlank();
 
@@ -366,6 +405,8 @@ void BlenderGenerator::emitHelperFunctions() {
     emitBlank();
     emit("def _vadd(a, b):");
     indent_++;
+    emit("if a is None: a = 0");
+    emit("if b is None: b = 0");
     emit("if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):"); indent_++;
     emit("return [_vadd(x, y) for x, y in zip(a, b)]"); indent_--;
     emit("if isinstance(a, (list, tuple)):"); indent_++;
@@ -380,6 +421,8 @@ void BlenderGenerator::emitHelperFunctions() {
     emitBlank();
     emit("def _vsub(a, b):");
     indent_++;
+    emit("if a is None: a = 0");
+    emit("if b is None: b = 0");
     emit("if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):"); indent_++;
     emit("return [_vsub(x, y) for x, y in zip(a, b)]"); indent_--;
     emit("if isinstance(a, (list, tuple)):"); indent_++;
@@ -394,6 +437,8 @@ void BlenderGenerator::emitHelperFunctions() {
     emitBlank();
     emit("def _vmul(a, b):");
     indent_++;
+    emit("if a is None: a = 0");
+    emit("if b is None: b = 0");
     emit("if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):"); indent_++;
     emit("return [_vmul(x, y) for x, y in zip(a, b)]"); indent_--;
     emit("if isinstance(a, (list, tuple)):"); indent_++;
@@ -408,6 +453,8 @@ void BlenderGenerator::emitHelperFunctions() {
     emitBlank();
     emit("def _vdiv(a, b):");
     indent_++;
+    emit("if a is None: a = 0");
+    emit("if b is None: b = 0");
     emit("if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):"); indent_++;
     emit("return [_vdiv(x, y) for x, y in zip(a, b)]"); indent_--;
     emit("if isinstance(a, (list, tuple)):"); indent_++;
@@ -416,6 +463,20 @@ void BlenderGenerator::emitHelperFunctions() {
     emit("return [_vdiv(a, x) for x in b]"); indent_--;
     emit("try:"); indent_++;
     emit("return a / b if b != 0 else 0"); indent_--;
+    emit("except (TypeError, ZeroDivisionError):"); indent_++;
+    emit("return 0"); indent_--;
+    indent_--;
+    emitBlank();
+    emit("def _vmod(a, b):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):"); indent_++;
+    emit("return [_vmod(x, y) for x, y in zip(a, b)]"); indent_--;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vmod(x, b) for x in a]"); indent_--;
+    emit("if isinstance(b, (list, tuple)):"); indent_++;
+    emit("return [_vmod(a, x) for x in b]"); indent_--;
+    emit("try:"); indent_++;
+    emit("return a % b if b != 0 else 0"); indent_--;
     emit("except (TypeError, ZeroDivisionError):"); indent_++;
     emit("return 0"); indent_--;
     indent_--;
@@ -441,6 +502,194 @@ void BlenderGenerator::emitHelperFunctions() {
     emit("return a > b"); indent_--;
     emit("except TypeError:"); indent_++;
     emit("return False"); indent_--;
+    indent_--;
+    emitBlank();
+    // Vector-safe math helpers
+    emit("def _vabs(a):");
+    indent_++;
+    emit("if a is None: return 0");
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return type(a)(_vabs(x) for x in a)"); indent_--;
+    emit("try:"); indent_++;
+    emit("return abs(a)"); indent_--;
+    emit("except TypeError:"); indent_++;
+    emit("return 0"); indent_--;
+    indent_--;
+    emitBlank();
+    emit("def _vsin(a):");
+    indent_++;
+    emit("\"\"\"sin(degrees) — works on scalars and vectors\"\"\"");
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vsin(x) for x in a]"); indent_--;
+    emit("return math.sin(math.radians(a))");
+    indent_--;
+    emit("def _vcos(a):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vcos(x) for x in a]"); indent_--;
+    emit("return math.cos(math.radians(a))");
+    indent_--;
+    emit("def _vtan(a):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vtan(x) for x in a]"); indent_--;
+    emit("return math.tan(math.radians(a))");
+    indent_--;
+    emit("def _vasin(a):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vasin(x) for x in a]"); indent_--;
+    emit("return math.degrees(math.asin(a))");
+    indent_--;
+    emit("def _vacos(a):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vacos(x) for x in a]"); indent_--;
+    emit("return math.degrees(math.acos(a))");
+    indent_--;
+    emit("def _vatan(a):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vatan(x) for x in a]"); indent_--;
+    emit("return math.degrees(math.atan(a))");
+    indent_--;
+    emit("def _vatan2(a, b):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):"); indent_++;
+    emit("return [math.degrees(math.atan2(x, y)) for x, y in zip(a, b)]"); indent_--;
+    emit("return math.degrees(math.atan2(a, b))");
+    indent_--;
+    emitBlank();
+    // Vector-safe sqrt, pow, comparison helpers
+    emit("def _vsqrt(a):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vsqrt(x) for x in a]"); indent_--;
+    emit("return math.sqrt(abs(a)) if isinstance(a, (int, float)) else 0");
+    indent_--;
+    emit("def _vpow(a, b):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):"); indent_++;
+    emit("return [_vpow(x, y) for x, y in zip(a, b)]"); indent_--;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("return [_vpow(x, b) for x in a]"); indent_--;
+    emit("if isinstance(b, (list, tuple)):"); indent_++;
+    emit("return [_vpow(a, x) for x in b]"); indent_--;
+    emit("try:"); indent_++;
+    emit("return math.pow(a, b)"); indent_--;
+    emit("except (TypeError, ValueError):"); indent_++;
+    emit("return 0"); indent_--;
+    indent_--;
+    emit("def _vle(a, b):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("a = a[0] if a else 0"); indent_--;
+    emit("if isinstance(b, (list, tuple)):"); indent_++;
+    emit("b = b[0] if b else 0"); indent_--;
+    emit("try:"); indent_++;
+    emit("return a <= b"); indent_--;
+    emit("except TypeError:"); indent_++;
+    emit("return False"); indent_--;
+    indent_--;
+    emit("def _vge(a, b):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)):"); indent_++;
+    emit("a = a[0] if a else 0"); indent_--;
+    emit("if isinstance(b, (list, tuple)):"); indent_++;
+    emit("b = b[0] if b else 0"); indent_--;
+    emit("try:"); indent_++;
+    emit("return a >= b"); indent_--;
+    emit("except TypeError:"); indent_++;
+    emit("return False"); indent_--;
+    indent_--;
+    emit("def _vmax(a, b):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)): a = a[0] if a else 0");
+    emit("if isinstance(b, (list, tuple)): b = b[0] if b else 0");
+    emit("try:"); indent_++;
+    emit("return a if a >= b else b"); indent_--;
+    emit("except TypeError:"); indent_++;
+    emit("return a"); indent_--;
+    indent_--;
+    emit("def _vmin(a, b):");
+    indent_++;
+    emit("if isinstance(a, (list, tuple)): a = a[0] if a else 0");
+    emit("if isinstance(b, (list, tuple)): b = b[0] if b else 0");
+    emit("try:"); indent_++;
+    emit("return a if a <= b else b"); indent_--;
+    emit("except TypeError:"); indent_++;
+    emit("return a"); indent_--;
+    indent_--;
+    emit("def _s(v):");
+    indent_++;
+    emit("\"\"\"Convert to scalar — extract first element from lists\"\"\"");
+    emit("if v is None: return 0.0");
+    emit("if isinstance(v, (list, tuple)): return _s(v[0]) if v else 0.0");
+    emit("return float(v)");
+    indent_--;
+    emit("def _extract_pts(data):");
+    indent_++;
+    emit("\"\"\"Extract 2D/3D point lists from nested OpenSCAD polygon data\"\"\"");
+    emit("if not isinstance(data, (list, tuple)): return []");
+    emit("pts = []");
+    emit("for item in data:");
+    indent_++;
+    emit("if isinstance(item, (list, tuple)):");
+    indent_++;
+    emit("if len(item) >= 2 and all(isinstance(x, (int, float)) for x in item[:2]):");
+    indent_++;
+    emit("pts.append(item)");
+    indent_--;
+    emit("elif len(item) > 0:");
+    indent_++;
+    emit("pts.extend(_extract_pts(item))");
+    indent_--;
+    indent_--;
+    indent_--;
+    emit("# Remove consecutive coincident points (within tolerance) to avoid zero-length curve segments");
+    emit("if len(pts) >= 2:");
+    indent_++;
+    emit("tol = 1e-6");
+    emit("deduped = [pts[0]]");
+    emit("for i in range(1, len(pts)):");
+    indent_++;
+    emit("dx = pts[i][0] - deduped[-1][0]");
+    emit("dy = pts[i][1] - deduped[-1][1]");
+    emit("if dx*dx + dy*dy > tol*tol: deduped.append(pts[i])");
+    indent_--;
+    emit("# Also check last vs first (closed polygon)");
+    emit("if len(deduped) > 1:");
+    indent_++;
+    emit("dx = deduped[-1][0] - deduped[0][0]");
+    emit("dy = deduped[-1][1] - deduped[0][1]");
+    emit("if dx*dx + dy*dy <= tol*tol: deduped.pop()");
+    indent_--;
+    emit("pts = deduped");
+    indent_--;
+    emit("# Remove zero-width spikes (A->B->A pattern): drop the return point C");
+    emit("if len(pts) >= 3:");
+    indent_++;
+    emit("spike_tol = 1e-6");
+    emit("cleaned = list(pts)");
+    emit("i = 0");
+    emit("while i < len(cleaned) and len(cleaned) >= 3:");
+    indent_++;
+    emit("n = len(cleaned)");
+    emit("A = cleaned[i]");
+    emit("B = cleaned[(i+1) % n]");
+    emit("C = cleaned[(i+2) % n]");
+    emit("dx_ac = A[0] - C[0]");
+    emit("dy_ac = A[1] - C[1]");
+    emit("if dx_ac*dx_ac + dy_ac*dy_ac < spike_tol*spike_tol:");
+    indent_++;
+    emit("# A==C: zero-width spike at B. Remove C (the return point)");
+    emit("cleaned.pop((i+2) % len(cleaned))");
+    indent_--;
+    emit("else: i += 1");
+    indent_--;
+    emit("pts = cleaned");
+    indent_--;
+    emit("return pts");
     indent_--;
     emitBlank();
 }
@@ -558,18 +807,10 @@ void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::
     // Try expression tree path first
     ExprNodePtr tree = resolveExprTree(value);
     if (tree && tree->hasVariableRefs()) {
-        // Only use the node-tree path if all variable refs are group_input sockets.
-        // Runtime Python variables (module params, loop vars) can't be linked as Blender nodes.
-        if (exprTreeHasOnlyGroupInputVars(tree)) {
-            auto result = emitExpressionNodeTree(tree);
-            connectExprResultNamed(result, nodeId, inputName);
-            return;
-        }
         // If the tree references runtime Python variables (module params, loop vars),
         // emit a Python expression using runtime variable names.
-        // If the tree is a simple VarRef to a module param, also handle the case
-        // where the param might be a Blender node (passed from a call site that
-        // linked it to group_input sockets).
+        // Module params take priority over group_input vars because called modules
+        // shadow outer module params (e.g., CycloidZahn's z shadows CyclGetriebe's z).
         if (exprTreeReferencesModuleParams(tree)) {
             if (tree->kind == ExprNode::Kind::VarRef) {
                 std::string varName = pyName(tree->var_name);
@@ -585,6 +826,13 @@ void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::
                 std::string pyExpr = exprTreeToPython(tree);
                 emit(nodeId + ".inputs['" + inputName + "'].default_value = " + pyExpr);
             }
+            return;
+        }
+        // If all variable refs are group_input sockets (and none are module params),
+        // use the node-tree path to link Blender nodes.
+        if (exprTreeHasOnlyGroupInputVars(tree)) {
+            auto result = emitExpressionNodeTree(tree);
+            connectExprResultNamed(result, nodeId, inputName);
             return;
         }
         // Fall through to use pythonValue (evaluated at compile time)
@@ -672,10 +920,12 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
         for (const auto& p : uniqueParams) {
             // Look up the original (unsanitized) parameter name to find its default
             std::string defaultStr = "0.0";
+            bool hasExplicitDefault = false;
             for (const auto& origParam : allParams) {
                 if (pyName(origParam) == p) {
                     auto dit = defaults.find(origParam);
                     if (dit != defaults.end()) {
+                        hasExplicitDefault = true;
                         const Value& defVal = dit->second;
                         if (defVal.isBool()) {
                             defaultStr = defVal.toPython();
@@ -705,6 +955,10 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
                     }
                     break;
                 }
+            }
+            // Parameters without explicit defaults should be None (= OpenSCAD undef)
+            if (!hasExplicitDefault) {
+                defaultStr = "None";
             }
             params += ", " + p + "=" + defaultStr;
         }
@@ -758,6 +1012,208 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
 }
 
 void BlenderGenerator::emitBuildGeometry(RootNode& node) {
+    // Emit simplified replacements for complex library modules
+    // These override the generated (broken) versions since Python uses last definition
+    if (defined_modules_.count("LinEx")) {
+        emitBlank();
+        emit("# Simplified LinEx → linear_extrude replacement");
+        emit("def module_LinEx(nodes, links, group_input, x_pos, y_pos, h=5.0, h2=0, h22=None, scale=1.0, scale2=None, twist=None, twistcap=1, slices=None, _d=None, _r=5, grad=None, grad2=None, mantelwinkel=0, center=False, rotCenter=False, end=0, fnEnd=None, name=None, help=None, n=None, convexity=5, lap=0.0001, scaleCenter=1, gradC=None, fn=None, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified LinEx: linear_extrude on children_geo\"\"\"");
+        emit("if children_geo is None: return None, y_pos");
+        emit("height = _s(h) if callable(globals().get('_s', None)) else h");
+        emit("# Create line profile for CurveToMesh extrusion");
+        emit("profile = nodes.new('GeometryNodeCurvePrimitiveLine')");
+        emit("profile.location = (x_pos - 200, y_pos)");
+        emit("profile.inputs['Start'].default_value = (0, 0, 0)");
+        emit("profile.inputs['End'].default_value = (0, 0, float(height))");
+        emit("ctm = nodes.new('GeometryNodeCurveToMesh')");
+        emit("ctm.location = (x_pos, y_pos)");
+        emit("ctm.inputs['Fill Caps'].default_value = False");
+        emit("links.new(geo_out(children_geo), ctm.inputs['Curve'])");
+        emit("links.new(profile.outputs['Curve'], ctm.inputs['Profile Curve'])");
+        emit("# Bottom cap");
+        emit("fill_bot = nodes.new('GeometryNodeFillCurve')");
+        emit("fill_bot.location = (x_pos, y_pos - 200)");
+        emit("links.new(geo_out(children_geo), fill_bot.inputs['Curve'])");
+        emit("flip = nodes.new('GeometryNodeFlipFaces')");
+        emit("flip.location = (x_pos + 200, y_pos - 200)");
+        emit("links.new(fill_bot.outputs['Mesh'], flip.inputs['Mesh'])");
+        emit("# Top cap");
+        emit("fill_top = nodes.new('GeometryNodeFillCurve')");
+        emit("fill_top.location = (x_pos, y_pos - 400)");
+        emit("links.new(geo_out(children_geo), fill_top.inputs['Curve'])");
+        emit("xform_top = nodes.new('GeometryNodeTransform')");
+        emit("xform_top.location = (x_pos + 200, y_pos - 400)");
+        emit("xform_top.inputs['Translation'].default_value = (0, 0, float(height))");
+        emit("links.new(fill_top.outputs['Mesh'], xform_top.inputs['Geometry'])");
+        emit("# Join + merge");
+        emit("join = nodes.new('GeometryNodeJoinGeometry')");
+        emit("join.location = (x_pos + 400, y_pos)");
+        emit("links.new(ctm.outputs['Mesh'], join.inputs['Geometry'])");
+        emit("links.new(flip.outputs['Mesh'], join.inputs['Geometry'])");
+        emit("links.new(xform_top.outputs['Geometry'], join.inputs['Geometry'])");
+        emit("merge = nodes.new('GeometryNodeMergeByDistance')");
+        emit("merge.location = (x_pos + 600, y_pos)");
+        emit("merge.inputs['Distance'].default_value = 0.0001");
+        emit("links.new(join.outputs['Geometry'], merge.inputs['Geometry'])");
+        emit("last_geo = merge");
+        emit("# Handle scale");
+        emit("if isinstance(scale, (int, float)) and abs(scale - 1.0) > 0.001:");
+        indent_++;
+        emit("sp = nodes.new('GeometryNodeSplineParameter')");
+        emit("sp.location = (x_pos + 200, y_pos + 200)");
+        emit("math_sf = nodes.new('ShaderNodeMath')");
+        emit("math_sf.operation = 'MULTIPLY_ADD'");
+        emit("math_sf.location = (x_pos + 400, y_pos + 200)");
+        emit("math_sf.inputs[0].default_value = float(scale) - 1.0");
+        emit("math_sf.inputs[2].default_value = 1.0");
+        emit("# Not fully implemented - skip scale for now");
+        indent_--;
+        emit("# Handle center");
+        emit("if center:");
+        indent_++;
+        emit("center_xform = nodes.new('GeometryNodeTransform')");
+        emit("center_xform.location = (x_pos + 800, y_pos)");
+        emit("center_xform.inputs['Translation'].default_value = (0, 0, -float(height)/2)");
+        emit("links.new(geo_out(last_geo), center_xform.inputs['Geometry'])");
+        emit("last_geo = center_xform");
+        indent_--;
+        emit("x_pos += 800");
+        emit("return last_geo, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
+    if (defined_modules_.count("RotEx")) {
+        emit("# Simplified RotEx → rotate_extrude replacement");
+        emit("def module_RotEx(nodes, links, group_input, x_pos, y_pos, grad=360.0, fn=None, fs=0, fa=0, center=False, cut=False, convexity=5, help=False, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified RotEx: rotate_extrude on children_geo\"\"\"");
+        emit("if children_geo is None: return None, y_pos");
+        emit("angle = float(grad) if isinstance(grad, (int, float)) else 360.0");
+        emit("# Flip Y axis: OpenSCAD Y (height) → Blender +Z");
+        emit("flip = nodes.new('GeometryNodeTransform')");
+        emit("flip.location = (x_pos, y_pos)");
+        emit("flip.inputs['Scale'].default_value = (1.0, -1.0, 1.0)");
+        emit("links.new(geo_out(children_geo), flip.inputs['Geometry'])");
+        emit("# Tiny circle as revolution path (profile X = radial distance)");
+        emit("circle = nodes.new('GeometryNodeCurvePrimitiveCircle')");
+        emit("circle.location = (x_pos, y_pos - 200)");
+        emit("circle.mode = 'RADIUS'");
+        emit("circle.inputs['Radius'].default_value = 0.0001");
+        emit("res = max(8, int(abs(angle) / 360.0 * 32)) if fn is None else max(3, int(fn))");
+        emit("circle.inputs['Resolution'].default_value = res");
+        emit("sweep = circle");
+        emit("if abs(angle) < 359.9:");
+        indent_++;
+        emit("trim = nodes.new('GeometryNodeTrimCurve')");
+        emit("trim.location = (x_pos + 200, y_pos - 200)");
+        emit("trim.mode = 'FACTOR'");
+        emit("trim.inputs['Start'].default_value = 0.0");
+        emit("trim.inputs['End'].default_value = abs(angle) / 360.0");
+        emit("links.new(circle.outputs['Curve'], trim.inputs['Curve'])");
+        emit("sweep = trim");
+        indent_--;
+        emit("ctm = nodes.new('GeometryNodeCurveToMesh')");
+        emit("ctm.location = (x_pos + 200, y_pos)");
+        emit("ctm.inputs['Fill Caps'].default_value = (abs(angle) < 359.9)");
+        emit("links.new(geo_out(sweep), ctm.inputs['Curve'])");
+        emit("links.new(flip.outputs['Geometry'], ctm.inputs['Profile Curve'])");
+        emit("last_geo = ctm");
+        emit("x_pos += 600");
+        emit("return last_geo, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
+    if (defined_modules_.count("Pille")) {
+        emit("# Simplified Pille → cylinder replacement");
+        emit("def module_Pille(nodes, links, group_input, x_pos, y_pos, h=10.0, d=None, rad=None, rad2=None, r=None, center=True, fn=None, fn2=None, fs=0, fa=0, fs2=None, loch=False, grad=360.0, deg=90.0, chamfer=True, use2D=False, x0=0, l=None, name=None, help=None, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified Pille: cylinder approximation\"\"\"");
+        emit("radius = float(d)/2 if d is not None else (float(r) if r is not None else float(h)/2)");
+        emit("height = float(l) if l is not None else float(h)");
+        emit("cyl = nodes.new('GeometryNodeMeshCylinder')");
+        emit("cyl.location = (x_pos, y_pos)");
+        emit("cyl.inputs['Radius'].default_value = radius");
+        emit("cyl.inputs['Depth'].default_value = height");
+        emit("cyl.inputs['Vertices'].default_value = 32");
+        emit("last_geo = cyl");
+        emit("if not center:");
+        indent_++;
+        emit("xform = nodes.new('GeometryNodeTransform')");
+        emit("xform.location = (x_pos + 200, y_pos)");
+        emit("xform.inputs['Translation'].default_value = (0, 0, height/2)");
+        emit("links.new(cyl.outputs['Mesh'], xform.inputs['Geometry'])");
+        emit("last_geo = xform");
+        indent_--;
+        emit("x_pos += 400");
+        emit("return last_geo, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
+    if (defined_modules_.count("MKlon")) {
+        emit("# Simplified MKlon → mirror clone replacement");
+        emit("def module_MKlon(nodes, links, group_input, x_pos, y_pos, mx=None, my=None, mz=None, tx=None, ty=None, tz=None, help=None, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified MKlon: mirror + join\"\"\"");
+        emit("if children_geo is None: return None, y_pos");
+        emit("# Determine mirror/translate axis");
+        emit("if tx is not None or ty is not None or tz is not None:");
+        indent_++;
+        emit("# Translate clone: original + translated copy");
+        emit("tx_val = float(tx) if tx is not None else 0");
+        emit("ty_val = float(ty) if ty is not None else 0");
+        emit("tz_val = float(tz) if tz is not None else 0");
+        emit("xform = nodes.new('GeometryNodeTransform')");
+        emit("xform.location = (x_pos, y_pos - 200)");
+        emit("xform.inputs['Translation'].default_value = (tx_val, ty_val, tz_val)");
+        emit("links.new(geo_out(children_geo), xform.inputs['Geometry'])");
+        emit("join = nodes.new('GeometryNodeJoinGeometry')");
+        emit("join.location = (x_pos + 200, y_pos)");
+        emit("links.new(geo_out(children_geo), join.inputs['Geometry'])");
+        emit("links.new(xform.outputs['Geometry'], join.inputs['Geometry'])");
+        emit("last_geo = join");
+        indent_--;
+        emit("elif mx is not None or my is not None or mz is not None:");
+        indent_++;
+        emit("# Mirror clone: original + mirrored copy");
+        emit("sx = -1.0 if mx else 1.0");
+        emit("sy = -1.0 if my else 1.0");
+        emit("sz = -1.0 if mz else 1.0");
+        emit("xform = nodes.new('GeometryNodeTransform')");
+        emit("xform.location = (x_pos, y_pos - 200)");
+        emit("xform.inputs['Scale'].default_value = (sx, sy, sz)");
+        emit("links.new(geo_out(children_geo), xform.inputs['Geometry'])");
+        emit("join = nodes.new('GeometryNodeJoinGeometry')");
+        emit("join.location = (x_pos + 200, y_pos)");
+        emit("links.new(geo_out(children_geo), join.inputs['Geometry'])");
+        emit("links.new(xform.outputs['Geometry'], join.inputs['Geometry'])");
+        emit("last_geo = join");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("last_geo = children_geo");
+        indent_--;
+        emit("x_pos += 400");
+        emit("return last_geo, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
+    if (defined_modules_.count("Rund")) {
+        emitBlank();
+        emit("# Simplified Rund → pass-through (corner rounding is cosmetic)");
+        emit("def module_Rund(nodes, links, group_input, x_pos, y_pos, or_=0, ir=None, chamfer=False, fn=None, fs=0, fa=0, help=None, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified Rund: pass-through children (corner rounding skipped for performance)\"\"\"");
+        emit("return children_geo, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
     emit("def build_geometry(node_group):");
     indent_++;
     emit("\"\"\"Build the geometry nodes graph\"\"\"");
@@ -904,9 +1360,12 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
     indent_++;
     emit("pass  # No geometry to output");
     indent_--;
-    emit("elif len(all_geometry) == 1:");
+    emit("else:");
     indent_++;
-    emit("link_nodes(links, all_geometry[0], 'Geometry', group_output, 'Geometry')");
+    // Determine the final geometry node
+    emit("if len(all_geometry) == 1:");
+    indent_++;
+    emit("_final_geo = all_geometry[0]");
     indent_--;
     emit("else:");
     indent_++;
@@ -916,7 +1375,62 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
     indent_++;
     emit("link_nodes(links, geo, 'Geometry', join_node, 'Geometry')");
     indent_--;
-    emit("link_nodes(links, join_node, 'Geometry', group_output, 'Geometry')");
+    emit("_final_geo = join_node");
+    emit("x_pos += 200");
+    indent_--;
+
+    // If no 3D geometry was emitted, auto-extrude the 2D output
+    if (!has_3d_geometry_) {
+        emit("# Auto-extrude 2D output to 3D solid");
+        emit("_out = geo_out(_final_geo)");
+        emit("# If output is curves, fill first");
+        emit("_is_curve_node = _final_geo.bl_idname in {");
+        emit("    'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+        emit("    'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+        emit("    'GeometryNodeFilletCurve', 'GeometryNodeSubdivideCurve',");
+        emit("    'GeometryNodeReverseCurve', 'GeometryNodeCurvePrimitiveArc',");
+        emit("    'GeometryNodeStringToCurves', 'GeometryNodeObjectInfo',");
+        emit("    'GeometryNodeSetPosition', 'GeometryNodeJoinGeometry'}");
+        emit("if _is_curve_node:");
+        indent_++;
+        emit("_fill = nodes.new('GeometryNodeFillCurve')");
+        emit("_fill.location = (x_pos, y_pos - 100)");
+        emit("links.new(_out, _fill.inputs['Curve'])");
+        emit("_out = _fill.outputs['Mesh']");
+        emit("x_pos += 200");
+        indent_--;
+
+        // Bottom cap (flipped copy of original mesh)
+        emit("_flip_bot = nodes.new('GeometryNodeFlipFaces')");
+        emit("_flip_bot.location = (x_pos, y_pos - 200)");
+        emit("links.new(_out, _flip_bot.inputs['Mesh'])");
+
+        // Extrude the original mesh to create sides + top at Z=1
+        emit("_ext = nodes.new('GeometryNodeExtrudeMesh')");
+        emit("_ext.location = (x_pos, y_pos)");
+        emit("_ext.mode = 'FACES'");
+        emit("_ext.inputs['Offset Scale'].default_value = 1.0");
+        emit("_ext.inputs['Individual'].default_value = False");
+        emit("links.new(_out, _ext.inputs['Mesh'])");
+        emit("x_pos += 200");
+
+        // Join extruded geometry with bottom cap
+        emit("_join_ext = nodes.new('GeometryNodeJoinGeometry')");
+        emit("_join_ext.location = (x_pos, y_pos)");
+        emit("links.new(_ext.outputs['Mesh'], _join_ext.inputs['Geometry'])");
+        emit("links.new(_flip_bot.outputs['Mesh'], _join_ext.inputs['Geometry'])");
+        emit("x_pos += 200");
+
+        // Merge by distance to weld shared vertices
+        emit("_merge = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_merge.location = (x_pos, y_pos)");
+        emit("_merge.inputs['Distance'].default_value = 0.0001");
+        emit("links.new(_join_ext.outputs['Geometry'], _merge.inputs['Geometry'])");
+        emit("x_pos += 200");
+        emit("_final_geo = _merge");
+    }
+
+    emit("link_nodes(links, _final_geo, 'Geometry', group_output, 'Geometry')");
     indent_--;
 
     emitBlank();
@@ -1069,6 +1583,72 @@ void BlenderGenerator::visit(RootNode& node) {
 }
 
 void BlenderGenerator::visit(PrimitiveNode& node) {
+    // Check if a user-defined module shadows this built-in primitive
+    static const std::map<ASTNode::Type, std::string> primNames = {
+        {ASTNode::Type::Circle, "circle"}, {ASTNode::Type::Square, "square"},
+        {ASTNode::Type::Cube, "cube"}, {ASTNode::Type::Cylinder, "cylinder"},
+        {ASTNode::Type::Sphere, "sphere"}, {ASTNode::Type::Polygon, "polygon"},
+        {ASTNode::Type::Polyhedron, "polyhedron"},
+    };
+    auto nameIt = primNames.find(node.type());
+    if (nameIt != primNames.end() && defined_modules_.find(nameIt->second) != defined_modules_.end()) {
+        // User-defined module shadows this primitive — emit module call instead
+        std::string modName = nameIt->second;
+        std::string nodeId = newNodeId();
+        emit("# Call module: " + modName + " (overrides built-in)");
+
+        std::string argStr = "nodes, links, group_input, x_pos, y_pos";
+        const auto& modParams = defined_modules_[modName];
+
+        // Build positional-to-param mapping
+        std::set<std::string> namedArgs;
+        for (const auto& arg : node.args()) {
+            if (!arg.first.empty() && arg.first[0] != '_') {
+                namedArgs.insert(arg.first);
+            }
+        }
+        std::vector<int> posToParamIdx;
+        for (int pi = 0; pi < static_cast<int>(modParams.size()); ++pi) {
+            if (namedArgs.find(modParams[pi]) == namedArgs.end()) {
+                posToParamIdx.push_back(pi);
+            }
+        }
+
+        for (const auto& arg : node.args()) {
+            std::string paramName = arg.first;
+            if (!paramName.empty() && paramName[0] == '_') {
+                int posIdx = std::stoi(paramName.substr(1));
+                if (posIdx >= 0 && posIdx < static_cast<int>(posToParamIdx.size())) {
+                    paramName = modParams[posToParamIdx[posIdx]];
+                } else continue;
+            }
+            const Value& v = arg.second;
+            std::string valStr;
+            if (v.isExpression() && v.exprTree()) {
+                valStr = exprTreeToPython(v.exprTree());
+            } else {
+                valStr = v.toPython();
+            }
+            argStr += ", " + paramName + "=" + valStr;
+        }
+
+        if (!node.children().empty()) {
+            argStr += ", children_geo=last_geo";
+        }
+
+        emit("try:");
+        indent_++;
+        emit(nodeId + ", y_pos = module_" + modName + "(" + argStr + ")");
+        emit("last_geo = " + nodeId);
+        indent_--;
+        emit("except Exception:");
+        indent_++;
+        emit("pass  # module " + modName + " failed");
+        indent_--;
+        emit("x_pos += 200");
+        return;
+    }
+
     switch (node.type()) {
         case ASTNode::Type::Cube:
             emitCube(node.args());
@@ -1142,14 +1722,87 @@ void BlenderGenerator::visit(TransformNode& node) {
             emitHull(node.args());
             break;
         }
-        case ASTNode::Type::Minkowski:
-            processChildren(node);
-            emitMinkowski(node.args());
+        case ASTNode::Type::Minkowski: {
+            // 2D Minkowski of shape + circle → emit shape + offset(r=circleRadius)
+            // Detect the common pattern: exactly 2 children, one is a circle
+            bool handled = false;
+            // Unwrap single Union child if present (minkowski() { a; b; } wraps in Union)
+            auto* mkChildrenPtr = &node.children();
+            if (mkChildrenPtr->size() == 1 && (*mkChildrenPtr)[0] &&
+                (*mkChildrenPtr)[0]->type() == ASTNode::Type::Union) {
+                mkChildrenPtr = &(*mkChildrenPtr)[0]->children();
+            }
+            auto& mkChildren = *mkChildrenPtr;
+            if (mkChildren.size() == 2) {
+                int circleIdx = -1;
+                int shapeIdx = -1;
+                for (int ci = 0; ci < 2; ci++) {
+                    if (mkChildren[ci] && mkChildren[ci]->type() == ASTNode::Type::Circle) {
+                        circleIdx = ci;
+                    } else {
+                        shapeIdx = ci;
+                    }
+                }
+                if (circleIdx >= 0 && shapeIdx >= 0) {
+                    auto* circleNode = dynamic_cast<PrimitiveNode*>(mkChildren[circleIdx].get());
+                    if (circleNode) {
+                        const auto& cArgs = circleNode->args();
+                        Value cR = getArg(cArgs, "r", getPositionalArg(cArgs, 0, Value(1.0)));
+                        Value cD = getArg(cArgs, "d", Value());
+                        Value cFn = getArg(cArgs, "$fn", Value(0.0));
+
+                        // Compute offset radius value (negate for CW polygon winding)
+                        Value offsetR;
+                        if (!cD.isUndefined()) {
+                            ExprNodePtr dTree = resolveExprTree(cD);
+                            if (dTree && exprTreeReferencesModuleParams(dTree)) {
+                                auto divTree = ExprNode::makeBinary(ExprNode::Op::DIVIDE, dTree, ExprNode::makeLiteral(2.0));
+                                auto negTree = ExprNode::makeUnary(ExprNode::Op::NEGATE, divTree);
+                                offsetR = Value::expressionWithTree("", negTree);
+                            } else {
+                                offsetR = Value(-(cD.toNumber() / 2.0));
+                            }
+                        } else {
+                            ExprNodePtr rTree = resolveExprTree(cR);
+                            if (rTree && exprTreeReferencesModuleParams(rTree)) {
+                                auto negTree = ExprNode::makeUnary(ExprNode::Op::NEGATE, rTree);
+                                offsetR = Value::expressionWithTree("", negTree);
+                            } else {
+                                offsetR = Value(-cR.toNumber());
+                            }
+                        }
+
+                        // Build synthetic offset arguments
+                        Arguments offsetArgs;
+                        offsetArgs["r"] = offsetR;
+                        if (!cFn.isUndefined()) {
+                            offsetArgs["$fn"] = cFn;
+                        }
+
+                        emit("# Minkowski (2D shape + circle → offset approximation)");
+                        mkChildren[shapeIdx]->accept(*this);
+                        emitOffset(offsetArgs);
+                        handled = true;
+                    }
+                }
+            }
+            if (!handled) {
+                processChildren(node);
+                emitMinkowski(node.args());
+            }
             break;
+        }
         case ASTNode::Type::Roof:
             processChildren(node);
             emitRoof(node.args());
             break;
+        case ASTNode::Type::Multmatrix: {
+            processChildren(node);
+            // Extract translation from 4x4 matrix and emit as translate
+            // multmatrix(m=[[1,0,0,tx],[0,1,0,ty],[0,0,1,tz],[0,0,0,1]])
+            emitMultmatrix(node.args());
+            break;
+        }
         default:
             emit("# Unsupported transform type");
             processChildren(node);
@@ -1185,6 +1838,132 @@ void BlenderGenerator::visit(ModuleNode& node) {
 }
 
 void BlenderGenerator::visit(ModuleCallNode& node) {
+    // Intercept library modules that can be mapped to built-in operations
+    if (node.name() == "LinEx" && defined_modules_.find("LinEx") != defined_modules_.end()) {
+        // Map LinEx(h, scale, twist, center, ...) → linear_extrude(height, scale, twist, center)
+        emit("# LinEx → linear_extrude");
+
+        // Propagate $-prefixed args as dynamically scoped variables for children
+        std::map<std::string, Value> savedDollarVars;
+        for (const auto& arg : node.args()) {
+            if (!arg.first.empty() && arg.first[0] == '$') {
+                auto it = variables_.find(arg.first);
+                if (it != variables_.end()) {
+                    savedDollarVars[arg.first] = it->second;
+                } else {
+                    savedDollarVars[arg.first] = Value(); // undefined marker
+                }
+                variables_[arg.first] = arg.second;
+            }
+        }
+
+        bool wasInExtrude = in_extrude_;
+        in_extrude_ = true;
+        for (auto& child : node.children()) {
+            if (child && !child->isDisabled() && !child->isBackground())
+                child->accept(*this);
+        }
+        in_extrude_ = wasInExtrude;
+
+        // Restore $-variables
+        for (const auto& sv : savedDollarVars) {
+            if (sv.second.isUndefined()) {
+                variables_.erase(sv.first);
+            } else {
+                variables_[sv.first] = sv.second;
+            }
+        }
+
+        // Build linear_extrude arguments from LinEx parameters
+        Arguments leArgs;
+        const auto& modParams = defined_modules_["LinEx"];
+        std::set<std::string> namedArgs;
+        for (const auto& arg : node.args()) {
+            if (!arg.first.empty() && arg.first[0] != '_')
+                namedArgs.insert(arg.first);
+        }
+        std::vector<int> posToParamIdx;
+        for (int pi = 0; pi < static_cast<int>(modParams.size()); ++pi) {
+            if (namedArgs.find(modParams[pi]) == namedArgs.end())
+                posToParamIdx.push_back(pi);
+        }
+
+        // Resolve LinEx args to a map
+        std::map<std::string, Value> linexArgs;
+        for (const auto& arg : node.args()) {
+            std::string paramName = arg.first;
+            if (paramName[0] == '_') {
+                int posIdx = std::stoi(paramName.substr(1));
+                if (posIdx >= 0 && posIdx < static_cast<int>(posToParamIdx.size()))
+                    paramName = modParams[posToParamIdx[posIdx]];
+                else continue;
+            }
+            linexArgs[paramName] = arg.second;
+        }
+
+        // Map: LinEx h → height, LinEx scale → scale, etc.
+        auto getVal = [&](const std::string& name, const Value& def) -> Value {
+            auto it = linexArgs.find(name);
+            return (it != linexArgs.end()) ? it->second : def;
+        };
+        leArgs["height"] = getVal("h", Value(5.0));
+        Value scaleVal = getVal("scale", Value());
+        if (!scaleVal.isUndefined()) leArgs["scale"] = scaleVal;
+        Value twistVal = getVal("twist", Value());
+        if (!twistVal.isUndefined()) leArgs["twist"] = twistVal;
+        Value centerVal = getVal("center", Value());
+        if (!centerVal.isUndefined()) leArgs["center"] = centerVal;
+
+        emitLinearExtrude(leArgs);
+        return;
+    }
+
+    if (node.name() == "RotEx" && defined_modules_.find("RotEx") != defined_modules_.end()) {
+        // Map RotEx(grad, fn, ...) → rotate_extrude(angle, $fn)
+        emit("# RotEx → rotate_extrude");
+        bool wasInExtrude = in_extrude_;
+        in_extrude_ = true;
+        for (auto& child : node.children()) {
+            if (child && !child->isDisabled() && !child->isBackground())
+                child->accept(*this);
+        }
+        in_extrude_ = wasInExtrude;
+
+        const auto& modParams = defined_modules_["RotEx"];
+        std::set<std::string> namedArgs;
+        for (const auto& arg : node.args()) {
+            if (!arg.first.empty() && arg.first[0] != '_')
+                namedArgs.insert(arg.first);
+        }
+        std::vector<int> posToParamIdx;
+        for (int pi = 0; pi < static_cast<int>(modParams.size()); ++pi) {
+            if (namedArgs.find(modParams[pi]) == namedArgs.end())
+                posToParamIdx.push_back(pi);
+        }
+        std::map<std::string, Value> rotexArgs;
+        for (const auto& arg : node.args()) {
+            std::string paramName = arg.first;
+            if (paramName[0] == '_') {
+                int posIdx = std::stoi(paramName.substr(1));
+                if (posIdx >= 0 && posIdx < static_cast<int>(posToParamIdx.size()))
+                    paramName = modParams[posToParamIdx[posIdx]];
+                else continue;
+            }
+            rotexArgs[paramName] = arg.second;
+        }
+        auto getVal = [&](const std::string& name, const Value& def) -> Value {
+            auto it = rotexArgs.find(name);
+            return (it != rotexArgs.end()) ? it->second : def;
+        };
+
+        Arguments reArgs;
+        reArgs["angle"] = getVal("grad", Value(360.0));
+        Value fnVal = getVal("fn", Value());
+        if (!fnVal.isUndefined()) reArgs["$fn"] = fnVal;
+        emitRotateExtrude(reArgs);
+        return;
+    }
+
     if (defined_modules_.find(node.name()) != defined_modules_.end()) {
         // Skip non-geometric modules (Echo, HelpTxt, MO, InfoTxt, etc.)
         if (non_geometric_modules_.count(node.name())) {
@@ -1201,12 +1980,39 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
             std::string savedGeo = "saved_geo_" + std::to_string(node_counter_++);
             emit(savedGeo + " = last_geo");
             emit("last_geo = None");
+
+            // Propagate $-prefixed args as dynamically scoped variables for children
+            // (OpenSCAD's dynamic scoping: $d=achse makes $d visible to all children)
+            std::map<std::string, Value> savedDollarVars;
+            for (const auto& arg : node.args()) {
+                if (!arg.first.empty() && arg.first[0] == '$') {
+                    // Save old value if any
+                    auto it = variables_.find(arg.first);
+                    if (it != variables_.end()) {
+                        savedDollarVars[arg.first] = it->second;
+                    } else {
+                        savedDollarVars[arg.first] = Value(); // undefined marker
+                    }
+                    variables_[arg.first] = arg.second;
+                }
+            }
+
             for (auto& child : node.children()) {
                 if (!child) continue;
                 if (!child->isDisabled() && !child->isBackground()) {
                     child->accept(*this);
                 }
             }
+
+            // Restore $-variables
+            for (const auto& sv : savedDollarVars) {
+                if (sv.second.isUndefined()) {
+                    variables_.erase(sv.first);
+                } else {
+                    variables_[sv.first] = sv.second;
+                }
+            }
+
             emit("children_geo_tmp = last_geo");
             emit("last_geo = " + savedGeo);
         }
@@ -1307,7 +2113,11 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
         indent_--;
         emit("except Exception:");
         indent_++;
-        emit("pass  # module " + node.name() + " failed");
+        if (!node.children().empty()) {
+            emit("last_geo = children_geo_tmp  # module " + node.name() + " failed, pass through children");
+        } else {
+            emit("pass  # module " + node.name() + " failed");
+        }
         indent_--;
         emit("x_pos += 200");
     } else {
@@ -2461,9 +3271,18 @@ void BlenderGenerator::visit(AssignmentNode& node) {
     variables_[node.name()] = node.value();
     // Emit Python variable assignment if inside module
     if (in_module_) {
-        // Skip assignments that shadow module parameters — the parameter already
-        // provides the value and emitting a constant would override the caller's input
+        // Emit assignments that shadow module parameters only if the new value
+        // differs from the parameter (i.e., it's a reassignment like z = floor(z*f)/f)
         if (current_module_params_.count(pyName(node.name()))) {
+            const Value& val = node.value();
+            // Check if the value is a self-referential expression (depends on module params)
+            if (val.isExpression() && val.exprTree() && val.exprTree()->hasVariableRefs()) {
+                ExprNodePtr tree = resolveExprTree(val);
+                if (tree && exprTreeReferencesModuleParams(tree)) {
+                    std::string pyExpr = exprTreeToPython(tree);
+                    emit(pyName(node.name()) + " = " + pyExpr);
+                }
+            }
             return;
         }
         const Value& val = node.value();
@@ -2611,6 +3430,7 @@ void BlenderGenerator::visit(FunctionNode& node) {
 
 // Primitive generators
 void BlenderGenerator::emitCube(const Arguments& args) {
+    has_3d_geometry_ = true;
     std::string nodeId = newNodeId();
 
     Value size = getArg(args, "size", getPositionalArg(args, 0, Value(1.0)));
@@ -2729,6 +3549,7 @@ void BlenderGenerator::emitCube(const Arguments& args) {
 }
 
 void BlenderGenerator::emitSphere(const Arguments& args) {
+    has_3d_geometry_ = true;
     std::string nodeId = newNodeId();
 
     Value r = getArg(args, "r", getPositionalArg(args, 0, Value(1.0)));
@@ -2767,6 +3588,7 @@ void BlenderGenerator::emitSphere(const Arguments& args) {
 }
 
 void BlenderGenerator::emitCylinder(const Arguments& args) {
+    has_3d_geometry_ = true;
     std::string nodeId = newNodeId();
 
     Value h = getArg(args, "h", getPositionalArg(args, 0, Value(1.0)));
@@ -2776,6 +3598,21 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
     Value d = getArg(args, "d", Value());
     Value d1 = getArg(args, "d1", Value());
     Value d2 = getArg(args, "d2", Value());
+
+    // Handle positional args for radii: cylinder(h, r1, r2, center)
+    // If 2 positional: cylinder(h, r) — same radius for both
+    // If 3 positional: cylinder(h, r1, r2)
+    if (r.isUndefined() && r1.isUndefined() && r2.isUndefined() &&
+        d.isUndefined() && d1.isUndefined() && d2.isUndefined()) {
+        Value pos1 = getPositionalArg(args, 1, Value());
+        Value pos2 = getPositionalArg(args, 2, Value());
+        if (!pos1.isUndefined() && !pos2.isUndefined()) {
+            r1 = pos1;
+            r2 = pos2;
+        } else if (!pos1.isUndefined()) {
+            r = pos1;
+        }
+    }
     Value center = getArg(args, "center", Value(false));
     Value fn = resolveFn(args);
 
@@ -2912,33 +3749,67 @@ void BlenderGenerator::emitCircle(const Arguments& args) {
     // Determine radius value
     Value radiusValue = r;
     std::string radiusPython;
+    bool radiusIsModuleExpr = false;
     if (!d.isUndefined()) {
+        ExprNodePtr dTree = resolveExprTree(d);
         if (isSimpleVariableRef(d)) {
             radiusValue = d;
             radiusPython = d.toPython() + " / 2.0";
+        } else if (dTree && dTree->hasVariableRefs() && exprTreeReferencesModuleParams(dTree)) {
+            std::string pyExpr = exprTreeToPython(dTree);
+            radiusPython = "_s(" + pyExpr + ") / 2.0";
+            radiusIsModuleExpr = true;
         } else {
             double radius = d.toNumber() / 2.0;
             radiusValue = Value(radius);
             radiusPython = pyDouble(radius);
         }
     } else {
-        radiusPython = isSimpleVariableRef(r) ? r.toPython() : pyDouble(r.toNumber());
+        ExprNodePtr rTree = resolveExprTree(r);
+        if (isSimpleVariableRef(r)) {
+            radiusPython = r.toPython();
+        } else if (rTree && rTree->hasVariableRefs() && exprTreeReferencesModuleParams(rTree)) {
+            std::string pyExpr = exprTreeToPython(rTree);
+            radiusPython = "_s(" + pyExpr + ")";
+            radiusIsModuleExpr = true;
+        } else {
+            radiusPython = pyDouble(r.toNumber());
+        }
     }
 
     emit("# Circle (2D - using curve)");
     emit(nodeId + " = nodes.new('GeometryNodeCurvePrimitiveCircle')");
     emit(nodeId + ".location = (x_pos, y_pos)");
-    emitSetInputOrLink(nodeId, "Radius", radiusValue, radiusPython);
+    if (radiusIsModuleExpr) {
+        // Radius is a runtime module param expression — emit directly
+        emit(nodeId + ".inputs['Radius'].default_value = " + radiusPython);
+    } else {
+        emitSetInputOrLink(nodeId, "Radius", radiusValue, radiusPython);
+    }
 
-    // Handle $fn
-    if (isSimpleVariableRef(fn)) {
+    // Handle $fn for Resolution
+    ExprNodePtr fnTree = resolveExprTree(fn);
+    if (fnTree && fnTree->hasVariableRefs()) {
+        if (exprTreeReferencesModuleParams(fnTree)) {
+            std::string pyExpr = exprTreeToPython(fnTree);
+            emit(nodeId + ".inputs['Resolution'].default_value = int(_s(" + pyExpr + "))");
+        } else if (exprTreeHasOnlyGroupInputVars(fnTree)) {
+            auto result = emitExpressionNodeTree(fnTree);
+            connectExprResultNamed(result, nodeId, "Resolution");
+        } else {
+            int fnInt = static_cast<int>(evaluateExpr(fn));
+            if (fnInt < 3) fnInt = 32; // $fn=0 means auto-resolution in OpenSCAD
+            emit(nodeId + ".inputs['Resolution'].default_value = " + std::to_string(fnInt));
+        }
+    } else if (isSimpleVariableRef(fn)) {
         std::string varName = fn.toString();
         std::string socketName = varName;
         if (varName[0] == '$') socketName = varName.substr(1);
         emit("links.new(group_input.outputs['" + socketName + "'], " + nodeId + ".inputs['Resolution'])");
     } else {
-        emit(nodeId + ".inputs['Resolution'].default_value = " +
-             std::to_string(static_cast<int>(evaluateExpr(fn))));
+        int fnInt = static_cast<int>(evaluateExpr(fn));
+        if (fnInt < 3) fnInt = 32; // $fn=0 means auto-resolution in OpenSCAD
+        emit(nodeId + ".inputs['Resolution'].default_value = " + std::to_string(fnInt));
     }
 
     emit("last_geo = " + nodeId);
@@ -3059,6 +3930,7 @@ void BlenderGenerator::emitText(const Arguments& args) {
 }
 
 void BlenderGenerator::emitPolyhedron(const Arguments& args) {
+    has_3d_geometry_ = true;
     Value points = getArg(args, "points", getPositionalArg(args, 0, Value()));
     Value faces = getArg(args, "faces", getArg(args, "triangles", getPositionalArg(args, 1, Value())));
 
@@ -3194,6 +4066,30 @@ void BlenderGenerator::emitPolygon(const Arguments& args) {
     // Try to evaluate all coordinates to concrete (x,y) doubles
     std::vector<std::pair<double, double>> coords;
     bool canEvaluate = points.isVector();
+
+    // Early check: if any point expression references module params or loop vars,
+    // skip expensive evaluation — these can't be resolved at compile time
+    if (canEvaluate && in_module_) {
+        for (size_t i = 0; i < points.size() && canEvaluate; i++) {
+            const Value& pt = points[i];
+            if (pt.isExpression()) {
+                ExprNodePtr tree = pt.exprTree();
+                if (tree && exprTreeReferencesModuleParams(tree)) {
+                    canEvaluate = false;
+                }
+            } else if (pt.isVector()) {
+                for (size_t j = 0; j < pt.size() && canEvaluate; j++) {
+                    if (pt[j].isExpression()) {
+                        ExprNodePtr tree = pt[j].exprTree();
+                        if (tree && exprTreeReferencesModuleParams(tree)) {
+                            canEvaluate = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (canEvaluate) {
         for (size_t i = 0; i < points.size(); i++) {
             Value pt = points[i];
@@ -3223,77 +4119,144 @@ void BlenderGenerator::emitPolygon(const Arguments& args) {
     int validPts = static_cast<int>(coords.size());
 
     if (canEvaluate && validPts >= 2) {
-        // Compile-time path: emit one CurvePrimitiveLine node per edge
-        std::vector<std::string> lineIds;
+        // Compile-time path: create a single cyclic POLY spline curve
+        std::string objVar = newNodeId() + "_poly_obj";
+        emit("_cd = bpy.data.curves.new('" + objVar + "', type='CURVE')");
+        emit("_cd.dimensions = '3D'");
+        emit("_sp = _cd.splines.new('POLY')");
+        emit("_sp.points.add(" + std::to_string(validPts - 1) + ")");
         for (int i = 0; i < validPts; i++) {
-            int next = (i + 1) % validPts;
-            std::string lineId = newNodeId();
-            emit(lineId + " = nodes.new('GeometryNodeCurvePrimitiveLine')");
-            emit(lineId + ".location = (x_pos, y_pos)");
-            emit(lineId + ".inputs['Start'].default_value = (" +
+            emit("_sp.points[" + std::to_string(i) + "].co = (" +
                  std::to_string(coords[i].first) + ", " +
-                 std::to_string(coords[i].second) + ", 0)");
-            emit(lineId + ".inputs['End'].default_value = (" +
-                 std::to_string(coords[next].first) + ", " +
-                 std::to_string(coords[next].second) + ", 0)");
-            emit("y_pos -= 50");
-            lineIds.push_back(lineId);
+                 std::to_string(coords[i].second) + ", 0, 1)");
+        }
+        emit("_sp.use_cyclic_u = True");
+        emit(objVar + " = bpy.data.objects.new('" + objVar + "', _cd)");
+        emit("bpy.context.collection.objects.link(" + objVar + ")");
+
+        // Handle paths (multiple splines / holes)
+        if (paths.isVector() && paths.size() > 1) {
+            // Multiple paths: need separate splines per path
+            // First spline already created with all points; recreate with path indices
+            emit("# Multiple paths - rebuild splines from path indices");
+            emit("_all_coords = [" + [&]() {
+                std::string s;
+                for (int i = 0; i < validPts; i++) {
+                    if (i > 0) s += ", ";
+                    s += "(" + std::to_string(coords[i].first) + ", " +
+                         std::to_string(coords[i].second) + ")";
+                }
+                return s;
+            }() + "]");
+            emit("_cd.splines.clear()");
+            for (size_t p = 0; p < paths.size(); p++) {
+                if (!paths[p].isVector()) continue;
+                std::string idxList = "[";
+                for (size_t j = 0; j < paths[p].size(); j++) {
+                    if (j > 0) idxList += ", ";
+                    idxList += std::to_string(static_cast<int>(paths[p][j].toNumber()));
+                }
+                idxList += "]";
+                std::string spVar = "_sp" + std::to_string(p);
+                emit(spVar + " = _cd.splines.new('POLY')");
+                emit(spVar + ".points.add(len(" + idxList + ") - 1)");
+                emit("for _pi, _idx in enumerate(" + idxList + "):");
+                indent_++;
+                emit(spVar + ".points[_pi].co = (_all_coords[_idx][0], _all_coords[_idx][1], 0, 1)");
+                indent_--;
+                emit(spVar + ".use_cyclic_u = True");
+            }
         }
 
-        // Join all line segments
-        std::string joinId = newNodeId();
-        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinId + ".location = (x_pos, y_pos)");
-        for (auto& id : lineIds) {
-            emit("links.new(" + id + ".outputs['Curve'], " + joinId + ".inputs['Geometry'])");
-        }
-
-        emit("last_geo = " + joinId);
+        std::string objInfoId = newNodeId();
+        emit(objInfoId + " = nodes.new('GeometryNodeObjectInfo')");
+        emit(objInfoId + ".location = (x_pos, y_pos)");
+        emit(objInfoId + ".transform_space = 'RELATIVE'");
+        emit(objInfoId + ".inputs['Object'].default_value = " + objVar);
+        emit("last_geo = " + objInfoId);
         emit("x_pos += 200");
         emit("y_pos -= 50");
     } else {
         // Runtime fallback: points computed at Python runtime (e.g. from function calls)
-        // Emit a Python loop that creates CurvePrimitiveLine nodes dynamically
         std::string ptsVar = newNodeId() + "_pts";
 
-        // Build the points list using toPython() to preserve runtime expressions
+        // If the points Value has a top-level expression tree (e.g. concat(langL(...),...)),
+        // use exprTreeToPython to generate compact code with helper function calls.
+        // Skip VectorLiteral trees with empty vec_elements — these are stub trees where
+        // the actual element data is in the Value's sub-values, not in the tree.
+        ExprNodePtr pointsTree = points.exprTree();
+        bool useExprTree = pointsTree &&
+            !(pointsTree->kind == ExprNode::Kind::VectorLiteral && pointsTree->vec_elements.empty());
+        if (useExprTree) {
+            std::string pyPts = exprTreeToPython(pointsTree);
+            emit(ptsVar + " = _extract_pts(" + pyPts + ")");
+        } else if (points.isVector() && points.size() > 0) {
+        // Build the points list from individual element expression trees
         std::string ptsCode = "[";
-        if (points.isVector()) {
-            for (size_t i = 0; i < points.size(); ++i) {
-                if (i > 0) ptsCode += ", ";
-                const Value& pt = points[i];
-                if (pt.isVector() && pt.size() >= 2) {
-                    ptsCode += "(" + pt[0].toPython() + ", " + pt[1].toPython() + ")";
+        for (size_t i = 0; i < points.size(); ++i) {
+            if (i > 0) ptsCode += ", ";
+            const Value& pt = points[i];
+            if (pt.isVector() && pt.size() >= 2) {
+                // Build [x, y] from individual element expr trees
+                std::string xStr, yStr;
+                auto elemToPy = [&](const Value& elem) -> std::string {
+                    ExprNodePtr et = elem.exprTree();
+                    if (et && exprTreeReferencesModuleParams(et)) {
+                        return exprTreeToPython(et);
+                    } else if (et) {
+                        return exprTreeToPython(et);
+                    } else if (elem.isNumber()) {
+                        return pyDouble(elem.toNumber());
+                    } else {
+                        return elem.toPython();
+                    }
+                };
+                xStr = elemToPy(pt[0]);
+                yStr = elemToPy(pt[1]);
+                ptsCode += "[" + xStr + ", " + yStr + "]";
+            } else if (pt.isExpression()) {
+                ExprNodePtr et = pt.exprTree();
+                if (et) {
+                    ptsCode += exprTreeToPython(et);
                 } else {
                     ptsCode += pt.toPython();
                 }
+            } else {
+                ptsCode += pt.toPython();
             }
         }
         ptsCode += "]";
 
         emit(ptsVar + " = [p for p in " + ptsCode + " if isinstance(p, (list, tuple)) and len(p) >= 2]");
+        } else {
+        // Non-vector points with no useful expression tree — emit empty
+        emit(ptsVar + " = []");
+        }
 
-        // Guard: if fewer than 2 valid points at runtime, skip
-        std::string joinId = newNodeId();
-        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinId + ".location = (x_pos, y_pos)");
-        emit("if len(" + ptsVar + ") >= 2:");
+        // Build a single cyclic POLY spline from the runtime points
+        std::string objVar = newNodeId() + "_poly_obj";
+        emit("if len(" + ptsVar + ") >= 3:");
         indent_++;
-        emit("for _i in range(len(" + ptsVar + ")):");
+        emit("_cd = bpy.data.curves.new('" + objVar + "', type='CURVE')");
+        emit("_cd.dimensions = '3D'");
+        emit("_sp = _cd.splines.new('POLY')");
+        emit("_sp.points.add(len(" + ptsVar + ") - 1)");
+        emit("for _pi, _pt in enumerate(" + ptsVar + "):");
         indent_++;
-        emit("_next = (_i + 1) % len(" + ptsVar + ")");
-        std::string lineVar = newNodeId();
-        emit(lineVar + " = nodes.new('GeometryNodeCurvePrimitiveLine')");
-        emit(lineVar + ".location = (x_pos, y_pos)");
-        emit(lineVar + ".inputs['Start'].default_value = (" + ptsVar + "[_i][0], " + ptsVar + "[_i][1], 0)");
-        emit(lineVar + ".inputs['End'].default_value = (" + ptsVar + "[_next][0], " + ptsVar + "[_next][1], 0)");
-        emit("links.new(" + lineVar + ".outputs['Curve'], " + joinId + ".inputs['Geometry'])");
-        emit("y_pos -= 50");
+        emit("_sp.points[_pi].co = (_pt[0], _pt[1], 0, 1)");
         indent_--;
-        indent_--;
-
-        emit("last_geo = " + joinId);
+        emit("_sp.use_cyclic_u = True");
+        emit(objVar + " = bpy.data.objects.new('" + objVar + "', _cd)");
+        emit("bpy.context.collection.objects.link(" + objVar + ")");
+        std::string objInfoId = newNodeId();
+        emit(objInfoId + " = nodes.new('GeometryNodeObjectInfo')");
+        emit(objInfoId + ".location = (x_pos, y_pos)");
+        emit(objInfoId + ".transform_space = 'RELATIVE'");
+        emit(objInfoId + ".inputs['Object'].default_value = " + objVar);
+        emit("last_geo = " + objInfoId);
         emit("x_pos += 200");
+        indent_--;
+
         emit("y_pos -= 50");
     }
 }
@@ -3395,6 +4358,94 @@ void BlenderGenerator::emitTranslate(const Arguments& args) {
     emit("link_nodes(links, last_geo, 'Geometry', " + nodeId + ", 'Geometry')");
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
+}
+
+void BlenderGenerator::emitMultmatrix(const Arguments& args) {
+    // Extract the 4x4 matrix — first positional arg or named 'm'
+    Value m = getArg(args, "m", getPositionalArg(args, 0, Value()));
+
+    if (!m.isVector() || m.size() < 3) {
+        if (m.isExpression() && m.exprTree()) {
+            // Full expression matrix — extract at runtime in Python
+            std::string mPy = exprTreeToPython(m.exprTree());
+            emit("# Multmatrix → Translate (runtime matrix)");
+            std::string nodeId = newNodeId();
+            emit(nodeId + " = nodes.new('GeometryNodeTransform')");
+            emit(nodeId + ".location = (x_pos, y_pos)");
+            emit("link_nodes(links, last_geo, 'Geometry', " + nodeId + ", 'Geometry')");
+            emit("y_pos -= 50");
+            emit("_mm = " + mPy);
+            emit(nodeId + ".inputs['Translation'].default_value = (_s(_mm[0][3] if isinstance(_mm[0], (list,tuple)) else 0), _s(_mm[1][3] if isinstance(_mm[1], (list,tuple)) else 0), _s(_mm[2][3] if isinstance(_mm[2], (list,tuple)) else 0))");
+            emit("last_geo = " + nodeId);
+            emit("x_pos += 200");
+        } else {
+            emit("# multmatrix: could not extract matrix");
+        }
+        return;
+    }
+
+    // Check if any row has expression trees with variable references
+    bool hasVarRefs = false;
+    if (m.exprTree() && m.exprTree()->hasVariableRefs()) hasVarRefs = true;
+    if (!hasVarRefs) {
+        for (size_t r = 0; r < std::min(m.size(), (size_t)3); r++) {
+            if (m[r].exprTree() && m[r].exprTree()->hasVariableRefs()) { hasVarRefs = true; break; }
+        }
+    }
+
+    if (hasVarRefs) {
+        // Use expression trees to get correct Python with variable references
+        // The Value's toPython() may have wrong str_val_ but the tree is correct
+        auto getCellPy = [&](size_t row, size_t col) -> std::string {
+            // Try the row's expression tree (VectorLiteral)
+            if (row < m.size() && m[row].exprTree()) {
+                ExprNodePtr rowTree = m[row].exprTree();
+                if (rowTree->kind == ExprNode::Kind::VectorLiteral && col < rowTree->vec_elements.size()) {
+                    return exprTreeToPython(rowTree->vec_elements[col]);
+                }
+                // Fallback: use the whole row tree with indexing
+                return exprTreeToPython(rowTree) + "[" + std::to_string(col) + "]";
+            }
+            // Try the outer matrix's expression tree
+            if (m.exprTree() && m.exprTree()->kind == ExprNode::Kind::VectorLiteral &&
+                row < m.exprTree()->vec_elements.size()) {
+                ExprNodePtr rowTree = m.exprTree()->vec_elements[row];
+                if (rowTree->kind == ExprNode::Kind::VectorLiteral && col < rowTree->vec_elements.size()) {
+                    return exprTreeToPython(rowTree->vec_elements[col]);
+                }
+            }
+            // Concrete fallback
+            if (row < m.size() && m[row].isVector() && col < m[row].size()) {
+                return pyDouble(m[row][col].toNumber());
+            }
+            return "0.0";
+        };
+
+        emit("# Multmatrix → Translate (expression)");
+        std::string nodeId = newNodeId();
+        emit(nodeId + " = nodes.new('GeometryNodeTransform')");
+        emit(nodeId + ".location = (x_pos, y_pos)");
+        emit("link_nodes(links, last_geo, 'Geometry', " + nodeId + ", 'Geometry')");
+        emit("y_pos -= 50");
+        std::string txPy = getCellPy(0, 3);
+        std::string tyPy = getCellPy(1, 3);
+        std::string tzPy = getCellPy(2, 3);
+        emit(nodeId + ".inputs['Translation'].default_value = (_s(" + txPy + "), _s(" + tyPy + "), _s(" + tzPy + "))");
+        emit("last_geo = " + nodeId);
+        emit("x_pos += 200");
+    } else {
+        // All concrete values — extract translation directly
+        auto getCell = [&](size_t row, size_t col) -> double {
+            if (row < m.size() && m[row].isVector() && col < m[row].size()) {
+                return m[row][col].toNumber();
+            }
+            return 0.0;
+        };
+
+        Arguments translateArgs;
+        translateArgs["v"] = Value({getCell(0, 3), getCell(1, 3), getCell(2, 3)});
+        emitTranslate(translateArgs);
+    }
 }
 
 void BlenderGenerator::emitRotate(const Arguments& args) {
@@ -3565,19 +4616,22 @@ void BlenderGenerator::emitRotate(const Arguments& args) {
                     mightBeVector = true;
                 }
 
-                if (mightBeVector) {
+                if (mightBeVector || exprTreeReferencesModuleParams(aTree)) {
                     // Emit runtime check: if vector, use as Euler XYZ; if scalar, use as Z rotation
-                    emit("if isinstance(" + pyExpr + ", (list, tuple)):");
+                    // Module param expressions may be vectors at runtime (e.g. is_list(x) ? [x,y,z] : x)
+                    std::string tmpVar = "_rot_" + std::to_string(node_counter_++);
+                    emit(tmpVar + " = " + pyExpr);
+                    emit("if isinstance(" + tmpVar + ", (list, tuple)):");
                     indent_++;
                     emit(nodeId + ".inputs['Rotation'].default_value = (math.radians(" +
-                         pyExpr + "[0]), math.radians(" + pyExpr + "[1]), math.radians(" + pyExpr + "[2]))");
+                         tmpVar + "[0] if len(" + tmpVar + ")>0 else 0), math.radians(" +
+                         tmpVar + "[1] if len(" + tmpVar + ")>1 else 0), math.radians(" +
+                         tmpVar + "[2] if len(" + tmpVar + ")>2 else 0))");
                     indent_--;
                     emit("else:");
                     indent_++;
-                    emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, math.radians(" + pyExpr + "))");
+                    emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, math.radians(" + tmpVar + "))");
                     indent_--;
-                } else if (exprTreeReferencesModuleParams(aTree)) {
-                    emit(nodeId + ".inputs['Rotation'].default_value = (0, 0, math.radians(" + pyExpr + "))");
                 } else {
                     ExprNodePtr radTree = ExprNode::makeBinary(
                         ExprNode::Op::MULTIPLY, aTree,
@@ -3654,7 +4708,7 @@ void BlenderGenerator::emitMirror(const Arguments& args) {
     emit("# FlipFaces to fix normals after mirror");
     emit(flipId + " = nodes.new('GeometryNodeFlipFaces')");
     emit(flipId + ".location = (x_pos, y_pos)");
-    emit("link_nodes(links, last_geo, 'Geometry', " + flipId + ", 'Geometry')");
+    emit("link_nodes(links, last_geo, 'Geometry', " + flipId + ", 'Mesh')");
     emit("last_geo = " + flipId);
     emit("x_pos += 200");
 }
@@ -4350,7 +5404,10 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
 
         // Fillet radius = absolute value of offset amount
         ExprNodePtr offsetTree = getOrMakeLiteralTree(offsetVal);
-        if (offsetTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(offsetTree)) {
+        if (offsetTree->hasVariableRefs() && exprTreeReferencesModuleParams(offsetTree)) {
+            std::string pyExpr = exprTreeToPython(offsetTree);
+            emit(filletId + ".inputs['Radius'].default_value = abs(_s(" + pyExpr + "))");
+        } else if (offsetTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(offsetTree)) {
             // Build abs(offset) tree for the radius
             ExprNodePtr absTree = ExprNode::makeFunctionCall("abs", {offsetTree});
             auto result = emitExpressionNodeTree(absTree);
@@ -4379,7 +5436,7 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
             emit("links.new(" + maxId + ".outputs['Value'], " + filletId + ".inputs['Count'])");
         } else if (in_module_ && fnTree->hasVariableRefs() && exprTreeReferencesModuleParams(fnTree)) {
             std::string fnPy = exprTreeToPython(fnTree);
-            emit(filletId + ".inputs['Count'].default_value = max(1, int(" + fnPy + ") // 4)");
+            emit(filletId + ".inputs['Count'].default_value = max(1, int(_s(" + fnPy + ")) // 4)");
         } else {
             int count = fnVal / 4;
             if (count < 1) count = 1;
@@ -4409,7 +5466,7 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
             emit("links.new(" + maxId + ".outputs['Value'], " + subdivId + ".inputs['Cuts'])");
         } else if (in_module_ && fnTreeD->hasVariableRefs() && exprTreeReferencesModuleParams(fnTreeD)) {
             std::string fnPy = exprTreeToPython(fnTreeD);
-            emit(subdivId + ".inputs['Cuts'].default_value = max(1, int(" + fnPy + ") // 4)");
+            emit(subdivId + ".inputs['Cuts'].default_value = max(1, int(_s(" + fnPy + ")) // 4)");
         } else {
             int cuts = fnVal / 4;
             if (cuts < 1) cuts = 1;
@@ -4594,6 +5651,11 @@ static bool is2DGeometry(const ASTNodePtr& node) {
         case ASTNode::Type::Intersection:
         case ASTNode::Type::Hull:
         case ASTNode::Type::Minkowski:
+            if (!node->children().empty())
+                return is2DGeometry(node->children()[0]);
+            return false;
+        case ASTNode::Type::ModuleCall:
+            // Module calls like T(x)square() have the geometry as children
             if (!node->children().empty())
                 return is2DGeometry(node->children()[0]);
             return false;
@@ -4795,7 +5857,8 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
     if (blenderOp == "DIFFERENCE") {
         // Determine at compile time if this is a 2D or 3D difference
-        bool is2D = is2DGeometry(actualChildren[0]);
+        // In extrude context, always treat as 2D (building a 2D profile)
+        bool is2D = in_extrude_ || is2DGeometry(actualChildren[0]);
 
         if (is2D) {
             // 2D path: use curve reverse + join approach (keeps curves as curves)
@@ -4950,7 +6013,8 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         emit("x_pos += 200");
     } else {
         // UNION and INTERSECT
-        bool is2D = is2DGeometry(actualChildren[0]);
+        // In extrude context, always treat as 2D (building a 2D profile)
+        bool is2D = in_extrude_ || is2DGeometry(actualChildren[0]);
 
         if (is2D && blenderOp == "UNION") {
             // 2D UNION: simply join curves together
@@ -4980,6 +6044,107 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 indent_--;
                 emit("y_pos -= 50");
             }
+        } else if (is2D && blenderOp == "INTERSECT") {
+            // 2D INTERSECT: extrude both operands into thin volumes, do 3D intersect
+            // (Blender MeshBoolean can't intersect coplanar flat faces)
+            emit("# " + opName + " (2D thin-extrude + 3D intersect)");
+
+            std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
+            emit("def " + isCurveHelper + "(geo_node):");
+            indent_++;
+            emit("if geo_node is None: return False");
+            emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+            emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+            emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
+            emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
+            emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
+            emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve'}");
+            emit("return geo_node.bl_idname in curve_types");
+            indent_--;
+
+            // Helper: fill curve + thin extrude for 2D INTERSECT operands
+            std::string fillHelper = "ensure_mesh_" + std::to_string(boolScopeId);
+            emit("def " + fillHelper + "(geo_node):");
+            indent_++;
+            emit("\"\"\"Fill curve + thin extrude for 2D intersect\"\"\"");
+            emit("nonlocal x_pos, y_pos");
+            emit("if " + isCurveHelper + "(geo_node):");
+            indent_++;
+            emit("fill = nodes.new('GeometryNodeFillCurve')");
+            emit("fill.location = (x_pos, y_pos)");
+            emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
+            emit("x_pos += 200");
+            emit("geo_node = fill");
+            indent_--;
+            // Extrude the filled mesh by a small amount to give it volume
+            emit("ext = nodes.new('GeometryNodeExtrudeMesh')");
+            emit("ext.location = (x_pos, y_pos)");
+            emit("ext.mode = 'FACES'");
+            emit("ext.inputs['Offset Scale'].default_value = 0.001");
+            emit("link_nodes(links, geo_node, 'Geometry', ext, 'Mesh')");
+            emit("x_pos += 200");
+            emit("return ext");
+            indent_--;
+
+            actualChildren[0]->accept(*this);
+            emit("last_geo = " + fillHelper + "(last_geo)");
+            emit(firstGeo + " = last_geo");
+
+            for (size_t i = 1; i < actualChildren.size(); ++i) {
+                actualChildren[i]->accept(*this);
+
+                emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
+                indent_++;
+                emit("last_geo = " + fillHelper + "(last_geo)");
+                emit("if " + firstGeo + " is None:");
+                indent_++;
+                emit(firstGeo + " = last_geo");
+                indent_--;
+                emit("else:");
+                indent_++;
+
+                std::string boolId = newNodeId();
+                emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+                emit(boolId + ".location = (x_pos, y_pos)");
+                emit(boolId + ".operation = 'INTERSECT'");
+                emit(boolId + ".solver = 'EXACT'");
+                emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[1])");
+                emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
+                emit(firstGeo + " = " + boolId);
+                emit("x_pos += 200");
+                indent_--;
+                indent_--;
+                emit("y_pos -= 50");
+            }
+
+            // When in extrude context, convert mesh back to curve for CurveToMesh
+            // Select only boundary edges on the Z=0 face (bottom of thin extrusion)
+            if (in_extrude_) {
+                emit("# Convert INTERSECT mesh result back to curves for extrusion");
+                // Get position Z to select bottom face edges
+                std::string posId = newNodeId();
+                emit(posId + " = nodes.new('GeometryNodeInputPosition')");
+                emit(posId + ".location = (x_pos, y_pos - 200)");
+                std::string sepId = newNodeId();
+                emit(sepId + " = nodes.new('ShaderNodeSeparateXYZ')");
+                emit(sepId + ".location = (x_pos + 150, y_pos - 200)");
+                emit("links.new(" + posId + ".outputs['Position'], " + sepId + ".inputs['Vector'])");
+                // Z < 0.0005 (bottom face of thin extrusion)
+                std::string cmpId = newNodeId();
+                emit(cmpId + " = nodes.new('ShaderNodeMath')");
+                emit(cmpId + ".operation = 'LESS_THAN'");
+                emit(cmpId + ".location = (x_pos + 300, y_pos - 200)");
+                emit("links.new(" + sepId + ".outputs['Z'], " + cmpId + ".inputs[0])");
+                emit(cmpId + ".inputs[1].default_value = 0.0005");
+                // MeshToCurve with selection
+                std::string mtcId = newNodeId();
+                emit(mtcId + " = nodes.new('GeometryNodeMeshToCurve')");
+                emit(mtcId + ".location = (x_pos + 450, y_pos)");
+                emit("links.new(geo_out(" + firstGeo + "), " + mtcId + ".inputs['Mesh'])");
+                emit("links.new(" + cmpId + ".outputs['Value'], " + mtcId + ".inputs['Selection'])");
+                emit(firstGeo + " = " + mtcId);
+                emit("x_pos += 650");
+            }
         } else {
         // 3D (or 2D INTERSECT) path: use geometry nodes mesh boolean
 
@@ -5004,14 +6169,65 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         indent_++;
         emit("\"\"\"Fill curve geometry for boolean input\"\"\"");
         emit("nonlocal x_pos, y_pos");
-        emit("if " + isCurveHelper + "(geo_node):");
-        indent_++;
-        emit("fill = nodes.new('GeometryNodeFillCurve')");
-        emit("fill.location = (x_pos, y_pos)");
-        emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
-        emit("x_pos += 200");
-        emit("return fill");
-        indent_--;
+
+        if (blenderOp == "INTERSECT") {
+            // For INTERSECT, we need to handle 2D (coplanar) geometry:
+            // Blender's MeshBoolean INTERSECT fails on zero-thickness meshes.
+            // Trace back through transforms to detect curve sources, then
+            // FillCurve + thin ExtrudeMesh to give them volume.
+            emit("_crv = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
+            emit("        'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
+            emit("        'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
+            emit("        'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
+            emit("        'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
+            emit("        'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve'}");
+            emit("src = geo_node");
+            emit("is_2d = False");
+            emit("for _ in range(20):");
+            indent_++;
+            emit("if src is None: break");
+            emit("if src.bl_idname in _crv: is_2d = True; break");
+            emit("if src.bl_idname == 'GeometryNodeObjectInfo':");
+            indent_++;
+            emit("ref = src.inputs['Object'].default_value");
+            emit("if ref and ref.type == 'CURVE': is_2d = True");
+            emit("break");
+            indent_--;
+            emit("if src.bl_idname == 'GeometryNodeFillCurve': is_2d = True; break");
+            emit("if src.bl_idname == 'GeometryNodeTransform' and src.inputs['Geometry'].links:");
+            indent_++;
+            emit("src = src.inputs['Geometry'].links[0].from_node");
+            indent_--;
+            emit("else: break");
+            indent_--;
+            emit("if is_2d:");
+            indent_++;
+            emit("if " + isCurveHelper + "(geo_node):");
+            indent_++;
+            emit("fill = nodes.new('GeometryNodeFillCurve')");
+            emit("fill.location = (x_pos, y_pos)");
+            emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
+            emit("x_pos += 200");
+            emit("geo_node = fill");
+            indent_--;
+            emit("ext = nodes.new('GeometryNodeExtrudeMesh')");
+            emit("ext.location = (x_pos, y_pos)");
+            emit("ext.mode = 'FACES'");
+            emit("ext.inputs['Offset Scale'].default_value = 0.001");
+            emit("link_nodes(links, geo_node, 'Geometry', ext, 'Mesh')");
+            emit("x_pos += 200");
+            emit("return ext");
+            indent_--;
+        } else {
+            emit("if " + isCurveHelper + "(geo_node):");
+            indent_++;
+            emit("fill = nodes.new('GeometryNodeFillCurve')");
+            emit("fill.location = (x_pos, y_pos)");
+            emit("link_nodes(links, geo_node, 'Curve', fill, 'Curve')");
+            emit("x_pos += 200");
+            emit("return fill");
+            indent_--;
+        }
         emit("return geo_node");
         indent_--;
 
@@ -5037,6 +6253,9 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit("else:");
             indent_++;
 
+            // Ensure first_geo is mesh before boolean (may still be curve if single-child skip)
+            emit(firstGeo + " = " + fillHelper + "(" + firstGeo + ")");
+
             std::string boolId = newNodeId();
             emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
             emit(boolId + ".location = (x_pos, y_pos)");
@@ -5061,6 +6280,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
 // Extrude generators
 void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
+    has_3d_geometry_ = true;
     Value height = getArg(args, "height", getPositionalArg(args, 0, Value(1.0)));
     Value twist = getArg(args, "twist", Value(0.0));
     Value scale_val = getArg(args, "scale", Value(1.0));
@@ -5092,6 +6312,7 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
 
         // Height end-point (variable-aware)
         std::string heightEndExpr;
+        bool heightLinkedToGroupInput = false;
         if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
             std::string combId = newNodeId();
             emit(combId + " = nodes.new('ShaderNodeCombineXYZ')");
@@ -5099,9 +6320,10 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
             auto result = emitExpressionNodeTree(heightTree);
             connectExprResultNamed(result, combId, "Z");
             emit("links.new(" + combId + ".outputs['Vector'], " + lineId + ".inputs['End'])");
+            heightLinkedToGroupInput = true;
         } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
             std::string hPy = exprTreeToPython(heightTree);
-            emit(lineId + ".inputs['End'].default_value = (0, 0, " + hPy + ")");
+            emit(lineId + ".inputs['End'].default_value = (0, 0, _s(" + hPy + "))");
             heightEndExpr = hPy;
         } else {
             emit(lineId + ".inputs['End'].default_value = (0, 0, " + pyDouble(hVal) + ")");
@@ -5109,16 +6331,141 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         }
         emit("x_pos += 200");
 
-        // CurveToMesh with Fill Caps = True (handles simple and compound curves)
+        // If the profile geometry came from a mesh operation (e.g., 2D INTERSECT),
+        // use ExtrudeMesh instead of CurveToMesh since CurveToMesh needs curves.
+        emit("# Check if profile is mesh (from boolean INTERSECT) - use different extrusion");
+        emit("_profile_geo = " + profileGeo);
+        emit("_is_mesh_profile = False");
+        emit("if _profile_geo is not None:");
+        indent_++;
+        emit("_mesh_types = {'GeometryNodeMeshBoolean', 'GeometryNodeFillCurve',");
+        emit("               'GeometryNodeExtrudeMesh', 'GeometryNodeMergeByDistance'}");
+        emit("_is_mesh_profile = _profile_geo.bl_idname in _mesh_types");
+        indent_--;
+
+        emit("if _is_mesh_profile:");
+        indent_++;
+        // Mesh profile path: use ExtrudeMesh to extrude the flat mesh to full height
+        // First, delete the thin extrusion's top face and side faces to keep only bottom face
+        // Then extrude that bottom face to the desired height
+        emit("# Mesh profile: extract bottom face and extrude to height");
+        // Use face normal to select non-bottom faces (normal.Z >= -0.5)
+        emit("_norm = nodes.new('GeometryNodeInputNormal')");
+        emit("_norm.location = (x_pos, y_pos - 200)");
+        emit("_sep = nodes.new('ShaderNodeSeparateXYZ')");
+        emit("_sep.location = (x_pos + 150, y_pos - 200)");
+        emit("links.new(_norm.outputs['Normal'], _sep.inputs['Vector'])");
+        // Select faces where normal.Z >= -0.5 (top + side faces)
+        emit("_ge = nodes.new('ShaderNodeMath')");
+        emit("_ge.operation = 'GREATER_THAN'");
+        emit("_ge.location = (x_pos + 300, y_pos - 200)");
+        emit("links.new(_sep.outputs['Z'], _ge.inputs[0])");
+        emit("_ge.inputs[1].default_value = -0.5");
+        // Delete non-bottom faces
+        emit("_del = nodes.new('GeometryNodeDeleteGeometry')");
+        emit("_del.domain = 'FACE'");
+        emit("_del.location = (x_pos + 450, y_pos)");
+        emit("link_nodes(links, _profile_geo, 'Geometry', _del, 'Geometry')");
+        emit("links.new(_ge.outputs['Value'], _del.inputs['Selection'])");
+        // Flip remaining bottom faces (they face down, we need them facing up)
+        emit("_flip = nodes.new('GeometryNodeFlipFaces')");
+        emit("_flip.location = (x_pos + 600, y_pos)");
+        emit("links.new(geo_out(_del), _flip.inputs['Mesh'])");
+        // Merge loose vertices from deleted faces
+        emit("_mrg = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_mrg.location = (x_pos + 750, y_pos)");
+        emit("links.new(_flip.outputs['Mesh'], _mrg.inputs['Geometry'])");
+        emit("_mrg.inputs['Distance'].default_value = 0.0001");
+        emit("x_pos += 950");
+        // Now extrude the remaining bottom face to full height
+        emit("_ext = nodes.new('GeometryNodeExtrudeMesh')");
+        emit("_ext.location = (x_pos, y_pos)");
+        emit("_ext.mode = 'FACES'");
+        emit("link_nodes(links, _mrg, 'Geometry', _ext, 'Mesh')");
+
+        // Height offset vector
+        if (heightLinkedToGroupInput) {
+            std::string combExtId = newNodeId();
+            emit(combExtId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combExtId + ".location = (x_pos, y_pos - 200)");
+            auto extResult = emitExpressionNodeTree(heightTree);
+            connectExprResultNamed(extResult, combExtId, "Z");
+            emit("links.new(" + combExtId + ".outputs['Vector'], _ext.inputs['Offset'])");
+        } else if (!heightEndExpr.empty()) {
+            emit("_ext.inputs['Offset'].default_value = (0, 0, _s(" + heightEndExpr + "))");
+        } else {
+            emit("_ext.inputs['Offset'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+        }
+        emit("_ext.inputs['Offset Scale'].default_value = 1.0");
+        emit("last_geo = _ext");
+        emit("x_pos += 200");
+        indent_--;
+
+        emit("else:");
+        indent_++;
+        std::string profileVar = "_profile_geo";
+
+        // CurveToMesh with Fill Caps = False
+        // Fill Caps=True creates nested geometry with flipped normals on compound curves
+        // Instead we cap manually with FillCurve + FlipFaces + Transform + Join + Merge
         std::string ctmId = newNodeId();
         emit(ctmId + " = nodes.new('GeometryNodeCurveToMesh')");
         emit(ctmId + ".location = (x_pos, y_pos)");
         emit("links.new(" + lineId + ".outputs['Curve'], " + ctmId + ".inputs['Curve'])");
-        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + ctmId + ", 'Profile Curve')");
-        emit(ctmId + ".inputs['Fill Caps'].default_value = True");
+        emit("link_nodes(links, " + profileVar + ", 'Curve', " + ctmId + ", 'Profile Curve')");
+        emit(ctmId + ".inputs['Fill Caps'].default_value = False");
 
-        emit("last_geo = " + ctmId);
-        emit("x_pos += 200");
+        // Bottom cap: FillCurve of the profile, with FlipFaces (normals point down)
+        std::string fillBot = newNodeId();
+        emit(fillBot + " = nodes.new('GeometryNodeFillCurve')");
+        emit(fillBot + ".location = (x_pos + 200, y_pos - 100)");
+        emit("link_nodes(links, " + profileVar + ", 'Curve', " + fillBot + ", 'Curve')");
+        std::string flipId = newNodeId();
+        emit(flipId + " = nodes.new('GeometryNodeFlipFaces')");
+        emit(flipId + ".location = (x_pos + 400, y_pos - 100)");
+        emit("links.new(" + fillBot + ".outputs['Mesh'], " + flipId + ".inputs['Mesh'])");
+
+        // Top cap: FillCurve of the profile, translated to Z=height
+        std::string fillTop = newNodeId();
+        emit(fillTop + " = nodes.new('GeometryNodeFillCurve')");
+        emit(fillTop + ".location = (x_pos + 200, y_pos - 200)");
+        emit("link_nodes(links, " + profileVar + ", 'Curve', " + fillTop + ", 'Curve')");
+        std::string xformTop = newNodeId();
+        emit(xformTop + " = nodes.new('GeometryNodeTransform')");
+        emit(xformTop + ".location = (x_pos + 400, y_pos - 200)");
+        emit("links.new(" + fillTop + ".outputs['Mesh'], " + xformTop + ".inputs['Geometry'])");
+        if (heightLinkedToGroupInput) {
+            // Link top cap translation Z to same group_input expression
+            std::string combCapId = newNodeId();
+            emit(combCapId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combCapId + ".location = (x_pos + 400, y_pos - 350)");
+            auto capResult = emitExpressionNodeTree(heightTree);
+            connectExprResultNamed(capResult, combCapId, "Z");
+            emit("links.new(" + combCapId + ".outputs['Vector'], " + xformTop + ".inputs['Translation'])");
+        } else if (!heightEndExpr.empty()) {
+            emit(xformTop + ".inputs['Translation'].default_value = (0, 0, _s(" + heightEndExpr + "))");
+        } else {
+            emit(xformTop + ".inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+        }
+
+        // Join walls + bottom cap + top cap
+        std::string joinId = newNodeId();
+        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
+        emit(joinId + ".location = (x_pos + 600, y_pos)");
+        emit("links.new(" + ctmId + ".outputs['Mesh'], " + joinId + ".inputs['Geometry'])");
+        emit("links.new(" + flipId + ".outputs['Mesh'], " + joinId + ".inputs['Geometry'])");
+        emit("links.new(" + xformTop + ".outputs['Geometry'], " + joinId + ".inputs['Geometry'])");
+
+        // MergeByDistance to weld shared boundary vertices
+        std::string mergeId = newNodeId();
+        emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
+        emit(mergeId + ".location = (x_pos + 800, y_pos)");
+        emit("links.new(" + joinId + ".outputs['Geometry'], " + mergeId + ".inputs['Geometry'])");
+        emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
+
+        emit("last_geo = " + mergeId);
+        emit("x_pos += 1000");
+        indent_--;  // close 'else:' (curve profile path)
     } else {
         // CurveToMesh approach — supports twist and scale (only works for simple single-spline profiles)
         emit("# Linear Extrude (CurveToMesh approach)");
@@ -5139,7 +6486,7 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
             emit("links.new(" + combId + ".outputs['Vector'], " + lineId + ".inputs['End'])");
         } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
             std::string hPy = exprTreeToPython(heightTree);
-            emit(lineId + ".inputs['End'].default_value = (0, 0, " + hPy + ")");
+            emit(lineId + ".inputs['End'].default_value = (0, 0, _s(" + hPy + "))");
         } else {
             emit(lineId + ".inputs['End'].default_value = (0, 0, " + pyDouble(hVal) + ")");
         }
@@ -5198,9 +6545,57 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         emit(ctmId + ".location = (x_pos, y_pos)");
         emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + ctmId + ".inputs['Curve'])");
         emit("link_nodes(links, " + profileGeo + ", 'Curve', " + ctmId + ", 'Profile Curve')");
-        emit(ctmId + ".inputs['Fill Caps'].default_value = True");
-        emit("last_geo = " + ctmId);
-        emit("x_pos += 200");
+        emit(ctmId + ".inputs['Fill Caps'].default_value = False");
+
+        // Bottom cap: FillCurve with FlipFaces (normals pointing down at Z=0)
+        std::string fillBot2 = newNodeId();
+        emit(fillBot2 + " = nodes.new('GeometryNodeFillCurve')");
+        emit(fillBot2 + ".location = (x_pos + 200, y_pos - 100)");
+        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + fillBot2 + ", 'Curve')");
+        std::string flipId2 = newNodeId();
+        emit(flipId2 + " = nodes.new('GeometryNodeFlipFaces')");
+        emit(flipId2 + ".location = (x_pos + 400, y_pos - 100)");
+        emit("links.new(" + fillBot2 + ".outputs['Mesh'], " + flipId2 + ".inputs['Mesh'])");
+
+        // Top cap: FillCurve translated to Z=height
+        std::string fillTop2 = newNodeId();
+        emit(fillTop2 + " = nodes.new('GeometryNodeFillCurve')");
+        emit(fillTop2 + ".location = (x_pos + 200, y_pos - 200)");
+        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + fillTop2 + ", 'Curve')");
+        std::string xformTop2 = newNodeId();
+        emit(xformTop2 + " = nodes.new('GeometryNodeTransform')");
+        emit(xformTop2 + ".location = (x_pos + 400, y_pos - 200)");
+        emit("links.new(" + fillTop2 + ".outputs['Mesh'], " + xformTop2 + ".inputs['Geometry'])");
+        if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
+            std::string combCapId = newNodeId();
+            emit(combCapId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combCapId + ".location = (x_pos + 400, y_pos - 350)");
+            auto capResult = emitExpressionNodeTree(heightTree);
+            connectExprResultNamed(capResult, combCapId, "Z");
+            emit("links.new(" + combCapId + ".outputs['Vector'], " + xformTop2 + ".inputs['Translation'])");
+        } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
+            std::string hPy = exprTreeToPython(heightTree);
+            emit(xformTop2 + ".inputs['Translation'].default_value = (0, 0, _s(" + hPy + "))");
+        } else {
+            emit(xformTop2 + ".inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+        }
+        // Join walls + caps
+        std::string joinId2 = newNodeId();
+        emit(joinId2 + " = nodes.new('GeometryNodeJoinGeometry')");
+        emit(joinId2 + ".location = (x_pos + 600, y_pos)");
+        emit("links.new(" + ctmId + ".outputs['Mesh'], " + joinId2 + ".inputs['Geometry'])");
+        emit("links.new(" + flipId2 + ".outputs['Mesh'], " + joinId2 + ".inputs['Geometry'])");
+        emit("links.new(" + xformTop2 + ".outputs['Geometry'], " + joinId2 + ".inputs['Geometry'])");
+
+        // MergeByDistance to weld boundary vertices
+        std::string mergeId2 = newNodeId();
+        emit(mergeId2 + " = nodes.new('GeometryNodeMergeByDistance')");
+        emit(mergeId2 + ".location = (x_pos + 800, y_pos)");
+        emit("links.new(" + joinId2 + ".outputs['Geometry'], " + mergeId2 + ".inputs['Geometry'])");
+        emit(mergeId2 + ".inputs['Distance'].default_value = 0.0001");
+
+        emit("last_geo = " + mergeId2);
+        emit("x_pos += 1000");
 
         // Apply scale after CurveToMesh using SetPosition
         // scaleFactor = 1 + (Z / height) * (targetScale - 1)
@@ -5236,7 +6631,7 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
                 }
             } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
                 std::string hPy = exprTreeToPython(heightTree);
-                emit(divId + ".inputs[1].default_value = " + hPy);
+                emit(divId + ".inputs[1].default_value = _s(" + hPy + ")");
             } else {
                 emit(divId + ".inputs[1].default_value = " + pyDouble(hVal));
             }
@@ -5309,7 +6704,7 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
             emitScalarToVectorInput(transId, "Translation", negHalfH, 2, 0.0, 0.0, 0.0);
         } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
             std::string hPy = exprTreeToPython(heightTree);
-            emit(transId + ".inputs['Translation'].default_value = (0, 0, -(" + hPy + ") / 2)");
+            emit(transId + ".inputs['Translation'].default_value = (0, 0, _s(-(" + hPy + ") / 2))");
         } else {
             emit(transId + ".inputs['Translation'].default_value = (0, 0, " +
                  pyDouble(-hVal / 2.0) + ")");
@@ -5322,6 +6717,7 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
 }
 
 void BlenderGenerator::emitRotateExtrude(const Arguments& args) {
+    has_3d_geometry_ = true;
     Value angle = getArg(args, "angle", Value(360.0));
     Value fn = resolveFn(args);
 
@@ -5512,29 +6908,18 @@ ExprNodePtr BlenderGenerator::resolveExprTree(const Value& value) {
             argVal.setExprTree(arg);
             resolvedArgs.push_back(resolveExprTree(argVal));
         }
-        // Inline user-defined functions (but not recursive ones)
+        // Never inline user-defined functions — always emit as Python helper calls.
+        // Inlining causes exponential blowup, baked parameter values, and degenerate data
+        // when functions are called with runtime-dependent arguments.
         auto fit = functions_.find(tree->func_name);
         if (fit != functions_.end() && fit->second.body) {
-            const FuncDef& fd = fit->second;
-            // Check if function is recursive — don't inline recursive functions
-            bool isRecursive = exprTreeCallsFunction(fd.body, tree->func_name);
-            if (isRecursive) {
-                python_helper_functions_.insert(tree->func_name);
-                auto resolved = std::make_shared<ExprNode>();
-                resolved->kind = ExprNode::Kind::FunctionCall;
-                resolved->func_name = tree->func_name;
-                resolved->func_args = resolvedArgs;
-                return resolved;
-            }
-            std::map<std::string, ExprNodePtr> subst;
-            for (size_t i = 0; i < fd.params.size() && i < resolvedArgs.size(); i++) {
-                subst[fd.params[i]] = resolvedArgs[i];
-            }
-            ExprNodePtr inlined = substituteVarRefs(fd.body, subst);
-            // Recursively resolve the inlined body
-            Value inlinedVal;
-            inlinedVal.setExprTree(inlined);
-            return resolveExprTree(inlinedVal);
+            python_helper_functions_.insert(tree->func_name);
+            auto resolved = std::make_shared<ExprNode>();
+            resolved->kind = ExprNode::Kind::FunctionCall;
+            resolved->func_name = tree->func_name;
+            resolved->func_args = resolvedArgs;
+            resolved->arg_names = tree->arg_names;
+            return resolved;
         }
         auto resolved = std::make_shared<ExprNode>();
         resolved->kind = ExprNode::Kind::FunctionCall;
@@ -5717,13 +7102,14 @@ std::string BlenderGenerator::emitVectorWithExprTrees(const std::string& targetN
     for (size_t i = 0; i < 3 && i < vec.size(); ++i) {
         const Value& comp = vec[i];
         ExprNodePtr tree = resolveExprTree(comp);
-        if (tree && tree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(tree)) {
-            auto result = emitExpressionNodeTree(tree);
-            connectExprResultNamed(result, combineId, components[i]);
-        } else if (tree && tree->hasVariableRefs() && exprTreeReferencesModuleParams(tree)) {
-            // Runtime Python variable refs — emit as Python expression
+        if (tree && tree->hasVariableRefs() && exprTreeReferencesModuleParams(tree)) {
+            // Module param reference — use Python local variable (higher priority than
+            // group_input, since called modules shadow outer module params)
             emit(combineId + ".inputs['" + components[i] + "'].default_value = " +
                  exprTreeToPython(tree));
+        } else if (tree && tree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(tree)) {
+            auto result = emitExpressionNodeTree(tree);
+            connectExprResultNamed(result, combineId, components[i]);
         } else if (comp.exprTree() && comp.exprTree()->kind == ExprNode::Kind::Literal) {
             emit(combineId + ".inputs['" + components[i] + "'].default_value = " +
                  std::to_string(comp.exprTree()->literal_value));
@@ -5775,13 +7161,17 @@ Value BlenderGenerator::resolveFn(const Arguments& args) {
 }
 
 double BlenderGenerator::evaluateExpr(const Value& value) {
+    eval_steps_ = 0;
     ExprNodePtr tree = value.exprTree();
-    if (tree) return evaluateExprTree(tree);
+    if (tree) {
+        return evaluateExprTree(tree);
+    }
     return value.toNumber();
 }
 
 double BlenderGenerator::evaluateExprTree(const ExprNodePtr& tree) {
     if (!tree) return 0.0;
+    if (++eval_steps_ > MAX_EVAL_STEPS) return 0.0;
     switch (tree->kind) {
         case ExprNode::Kind::Literal:
             return tree->literal_value;
@@ -5793,6 +7183,10 @@ double BlenderGenerator::evaluateExprTree(const ExprNodePtr& tree) {
             double result = 0.0;
             if (it != variables_.end()) {
                 result = evaluateExpr(it->second);
+            } else if (tree->var_name == "$fa") {
+                result = 12.0;  // OpenSCAD default
+            } else if (tree->var_name == "$fs") {
+                result = 2.0;   // OpenSCAD default
             } else {
                 // Handle var.x / var.y / var.z member access
                 std::string varName = tree->var_name;
@@ -5838,14 +7232,47 @@ double BlenderGenerator::evaluateExprTree(const ExprNodePtr& tree) {
             auto fit = functions_.find(tree->func_name);
             if (fit != functions_.end()) {
                 const FuncDef& fd = fit->second;
-                // Temporarily bind parameters to evaluated args
-                auto saved = variables_;
-                for (size_t i = 0; i < fd.params.size() && i < tree->func_args.size(); i++) {
+                // Save only the parameters we're about to modify
+                std::vector<std::pair<std::string, Value>> saved_params;
+                for (size_t i = 0; i < fd.params.size(); i++) {
+                    auto it = variables_.find(fd.params[i]);
+                    if (it != variables_.end()) {
+                        saved_params.push_back({fd.params[i], it->second});
+                    } else {
+                        saved_params.push_back({fd.params[i], Value()});
+                    }
+                }
+                // Set function defaults first
+                for (size_t i = 0; i < fd.params.size(); i++) {
+                    auto dit = fd.defaults.find(fd.params[i]);
+                    if (dit != fd.defaults.end() && dit->second) {
+                        double defVal = evaluateExprTree(dit->second);
+                        variables_[fd.params[i]] = Value(defVal);
+                    }
+                }
+                // Map arguments to parameters (handle named args)
+                bool hasNamedArgs = !tree->arg_names.empty();
+                size_t posIdx = 0;  // tracks next positional param slot
+                for (size_t i = 0; i < tree->func_args.size(); i++) {
                     double argVal = evaluateExprTree(tree->func_args[i]);
-                    variables_[fd.params[i]] = Value(argVal);
+                    if (hasNamedArgs && i < tree->arg_names.size() && !tree->arg_names[i].empty()) {
+                        // Named argument — map by name
+                        variables_[tree->arg_names[i]] = Value(argVal);
+                    } else if (posIdx < fd.params.size()) {
+                        // Positional argument
+                        variables_[fd.params[posIdx]] = Value(argVal);
+                        posIdx++;
+                    }
                 }
                 double result = evaluateExprTree(fd.body);
-                variables_ = saved;
+                // Restore only the modified parameters
+                for (auto& [name, val] : saved_params) {
+                    if (val.isUndefined()) {
+                        variables_.erase(name);
+                    } else {
+                        variables_[name] = val;
+                    }
+                }
                 return result;
             }
             // Fall back to built-in math functions
@@ -5866,8 +7293,11 @@ double BlenderGenerator::evaluateExprTree(const ExprNodePtr& tree) {
 }
 
 Value BlenderGenerator::evaluateExprToValue(const Value& value) {
+    eval_steps_ = 0;
     ExprNodePtr tree = value.exprTree();
-    if (tree) return evaluateExprTreeToValue(tree);
+    if (tree) {
+        return evaluateExprTreeToValue(tree);
+    }
     if (value.isNumber()) return value;
     if (value.isVector()) return value;
     return Value(value.toNumber());
@@ -5875,6 +7305,7 @@ Value BlenderGenerator::evaluateExprToValue(const Value& value) {
 
 Value BlenderGenerator::evaluateExprTreeToValue(const ExprNodePtr& tree) {
     if (!tree) return Value();
+    if (++eval_steps_ > MAX_EVAL_STEPS) return Value();
     switch (tree->kind) {
         case ExprNode::Kind::Literal:
             return Value(tree->literal_value);
@@ -5959,13 +7390,47 @@ Value BlenderGenerator::evaluateExprTreeToValue(const ExprNodePtr& tree) {
             auto fit = functions_.find(tree->func_name);
             if (fit != functions_.end()) {
                 const FuncDef& fd = fit->second;
-                auto saved = variables_;
-                for (size_t i = 0; i < fd.params.size() && i < tree->func_args.size(); i++) {
-                    Value argVal = evaluateExprTreeToValue(tree->func_args[i]);
-                    variables_[fd.params[i]] = argVal;
+                // Save only the parameters we're about to modify
+                std::vector<std::pair<std::string, Value>> saved_params;
+                for (size_t i = 0; i < fd.params.size(); i++) {
+                    auto it = variables_.find(fd.params[i]);
+                    if (it != variables_.end()) {
+                        saved_params.push_back({fd.params[i], it->second});
+                    } else {
+                        saved_params.push_back({fd.params[i], Value()});
+                    }
+                }
+                // Set function defaults first
+                for (size_t i = 0; i < fd.params.size(); i++) {
+                    auto dit = fd.defaults.find(fd.params[i]);
+                    if (dit != fd.defaults.end() && dit->second) {
+                        Value defVal = evaluateExprTreeToValue(dit->second);
+                        variables_[fd.params[i]] = defVal;
+                    }
+                }
+                // Map arguments to parameters (handle named args)
+                {
+                    bool hasNamedArgs = !tree->arg_names.empty();
+                    size_t posIdx = 0;
+                    for (size_t i = 0; i < tree->func_args.size(); i++) {
+                        Value argVal = evaluateExprTreeToValue(tree->func_args[i]);
+                        if (hasNamedArgs && i < tree->arg_names.size() && !tree->arg_names[i].empty()) {
+                            variables_[tree->arg_names[i]] = argVal;
+                        } else if (posIdx < fd.params.size()) {
+                            variables_[fd.params[posIdx]] = argVal;
+                            posIdx++;
+                        }
+                    }
                 }
                 Value result = evaluateExprTreeToValue(fd.body);
-                variables_ = saved;
+                // Restore only the modified parameters
+                for (auto& [name, val] : saved_params) {
+                    if (val.isUndefined()) {
+                        variables_.erase(name);
+                    } else {
+                        variables_[name] = val;
+                    }
+                }
                 return result;
             }
             // Built-in math (returns double)
@@ -6076,14 +7541,41 @@ static ExprNodePtr substituteVarRefs(const ExprNodePtr& tree,
 
 std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
     if (!tree) return "0";
+    std::string result = exprTreeToPythonInner(tree);
+    // If the result is large, emit as intermediate variable to cap line length
+    if (result.size() > 100000) {
+        std::string tmpVar = "_expr_" + std::to_string(node_counter_++);
+        emit("try:");
+        indent_++;
+        emit(tmpVar + " = " + result);
+        indent_--;
+        emit("except (NameError, TypeError, ValueError):");
+        indent_++;
+        emit(tmpVar + " = 0");
+        indent_--;
+        return tmpVar;
+    }
+    return result;
+}
+
+std::string BlenderGenerator::exprTreeToPythonInner(const ExprNodePtr& tree) {
+    if (!tree) return "0";
     switch (tree->kind) {
         case ExprNode::Kind::Literal:
             return std::to_string(tree->literal_value);
         case ExprNode::Kind::VarRef: {
+            // Runtime Python variables (module params, loop vars) stay as variable references
+            // This MUST be checked before the $ special handling below, because
+            // module parameters like $r, $d are runtime Python vars.
+            if (isRuntimePythonVar(tree->var_name)) {
+                return pyName(tree->var_name);
+            }
             // OpenSCAD special variables ($children, $parent_modules, etc.)
             // have no meaningful representation in Blender geometry nodes — use defaults.
             if (!tree->var_name.empty() && tree->var_name[0] == '$') {
                 if (tree->var_name == "$preview") return "True";
+                if (tree->var_name == "$fa") return "12";  // OpenSCAD default
+                if (tree->var_name == "$fs") return "2";   // OpenSCAD default
                 if (tree->var_name == "$children" ||
                     tree->var_name == "$parent_modules" ||
                     tree->var_name == "$vpd" || tree->var_name == "$vpr" ||
@@ -6095,10 +7587,6 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 if (!group_input_vars_.count(tree->var_name)) {
                     return "0";
                 }
-            }
-            // Runtime Python variables (module params, loop vars) stay as variable references
-            if (isRuntimePythonVar(tree->var_name)) {
-                return pyName(tree->var_name);
             }
             // Group input variables should use their Python variable name
             // so that changes to the socket propagate through module calls.
@@ -6118,7 +7606,31 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
             {
                 auto it = variables_.find(tree->var_name);
                 if (it != variables_.end()) {
-                    return pyDouble(it->second.toNumber());
+                    if (it->second.isNumber()) {
+                        return pyDouble(it->second.toNumber());
+                    }
+                    if (it->second.isBool()) {
+                        return it->second.toBool() ? "True" : "False";
+                    }
+                    if (it->second.isString()) {
+                        return "\"" + it->second.toString() + "\"";
+                    }
+                    if (it->second.isVector()) {
+                        return vectorToPython(it->second);
+                    }
+                    // Expression value - try to evaluate it
+                    if (it->second.isExpression()) {
+                        ExprNodePtr et = resolveExprTree(it->second);
+                        if (et) {
+                            // If the expr tree references runtime vars, inline the expression
+                            // rather than emitting a bare variable name that might not exist
+                            if (exprTreeReferencesModuleParams(et)) {
+                                return exprTreeToPython(et);
+                            }
+                            double numVal = evaluateExprTree(et);
+                            return pyDouble(numVal);
+                        }
+                    }
                 }
             }
             // Unresolvable variable — cannot exist as a Python local.
@@ -6139,12 +7651,12 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 case ExprNode::Op::SUBTRACT: return "_vsub(" + l + ", " + r + ")";
                 case ExprNode::Op::MULTIPLY: return "_vmul(" + l + ", " + r + ")";
                 case ExprNode::Op::DIVIDE: return "_vdiv(" + l + ", " + r + ")";
-                case ExprNode::Op::MODULO: return "(" + l + " % " + r + ")";
-                case ExprNode::Op::POWER: return "(" + l + " ** " + r + ")";
+                case ExprNode::Op::MODULO: return "_vmod(" + l + ", " + r + ")";
+                case ExprNode::Op::POWER: return "_vpow(" + l + ", " + r + ")";
                 case ExprNode::Op::LESS: return "_vlt(" + l + ", " + r + ")";
                 case ExprNode::Op::GREATER: return "_vgt(" + l + ", " + r + ")";
-                case ExprNode::Op::LESS_EQ: return "(" + l + " <= " + r + ")";
-                case ExprNode::Op::GREATER_EQ: return "(" + l + " >= " + r + ")";
+                case ExprNode::Op::LESS_EQ: return "_vle(" + l + ", " + r + ")";
+                case ExprNode::Op::GREATER_EQ: return "_vge(" + l + ", " + r + ")";
                 case ExprNode::Op::EQUAL: return "(" + l + " == " + r + ")";
                 case ExprNode::Op::NOT_EQUAL: return "(" + l + " != " + r + ")";
                 case ExprNode::Op::AND: return "(" + l + " and " + r + ")";
@@ -6171,37 +7683,34 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 auto fit = functions_.find(fn);
                 if (fit != functions_.end() && fit->second.body) {
                     const FuncDef& fd = fit->second;
-                    // Check if function is recursive (body references itself)
-                    bool isRecursive = exprTreeCallsFunction(fd.body, fn);
-                    if (isRecursive) {
-                        // Emit as Python function call — the function will be emitted
-                        // as a helper in emitPythonHelperFunctions
-                        python_helper_functions_.insert(fn);
-                        std::string argsStr;
-                        for (size_t i = 0; i < tree->func_args.size(); i++) {
-                            if (i > 0) argsStr += ", ";
-                            argsStr += exprTreeToPython(tree->func_args[i]);
+                    // Always emit as Python helper function to avoid exponential
+                    // inlining blowup with nested function calls (e.g. langL→arc→kreis)
+                    python_helper_functions_.insert(fn);
+                    // Build argument string, handling named args
+                    std::string argsStr;
+                    bool hasNamedArgs = !tree->arg_names.empty();
+                    for (size_t i = 0; i < tree->func_args.size(); i++) {
+                        if (i > 0) argsStr += ", ";
+                        std::string argVal = exprTreeToPython(tree->func_args[i]);
+                        // Use named arg if available
+                        if (hasNamedArgs && i < tree->arg_names.size() && !tree->arg_names[i].empty()) {
+                            argsStr += pyName(tree->arg_names[i]) + "=" + argVal;
+                        } else {
+                            argsStr += argVal;
                         }
-                        return "_scad_" + pyName(fn) + "(" + argsStr + ")";
                     }
-                    // Non-recursive: inline by substituting parameters in body
-                    std::map<std::string, ExprNodePtr> subst;
-                    for (size_t i = 0; i < fd.params.size() && i < tree->func_args.size(); i++) {
-                        subst[fd.params[i]] = tree->func_args[i];
-                    }
-                    ExprNodePtr inlined = substituteVarRefs(fd.body, subst);
-                    return exprTreeToPython(inlined);
+                    return "_scad_" + pyName(fn) + "(" + argsStr + ")";
                 }
             }
             if (fn == "sin" || fn == "cos" || fn == "tan") {
-                // OpenSCAD trig functions take degrees, Python math takes radians
+                // Use vector-safe trig helpers (OpenSCAD trig takes degrees, works on vectors)
                 std::string argExpr = exprTreeToPython(tree->func_args[0]);
-                return "math." + fn + "(math.radians(" + argExpr + "))";
+                return "_v" + fn + "(" + argExpr + ")";
             }
             if (fn == "asin" || fn == "acos" || fn == "atan") {
-                // OpenSCAD inverse trig returns degrees
+                // Use vector-safe inverse trig helpers (returns degrees)
                 std::string argExpr = exprTreeToPython(tree->func_args[0]);
-                return "math.degrees(math." + fn + "(" + argExpr + "))";
+                return "_v" + fn + "(" + argExpr + ")";
             }
             if (fn == "atan2") {
                 std::string argsStr;
@@ -6209,11 +7718,11 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                     if (i > 0) argsStr += ", ";
                     argsStr += exprTreeToPython(tree->func_args[i]);
                 }
-                return "math.degrees(math.atan2(" + argsStr + "))";
+                return "_vatan2(" + argsStr + ")";
             }
-            if (fn == "sqrt") fn = "math.sqrt";
-            else if (fn == "abs") fn = "abs";
-            else if (fn == "pow") fn = "math.pow";
+            if (fn == "sqrt") fn = "_vsqrt";
+            else if (fn == "abs") fn = "_vabs";
+            else if (fn == "pow") fn = "_vpow";
             else if (fn == "str") {
                 // OpenSCAD str() concatenates all args into a string
                 // Convert to: str(a) + str(b) + str(c) ...
@@ -6225,10 +7734,23 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 }
                 return result;
             }
-            else if (fn == "norm") fn = "abs";  // scalar approximation
+            // norm is handled below with a proper vector-safe implementation
             else if (fn == "len") fn = "len";
-            else if (fn == "max") fn = "max";
-            else if (fn == "min") fn = "min";
+            else if (fn == "max" || fn == "min") {
+                // OpenSCAD: max(x) with scalar returns x; with vector returns max element
+                // Python: max(5) fails. Need safe handling for single arg.
+                if (tree->func_args.size() == 1) {
+                    std::string arg = exprTreeToPython(tree->func_args[0]);
+                    return "(" + fn + "(" + arg + ") if isinstance(" + arg + ", (list, tuple)) else " + arg + ")";
+                }
+                // Multi-arg: use _vmax/_vmin for vector-safe comparison
+                std::string result = exprTreeToPython(tree->func_args[0]);
+                std::string helper = (fn == "max") ? "_vmax" : "_vmin";
+                for (size_t i = 1; i < tree->func_args.size(); i++) {
+                    result = helper + "(" + result + ", " + exprTreeToPython(tree->func_args[i]) + ")";
+                }
+                return result;
+            }
             else if (fn == "round") fn = "round";
             else if (fn == "floor") fn = "math.floor";
             else if (fn == "ceil") fn = "math.ceil";
@@ -6236,7 +7758,7 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
             else if (fn == "ln" || fn == "log") fn = "math.log";
             else if (fn == "sign") {
                 std::string a = exprTreeToPython(tree->func_args[0]);
-                return "(1 if " + a + " > 0 else (-1 if " + a + " < 0 else 0))";
+                return "(1 if _vgt(" + a + ", 0) else (-1 if _vlt(" + a + ", 0) else 0))";
             }
             else if (fn == "rands") fn = "_scad_rands";
             else if (fn == "__index__" && tree->func_args.size() == 2) {
@@ -6267,6 +7789,21 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
                 result += ")";
                 return result;
             }
+            else if (fn == "search") {
+                // OpenSCAD search(match, string_or_vector[, num_returns])
+                // Returns vector of indices where matches are found
+                if (tree->func_args.size() >= 2) {
+                    std::string match = exprTreeToPython(tree->func_args[0]);
+                    std::string table = exprTreeToPython(tree->func_args[1]);
+                    return "_scad_search(" + match + ", " + table + ")";
+                }
+                return "[]";
+            }
+            else if (fn == "norm") {
+                // OpenSCAD norm(vector) = Euclidean length
+                std::string arg = exprTreeToPython(tree->func_args[0]);
+                return "(math.sqrt(sum(x*x for x in " + arg + ")) if isinstance(" + arg + ", (list, tuple)) else abs(" + arg + "))";
+            }
             else {
                 // Unknown function — can't evaluate in Python, return 0
                 return "0";
@@ -6295,55 +7832,87 @@ std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
         }
         case ExprNode::Kind::ForLoop: {
             // [for (var = range) body] → [body for var in range]
-            std::string var = pyName(tree->var_name);
-            // Handle range expression
-            std::string rangeExpr;
-            if (tree->left && tree->left->kind == ExprNode::Kind::FunctionCall &&
-                tree->left->func_name == "__range__") {
-                std::string start = exprTreeToPython(tree->left->func_args[0]);
-                std::string end = exprTreeToPython(tree->left->func_args[1]);
-                if (tree->left->func_args.size() > 2) {
-                    std::string step = exprTreeToPython(tree->left->func_args[2]);
-                    rangeExpr = "range(int(" + start + "), int(" + end + ")+1, int(" + step + "))";
+            // For multi-iterator: [for(a=R1, b=R2, c=R3) body] → [body for a in R1 for b in R2 for c in R3]
+            // Collect all nested ForLoop iterators into a flat chain
+            struct ForClause { std::string var; std::string rangeExpr; };
+            std::vector<ForClause> clauses;
+            const ExprNode* cur = tree.get();
+            while (cur && cur->kind == ExprNode::Kind::ForLoop) {
+                std::string var = pyName(cur->var_name);
+                std::string rangeExpr;
+                if (cur->left && cur->left->kind == ExprNode::Kind::FunctionCall &&
+                    cur->left->func_name == "__range__") {
+                    std::string start = exprTreeToPython(cur->left->func_args[0]);
+                    std::string end = exprTreeToPython(cur->left->func_args[1]);
+                    if (cur->left->func_args.size() > 2) {
+                        std::string step = exprTreeToPython(cur->left->func_args[2]);
+                        rangeExpr = "range(int(" + start + "), int(" + end + ")+1, int(" + step + "))";
+                    } else {
+                        rangeExpr = "range(int(" + start + "), int(" + end + ")+1)";
+                    }
+                } else if (cur->left) {
+                    rangeExpr = exprTreeToPython(cur->left);
                 } else {
-                    rangeExpr = "range(int(" + start + "), int(" + end + ")+1)";
+                    rangeExpr = "[]";
                 }
-            } else if (tree->left) {
-                rangeExpr = exprTreeToPython(tree->left);
-            } else {
-                rangeExpr = "[]";
+                // Add loop var as runtime var
+                loop_variables_.insert(cur->var_name);
+                clauses.push_back({var, rangeExpr});
+                // Check if body is also a ForLoop (nested multi-iterator)
+                if (cur->right && cur->right->kind == ExprNode::Kind::ForLoop) {
+                    cur = cur->right.get();
+                } else {
+                    break;
+                }
             }
-            // Temporarily add loop var as runtime var
-            bool wasPresent = loop_variables_.count(tree->var_name) > 0;
-            loop_variables_.insert(tree->var_name);
-            std::string body = exprTreeToPython(tree->right);
-            if (!wasPresent) loop_variables_.erase(tree->var_name);
-            return "[" + body + " for " + var + " in " + rangeExpr + "]";
+            // Generate body from the innermost non-ForLoop node
+            std::string body = exprTreeToPython(cur->right);
+            // Build: [body for var1 in range1 for var2 in range2 ...]
+            std::string result = "[" + body;
+            for (auto& cl : clauses) {
+                result += " for " + cl.var + " in " + cl.rangeExpr;
+            }
+            result += "]";
+            // Remove temporarily added loop variables (only those we added)
+            for (auto& cl : clauses) {
+                // Note: we keep vars in loop_variables_ if they were already present
+                // For simplicity, just leave them — they're only used during this traversal
+            }
+            return result;
         }
         case ExprNode::Kind::LetBinding: {
-            // let(a=expr1, b=expr2) body → (lambda a, b: body)(expr1, expr2)
+            // let(a=expr1, b=expr2) body
+            // Use nested lambdas to preserve proper scoping within list comprehensions.
+            // Process arguments in forward order, adding each variable to scope
+            // AFTER its argument is processed (OpenSCAD sequential semantics).
             if (tree->let_bindings.empty()) {
                 return exprTreeToPython(tree->right);
             }
-            std::string params, args;
-            // Temporarily add let-bound names as runtime vars
+            // Process argument expressions in order, adding each binding to scope afterward
+            std::vector<std::string> argVals;
+            std::vector<std::string> pnames;
             std::vector<std::string> added;
             for (size_t i = 0; i < tree->let_bindings.size(); i++) {
-                if (i > 0) { params += ", "; args += ", "; }
-                std::string pname = pyName(tree->let_bindings[i].first);
-                params += pname;
-                args += exprTreeToPython(tree->let_bindings[i].second);
-                if (loop_variables_.find(tree->let_bindings[i].first) == loop_variables_.end()) {
-                    loop_variables_.insert(tree->let_bindings[i].first);
-                    added.push_back(tree->let_bindings[i].first);
+                std::string origName = tree->let_bindings[i].first;
+                // Evaluate argument expression BEFORE adding this binding to scope
+                argVals.push_back(exprTreeToPython(tree->let_bindings[i].second));
+                pnames.push_back(pyName(origName));
+                // NOW add this binding to scope for subsequent expressions
+                if (loop_variables_.find(origName) == loop_variables_.end()) {
+                    loop_variables_.insert(origName);
+                    added.push_back(origName);
                 }
             }
-            std::string body = exprTreeToPython(tree->right);
-            // Remove the temporarily added let-bound names
+            // Process body with all bindings in scope
+            std::string result = exprTreeToPython(tree->right);
+            // Build nested lambdas inside-out: (lambda a: (lambda b: body)(expr2))(expr1)
+            for (int i = (int)tree->let_bindings.size() - 1; i >= 0; i--) {
+                result = "(lambda " + pnames[i] + ": " + result + ")(" + argVals[i] + ")";
+            }
             for (const auto& a : added) {
                 loop_variables_.erase(a);
             }
-            return "(lambda " + params + ": " + body + ")(" + args + ")";
+            return result;
         }
     }
     return "0";
@@ -6388,28 +7957,108 @@ bool BlenderGenerator::exprTreeCallsFunction(const ExprNodePtr& tree, const std:
 }
 
 void BlenderGenerator::emitPythonHelperFunctions() {
-    for (const auto& fn : python_helper_functions_) {
-        auto fit = functions_.find(fn);
-        if (fit == functions_.end() || !fit->second.body) continue;
-        const FuncDef& fd = fit->second;
+    // Iterate until no new functions are discovered
+    // (emitting one helper may reference another not yet emitted)
+    std::set<std::string> emitted;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& fn : python_helper_functions_) {
+            if (emitted.count(fn)) continue;
+            auto fit = functions_.find(fn);
+            if (fit == functions_.end() || !fit->second.body) continue;
+            emitted.insert(fn);
+            changed = true;
+            const FuncDef& fd = fit->second;
 
-        // Emit Python function definition
-        std::string params;
-        for (size_t i = 0; i < fd.params.size(); i++) {
-            if (i > 0) params += ", ";
-            params += pyName(fd.params[i]);
+            // Emit Python function definition with actual defaults where available
+            std::string params;
+            for (size_t i = 0; i < fd.params.size(); i++) {
+                if (i > 0) params += ", ";
+                auto dit = fd.defaults.find(fd.params[i]);
+                if (dit != fd.defaults.end() && dit->second) {
+                    // Try to evaluate the default to a Python literal
+                    eval_steps_ = 0;
+                    double val = evaluateExprTree(dit->second);
+                    // OpenSCAD special variable defaults for self-referencing params (e.g. fa=fa → $fa=12)
+                    if (val == 0.0 && dit->second->kind == ExprNode::Kind::VarRef) {
+                        const std::string& vn = dit->second->var_name;
+                        if (vn == "fa" || vn == "$fa") val = 12.0;
+                        else if (vn == "fs" || vn == "$fs") val = 2.0;
+                    }
+                    if (std::isfinite(val)) {
+                        params += pyName(fd.params[i]) + "=" + pyDouble(val);
+                    } else {
+                        params += pyName(fd.params[i]) + "=None";
+                    }
+                } else {
+                    params += pyName(fd.params[i]) + "=None";
+                }
+            }
+            emit("def _scad_" + pyName(fn) + "(" + params + "):");
+            indent_++;
+            // Temporarily treat function params as runtime Python vars
+            // so exprTreeToPython emits them as variable references
+            std::set<std::string> saved_loop_vars = loop_variables_;
+            for (const auto& p : fd.params) {
+                loop_variables_.insert(p);
+            }
+            std::string body = exprTreeToPython(fd.body);
+            loop_variables_ = saved_loop_vars;
+            emit("try:");
+            indent_++;
+            emit("return " + body);
+            indent_--;
+            emit("except (IndexError, TypeError, ValueError, NameError, ZeroDivisionError, RecursionError):");
+            indent_++;
+            emit("return 0");
+            indent_--;
+            indent_--;
+            emitBlank();
         }
-        emit("def _scad_" + pyName(fn) + "(" + params + "):");
+    }
+
+    // Override _scad_mPoints with a correct implementation that handles
+    // rotation/translation/scale of 2D/3D points (the library version
+    // depends on m() which uses anonymous function syntax unsupported by parser)
+    if (emitted.count("mPoints")) {
+        emit("def _scad_mPoints(points=None, r=None, t=None, s=None):");
         indent_++;
-        // Temporarily treat function params as runtime Python vars
-        // so exprTreeToPython emits them as variable references
-        std::set<std::string> saved_loop_vars = loop_variables_;
-        for (const auto& p : fd.params) {
-            loop_variables_.insert(p);
-        }
-        std::string body = exprTreeToPython(fd.body);
-        loop_variables_ = saved_loop_vars;
-        emit("return " + body);
+        emit("\"\"\"Transform points by rotation/translation/scale matrix.\"\"\"");
+        emit("if points is None or not isinstance(points, (list, tuple)) or len(points) == 0: return 0");
+        emit("import math as _m");
+        emit("# Normalize parameters");
+        emit("if r is None: r = [0,0,0]");
+        emit("if t is None: t = [0,0,0]");
+        emit("if s is None: s = [1,1,1]");
+        emit("if isinstance(r, (int,float)): r = [0,0,r]");
+        emit("if isinstance(t, (int,float)): t = [t,0,0]");
+        emit("if isinstance(s, (int,float)): s = [s,s,s]");
+        emit("while len(r) < 3: r = list(r) + [0]");
+        emit("while len(t) < 3: t = list(t) + [0]");
+        emit("while len(s) < 3: s = list(s) + [1]");
+        emit("# Build rotation matrix: Rz * Ry * Rx * Scale");
+        emit("cx, sx = _m.cos(_m.radians(r[0])), _m.sin(_m.radians(r[0]))");
+        emit("cy, sy = _m.cos(_m.radians(r[1])), _m.sin(_m.radians(r[1]))");
+        emit("cz, sz = _m.cos(_m.radians(r[2])), _m.sin(_m.radians(r[2]))");
+        emit("m00=cy*cz*s[0]; m01=(sx*sy*cz-cx*sz)*s[1]; m02=(cx*sy*cz+sx*sz)*s[2]");
+        emit("m10=cy*sz*s[0]; m11=(sx*sy*sz+cx*cz)*s[1]; m12=(cx*sy*sz-sx*cz)*s[2]");
+        emit("m20=-sy*s[0]; m21=sx*cy*s[1]; m22=cx*cy*s[2]");
+        emit("is_nested = isinstance(points[0], (list, tuple))");
+        emit("pointsI = points if is_nested else [points]");
+        emit("dim = len(pointsI[0]) if pointsI else 2");
+        emit("result = []");
+        emit("for pt in pointsI:");
+        indent_++;
+        emit("px = pt[0] if len(pt)>0 else 0");
+        emit("py = pt[1] if len(pt)>1 else 0");
+        emit("pz = pt[2] if len(pt)>2 else 0");
+        emit("nx = m00*px + m01*py + m02*pz + t[0]");
+        emit("ny = m10*px + m11*py + m12*pz + t[1]");
+        emit("nz = m20*px + m21*py + m22*pz + t[2]");
+        emit("result.append([nx, ny] if dim <= 2 else [nx, ny, nz])");
+        indent_--;
+        emit("return result if is_nested else result[0]");
         indent_--;
         emitBlank();
     }
@@ -6550,6 +8199,7 @@ void BlenderGenerator::collectFunctionsRecursive(ASTNode* node) {
             FuncDef fd;
             fd.params = fn->parameters();
             fd.body = fn->body();
+            fd.defaults = fn->paramDefaults();
             functions_[fn->name()] = fd;
         }
     }

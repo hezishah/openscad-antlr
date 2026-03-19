@@ -234,6 +234,8 @@ std::string Value::toPython() const {
                 {"$vpt", "0"},
                 {"$preview", "True"},
                 {"$t", "0"},
+                {"$fa", "12"},
+                {"$fs", "2"},
                 {nullptr, nullptr}
             };
             for (auto* sv = specialVarDefaults; sv->var; ++sv) {
