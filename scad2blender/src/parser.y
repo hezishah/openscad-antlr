@@ -106,6 +106,11 @@ static std::vector<bool> g_in_module_def_stack;
 static std::set<std::string> g_module_literal_vars;
 static std::vector<std::set<std::string>> g_module_literal_vars_stack;
 
+// Track top-level (global) variables. When referenced inside module bodies,
+// these produce VarRef expression trees so the code generator can link them
+// to group_input sockets instead of hardcoding values.
+static std::set<std::string> g_top_level_vars;
+
 // Ordered let-binding capture: argument_list appends entries here
 // so that the let() rule can reconstruct insertion order
 static std::vector<std::pair<std::string, Value>> g_ordered_args;
@@ -1088,6 +1093,16 @@ void prescan_variables(FILE* f) {
         set_variable("$children", Value(0.0));
     // OpenSCAD built-in constants
     set_variable("PI", Value(M_PI));
+
+    // Record all variables set so far as top-level globals.
+    // Inside module bodies, references to these will produce VarRef expression
+    // trees so the code generator can link them to group_input sockets.
+    auto& scope = current_scope();
+    for (const auto& kv : scope) {
+        if (kv.first[0] != '$' && kv.first != "PI") {  // skip special vars and constants
+            g_top_level_vars.insert(kv.first);
+        }
+    }
 }
 
 static void prescan_variables_internal(FILE* f, const std::string& file_dir) {
@@ -2346,19 +2361,20 @@ expr:
                     v.exprTree()->kind == ExprNode::Kind::VarRef &&
                     !v.exprTree()->left && !v.exprTree()->right;
                 if (!isBareVarRef) {
-                    // Check if this is a module-local literal variable that should
-                    // be treated as symbolic for parametric group_input linking
-                    if (g_module_literal_vars.count(*$1)) {
+                    // Check if this is a module-local literal variable or a top-level
+                    // global variable that should be treated as symbolic for parametric
+                    // group_input linking
+                    if (g_module_literal_vars.count(*$1) || g_top_level_vars.count(*$1)) {
                         // Return as VarRef expression (like a module parameter)
                         auto tree = ExprNode::makeVarRef(*$1);
                         $$ = new Value(Value::expressionWithTree(*$1, tree));
                         delete $1;
                     } else if (v.exprTree() && v.exprTree()->hasVariableRefs()) {
-                        // Expression depends on runtime variables (module params, loop vars).
-                        // Return as VarRef to avoid inlining the full expression tree — the
-                        // variable will be emitted as a Python assignment statement.
-                        auto tree = ExprNode::makeVarRef(*$1);
-                        $$ = new Value(Value::expressionWithTree(*$1, tree));
+                        // Expression depends on runtime variables (module params, loop vars,
+                        // or group_input vars).  Inline the expression tree so that nested
+                        // modules (where variables_ is saved/restored) still have the full
+                        // expression rather than a bare VarRef that can't be resolved.
+                        $$ = new Value(v);
                         delete $1;
                     } else {
                     // Concrete value — return it with its expression tree

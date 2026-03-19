@@ -153,26 +153,56 @@ static std::string readFile(const std::string& path) {
                         std::istreambuf_iterator<char>());
 }
 
-// Rename identifiers that start with a digit (e.g., "12ptStar") to "_12ptStar"
+// Rename identifiers that start with a digit (e.g., "12ptStar", "2D") to "_12ptStar", "_2D"
 // OpenSCAD allows this but our parser doesn't, so we fix it in preprocessing.
 static std::string fixDigitPrefixedNames(const std::string& content) {
-    // Match: "module <digit>..." and function calls to digit-prefixed names
-    std::regex moduleDigitName(R"(\bmodule\s+(\d))");
-    std::string result = std::regex_replace(content, moduleDigitName, "module _$1");
-    // Also fix calls to these renamed modules (standalone identifier starting with digit followed by '(')
-    // We need to find all digit-prefixed module names first
-    std::regex moduleDefPattern(R"(\bmodule\s+_(\d\w*)\s*\()");
-    std::smatch match;
-    std::set<std::string> digitModules;
-    std::string tmp = result;
-    while (std::regex_search(tmp, match, moduleDefPattern)) {
-        digitModules.insert(match[1].str());
-        tmp = match.suffix().str();
+    // Collect all digit-prefixed identifiers (digit(s) followed by letter(s))
+    // by scanning character-by-character to avoid regex lookbehind issues
+    std::set<std::string> digitIds;
+    for (size_t i = 0; i < content.size(); ) {
+        // Skip if preceded by a word character (part of a larger identifier like "needs2D")
+        if (i > 0 && (std::isalnum(content[i-1]) || content[i-1] == '_')) {
+            i++;
+            continue;
+        }
+        if (std::isdigit(content[i])) {
+            size_t start = i;
+            while (i < content.size() && std::isdigit(content[i])) i++;
+            if (i < content.size() && (std::isalpha(content[i]) || content[i] == '_')) {
+                // Has letter after digits — this is a digit-prefixed identifier
+                while (i < content.size() && (std::isalnum(content[i]) || content[i] == '_')) i++;
+                digitIds.insert(content.substr(start, i - start));
+            }
+            // else: just a plain number, skip
+        } else {
+            i++;
+        }
     }
-    // Replace calls: "12ptStar(" -> "_12ptStar("
-    for (const auto& name : digitModules) {
-        std::regex callPattern("\\b(" + name + ")\\s*\\(");
-        result = std::regex_replace(result, callPattern, "_$1(");
+
+    if (digitIds.empty()) return content;
+
+    // Build result by replacing digit-prefixed identifiers with _prefix version
+    std::string result;
+    result.reserve(content.size() + digitIds.size() * 100);
+    for (size_t i = 0; i < content.size(); ) {
+        // Check if preceded by a word character
+        bool preceded = (i > 0 && (std::isalnum(content[i-1]) || content[i-1] == '_'));
+        if (!preceded && std::isdigit(content[i])) {
+            size_t start = i;
+            while (i < content.size() && std::isdigit(content[i])) i++;
+            if (i < content.size() && (std::isalpha(content[i]) || content[i] == '_')) {
+                while (i < content.size() && (std::isalnum(content[i]) || content[i] == '_')) i++;
+                std::string token = content.substr(start, i - start);
+                if (digitIds.count(token)) {
+                    result += '_';
+                }
+                result += token;
+            } else {
+                result += content.substr(start, i - start);
+            }
+        } else {
+            result += content[i++];
+        }
     }
     return result;
 }

@@ -963,9 +963,13 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
             params += ", " + p + "=" + defaultStr;
         }
     }
-    // Add captured parent module params to signature
+    // Add captured parent module params to signature (skip duplicates of own params)
+    std::set<std::string> ownParams;
+    for (const auto& p : node.parameters()) ownParams.insert(pyName(p));
     for (const auto& cp : captured_params) {
-        params += ", " + cp + "=0.0";
+        if (ownParams.count(cp) == 0) {
+            params += ", " + cp + "=0.0";
+        }
     }
     params += ", children_geo=None";
 
@@ -1280,9 +1284,8 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
     if (!variables_.empty()) {
         // Snapshot to avoid iterator invalidation during iteration
         std::vector<std::pair<std::string, Value>> varSnapshot(variables_.begin(), variables_.end());
-        // If there are Python helper functions, declare top-level vars as global
-        // so the helper functions can access them
-        if (!python_helper_functions_.empty()) {
+        // Declare top-level vars as global so module functions can access them
+        if (!top_level_vars_.empty()) {
             std::string globalDecl = "global ";
             bool first = true;
             for (const auto& [name, value] : varSnapshot) {
@@ -1294,9 +1297,11 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
             if (!first) emit(globalDecl);
         }
         emit("# Python variables for group_input parameters");
+        // First pass: emit base variables (non-expression types — these have group_input sockets)
         for (const auto& [name, value] : varSnapshot) {
             // Only process top-level variables, not module-internal ones
             if (top_level_vars_.find(name) == top_level_vars_.end()) continue;
+            if (value.isExpression()) continue;  // defer to second pass
 
             std::string varName = pyName(name);
             if (value.isUndefined()) {
@@ -1317,13 +1322,23 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
                 if (value.size() == 1) vecVal += ",";
                 vecVal += ")";
                 emit(varName + " = " + vecVal);
-            } else if (value.isExpression()) {
-                // Try to evaluate expression to a concrete value
-                double v = evaluateExpr(value);
-                emit(varName + " = " + pyDouble(v));
             } else {
                 // Fallback for any unhandled types — emit None to prevent NameError
                 emit(varName + " = None  # unhandled type: " + std::to_string(static_cast<int>(value.type())));
+            }
+        }
+        // Second pass: emit derived variables (expression types — computed from base variables)
+        for (const auto& [name, value] : varSnapshot) {
+            if (top_level_vars_.find(name) == top_level_vars_.end()) continue;
+            if (!value.isExpression()) continue;
+
+            std::string varName = pyName(name);
+            ExprNodePtr tree = resolveExprTree(value);
+            if (tree && tree->hasVariableRefs()) {
+                emit(varName + " = " + exprTreeToPython(tree));
+            } else {
+                double v = evaluateExpr(value);
+                emit(varName + " = " + pyDouble(v));
             }
         }
         emitBlank();
@@ -3290,9 +3305,10 @@ void BlenderGenerator::visit(AssignmentNode& node) {
             // Undefined values become 0 to avoid None in arithmetic
             emit(pyName(node.name()) + " = 0");
         } else if (val.isExpression()) {
-            // Check if expression tree references runtime vars (module params, loop vars)
+            // Check if expression tree references runtime vars (module params, loop vars, or group_input globals)
             ExprNodePtr tree = resolveExprTree(val);
-            if (tree && exprTreeReferencesModuleParams(tree)) {
+            bool hasRuntimeRefs = tree && (exprTreeReferencesModuleParams(tree) || tree->hasVariableRefs());
+            if (hasRuntimeRefs) {
                 std::string pyExpr = exprTreeToPython(tree);
                 emit(pyName(node.name()) + " = " + pyExpr);
                 // Track this variable as a runtime variable since it depends on runtime vars
@@ -3306,21 +3322,21 @@ void BlenderGenerator::visit(AssignmentNode& node) {
             // Use the overall vector exprTree (VectorLiteral) if available,
             // as individual element Values may have been resolved away
             ExprNodePtr vecTree = val.exprTree();
-            bool hasModuleParamRef = false;
-            if (vecTree && exprTreeReferencesModuleParams(vecTree)) {
-                hasModuleParamRef = true;
+            bool hasRuntimeRef = false;
+            if (vecTree && (exprTreeReferencesModuleParams(vecTree) || vecTree->hasVariableRefs())) {
+                hasRuntimeRef = true;
             }
-            if (!hasModuleParamRef) {
+            if (!hasRuntimeRef) {
                 // Also check individual element trees
                 for (size_t i = 0; i < val.size(); ++i) {
                     ExprNodePtr et = val[i].exprTree();
-                    if (et && exprTreeReferencesModuleParams(et)) {
-                        hasModuleParamRef = true;
+                    if (et && (exprTreeReferencesModuleParams(et) || et->hasVariableRefs())) {
+                        hasRuntimeRef = true;
                         break;
                     }
                 }
             }
-            if (hasModuleParamRef) {
+            if (hasRuntimeRef) {
                 // Emit as Python tuple with runtime expressions
                 if (vecTree && vecTree->kind == ExprNode::Kind::BinaryOp &&
                     (vecTree->op == ExprNode::Op::ADD || vecTree->op == ExprNode::Op::SUBTRACT)) {
@@ -3374,7 +3390,7 @@ void BlenderGenerator::visit(AssignmentNode& node) {
                         if (i > 0) vecStr += ", ";
                         // Use element tree from VectorLiteral if available
                         ExprNodePtr et = (i < elemTrees.size()) ? elemTrees[i] : val[i].exprTree();
-                        if (et && exprTreeReferencesModuleParams(et)) {
+                        if (et && (exprTreeReferencesModuleParams(et) || et->hasVariableRefs())) {
                             vecStr += exprTreeToPython(et);
                         } else if (et) {
                             // Non-module-param expression tree — evaluate to constant
@@ -7541,18 +7557,34 @@ static ExprNodePtr substituteVarRefs(const ExprNodePtr& tree,
 
 std::string BlenderGenerator::exprTreeToPython(const ExprNodePtr& tree) {
     if (!tree) return "0";
+    if (expr_depth_ > 50) return "0";
+
+    // Avoid exponential blowup on shared expression nodes:
+    // If a node is referenced multiple times, cache its result
+    ExprNode* raw = tree.get();
+    if (tree.use_count() > 2) {
+        auto it = expr_cache_.find(raw);
+        if (it != expr_cache_.end()) return it->second;
+    }
+
+    expr_depth_++;
     std::string result = exprTreeToPythonInner(tree);
-    // If the result is large, emit as intermediate variable to cap line length
-    if (result.size() > 100000) {
+    expr_depth_--;
+
+    // Cache shared nodes
+    if (tree.use_count() > 2) {
+        expr_cache_[raw] = result;
+    }
+
+    // If the result is large, emit as intermediate variable to avoid
+    // Python's "too many nested parentheses" limit
+    if (result.size() > 2000) {
         std::string tmpVar = "_expr_" + std::to_string(node_counter_++);
-        emit("try:");
-        indent_++;
         emit(tmpVar + " = " + result);
-        indent_--;
-        emit("except (NameError, TypeError, ValueError):");
-        indent_++;
-        emit(tmpVar + " = 0");
-        indent_--;
+        // Update cache to use the variable name for future references
+        if (tree.use_count() > 2) {
+            expr_cache_[raw] = tmpVar;
+        }
         return tmpVar;
     }
     return result;
@@ -7590,16 +7622,8 @@ std::string BlenderGenerator::exprTreeToPythonInner(const ExprNodePtr& tree) {
             }
             // Group input variables should use their Python variable name
             // so that changes to the socket propagate through module calls.
-            // But inside module function bodies, these variables don't exist as
-            // Python locals — resolve to their concrete values instead.
+            // These are Python globals set in build_geometry, accessible from module functions.
             if (group_input_vars_.count(tree->var_name)) {
-                if (in_module_) {
-                    auto it = variables_.find(tree->var_name);
-                    if (it != variables_.end()) {
-                        return pyDouble(it->second.toNumber());
-                    }
-                    return "0";
-                }
                 return pyName(tree->var_name);
             }
             // If the variable can be resolved to a concrete value, use that
@@ -7622,9 +7646,9 @@ std::string BlenderGenerator::exprTreeToPythonInner(const ExprNodePtr& tree) {
                     if (it->second.isExpression()) {
                         ExprNodePtr et = resolveExprTree(it->second);
                         if (et) {
-                            // If the expr tree references runtime vars, inline the expression
-                            // rather than emitting a bare variable name that might not exist
-                            if (exprTreeReferencesModuleParams(et)) {
+                            // If the expr tree references runtime vars or group_input vars,
+                            // inline the expression rather than evaluating to a constant
+                            if (exprTreeReferencesModuleParams(et) || et->hasVariableRefs()) {
                                 return exprTreeToPython(et);
                             }
                             double numVal = evaluateExprTree(et);

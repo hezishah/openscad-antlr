@@ -10,6 +10,7 @@
 #include <sstream>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include "ast.h"
 
 namespace scad2blender {
@@ -185,6 +186,8 @@ private:
     // Convert expression tree to a Python expression string using Python-level variables
     std::string exprTreeToPython(const ExprNodePtr& tree);
     std::string exprTreeToPythonInner(const ExprNodePtr& tree);
+    int expr_depth_ = 0;
+    std::unordered_map<ExprNode*, std::string> expr_cache_;
 
     // Check if an expression tree contains a call to a specific function
     bool exprTreeCallsFunction(const ExprNodePtr& tree, const std::string& funcName);
