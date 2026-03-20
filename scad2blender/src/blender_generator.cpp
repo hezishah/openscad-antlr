@@ -2136,7 +2136,16 @@ void BlenderGenerator::visit(ModuleCallNode& node) {
         indent_--;
         emit("x_pos += 200");
     } else {
-        emit("# Unknown module: " + node.name());
+        // Handle pass-through modules that just process children
+        if ((node.name() == "render" || node.name() == "assert") && !node.children().empty()) {
+            emit("# Pass-through module: " + node.name());
+            for (auto& child : node.children()) {
+                if (child && !child->isDisabled() && !child->isBackground())
+                    child->accept(*this);
+            }
+        } else {
+            emit("# Unknown module: " + node.name());
+        }
     }
 }
 
@@ -2941,6 +2950,10 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         }
         indent_++;
 
+        // Reset last_geo at start of each iteration — OpenSCAD for-loop
+        // iterations are independent; they don't chain into each other
+        emit("last_geo = None");
+
         for (auto& child : node.children()) {
             if (!child) continue;
             child->accept(*this);
@@ -3093,6 +3106,9 @@ void BlenderGenerator::visit(ForLoopNode& node) {
             emit("for " + loopVar + " in " + range.toPython() + ":");
             indent_++;
 
+            // Reset last_geo — each iteration is independent
+            emit("last_geo = None");
+
             for (auto& child : node.children()) {
                 if (!child) continue;
                 child->accept(*this);
@@ -3131,6 +3147,9 @@ void BlenderGenerator::visit(ForLoopNode& node) {
             emit("for " + loopVar + " in " + range.toPython() + ":");
             indent_++;
 
+            // Reset last_geo — each iteration is independent
+            emit("last_geo = None");
+
             for (auto& child : node.children()) {
                 if (!child) continue;
                 child->accept(*this);
@@ -3161,6 +3180,9 @@ void BlenderGenerator::visit(ForLoopNode& node) {
         std::string rangeExpr = exprTreeToPython(range.exprTree());
         emit("for " + loopVar + " in " + rangeExpr + ":");
         indent_++;
+
+        // Reset last_geo — each iteration is independent
+        emit("last_geo = None");
 
         for (auto& child : node.children()) {
             if (!child) continue;
@@ -4369,6 +4391,44 @@ void BlenderGenerator::emitTranslate(const Arguments& args) {
         emitVectorWithExprTrees(nodeId, "Translation", v);
     } else if (v.isVector() && v.size() >= 3) {
         emit(nodeId + ".inputs['Translation'].default_value = " + vectorToPython(v));
+    } else if (v.isVector() && v.size() == 2) {
+        // 2-element vector: [x, y] → [x, y, 0]
+        if (vectorHasExprTrees(v)) {
+            // Build a 3-element vector by adding a literal 0 Z component
+            std::string combineId = newNodeId();
+            emit("# CombineXYZ for Translation (2D vector)");
+            emit(combineId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combineId + ".location = (x_pos, y_pos)");
+            emit("y_pos -= 50");
+            // X component
+            ExprNodePtr xTree = resolveExprTree(v[0]);
+            if (xTree && xTree->hasVariableRefs()) {
+                auto xr = emitExpressionNodeTree(xTree);
+                connectExprResultNamed(xr, combineId, "X");
+            } else {
+                emit(combineId + ".inputs['X'].default_value = " + pyDouble(evaluateExpr(v[0])));
+            }
+            // Y component
+            ExprNodePtr yTree = resolveExprTree(v[1]);
+            if (yTree && yTree->hasVariableRefs()) {
+                auto yr = emitExpressionNodeTree(yTree);
+                connectExprResultNamed(yr, combineId, "Y");
+            } else {
+                emit(combineId + ".inputs['Y'].default_value = " + pyDouble(evaluateExpr(v[1])));
+            }
+            emit(combineId + ".inputs['Z'].default_value = 0");
+            emit("links.new(" + combineId + ".outputs['Vector'], " + nodeId + ".inputs['Translation'])");
+        } else {
+            double x = evaluateExpr(v[0]);
+            double y = evaluateExpr(v[1]);
+            emit(nodeId + ".inputs['Translation'].default_value = (" +
+                 pyDouble(x) + ", " + pyDouble(y) + ", 0)");
+        }
+    } else if (v.isVector() && v.size() == 1) {
+        // 1-element vector: [x] → [x, 0, 0]
+        double x = evaluateExpr(v[0]);
+        emit(nodeId + ".inputs['Translation'].default_value = (" +
+             pyDouble(x) + ", 0, 0)");
     }
 
     emit("link_nodes(links, last_geo, 'Geometry', " + nodeId + ", 'Geometry')");
