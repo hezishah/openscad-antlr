@@ -5411,58 +5411,7 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
 
     emit("# Offset");
 
-    if (useRounding) {
-        // r mode: first fillet corners for rounding, then offset the curve.
-        // FilletCurve rounds corners with the specified radius.
-        std::string filletId = newNodeId();
-        emit(filletId + " = nodes.new('GeometryNodeFilletCurve')");
-        emit(filletId + ".location = (x_pos, y_pos)");
-
-        // Fillet radius = absolute value of offset amount
-        ExprNodePtr offsetTree = getOrMakeLiteralTree(offsetVal);
-        if (offsetTree->hasVariableRefs() && exprTreeReferencesModuleParams(offsetTree)) {
-            std::string pyExpr = exprTreeToPython(offsetTree);
-            emit(filletId + ".inputs['Radius'].default_value = abs(_s(" + pyExpr + "))");
-        } else if (offsetTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(offsetTree)) {
-            // Build abs(offset) tree for the radius
-            ExprNodePtr absTree = ExprNode::makeFunctionCall("abs", {offsetTree});
-            auto result = emitExpressionNodeTree(absTree);
-            connectExprResultNamed(result, filletId, "Radius");
-        } else {
-            double absOffset = std::abs(offsetVal.toNumber());
-            emit(filletId + ".inputs['Radius'].default_value = " + std::to_string(absOffset));
-        }
-
-        // Set Poly mode with $fn-controlled count for corner resolution.
-        // In Blender 5.1+, mode is a menu input socket ('Bézier'/'Poly'), not a property.
-        emit(filletId + ".inputs['Mode'].default_value = 'Poly'");
-        // Count = max(1, $fn / 4)
-        ExprNodePtr fnTree = getOrMakeLiteralTree(fn);
-        if (fnTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(fnTree)) {
-            // Build $fn / 4 node tree, linked from group_input
-            ExprNodePtr fnDiv4 = ExprNode::makeBinary(ExprNode::Op::DIVIDE, fnTree, ExprNode::makeLiteral(4.0));
-            auto fnResult = emitExpressionNodeTree(fnDiv4);
-            // Clamp: max(result, 1) using Math node
-            std::string maxId = newNodeId();
-            emit(maxId + " = nodes.new('ShaderNodeMath')");
-            emit(maxId + ".operation = 'MAXIMUM'");
-            emit(maxId + ".location = (x_pos, y_pos)");
-            connectExprResult(fnResult, maxId, 0);
-            emit(maxId + ".inputs[1].default_value = 1");
-            emit("links.new(" + maxId + ".outputs['Value'], " + filletId + ".inputs['Count'])");
-        } else if (in_module_ && fnTree->hasVariableRefs() && exprTreeReferencesModuleParams(fnTree)) {
-            std::string fnPy = exprTreeToPython(fnTree);
-            emit(filletId + ".inputs['Count'].default_value = max(1, int(_s(" + fnPy + ")) // 4)");
-        } else {
-            int count = fnVal / 4;
-            if (count < 1) count = 1;
-            emit(filletId + ".inputs['Count'].default_value = " + std::to_string(count));
-        }
-
-        emit("link_nodes(links, last_geo, 'Curve', " + filletId + ", 'Curve')");
-        emit("last_geo = " + filletId);
-        emit("x_pos += 200");
-    } else {
+    if (!useRounding) {
         // delta mode: subdivide straight edges for smooth offset without corner rounding.
         std::string subdivId = newNodeId();
         emit(subdivId + " = nodes.new('GeometryNodeSubdivideCurve')");
@@ -5529,6 +5478,55 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
     emit("links.new(" + scaleId + ".outputs['Vector'], " + setposId + ".inputs['Offset'])");
     emit("last_geo = " + setposId);
     emit("x_pos += 200");
+
+    if (useRounding) {
+        // r mode: fillet corners AFTER the tangent offset to round sharp corners
+        // that result from the offset. Applied after offset so it doesn't inflate
+        // already-smooth curves (like circles).
+        std::string filletId = newNodeId();
+        emit(filletId + " = nodes.new('GeometryNodeFilletCurve')");
+        emit(filletId + ".location = (x_pos, y_pos)");
+
+        // Fillet radius = absolute value of offset amount
+        ExprNodePtr offsetTree2 = getOrMakeLiteralTree(offsetVal);
+        if (offsetTree2->hasVariableRefs() && exprTreeReferencesModuleParams(offsetTree2)) {
+            std::string pyExpr = exprTreeToPython(offsetTree2);
+            emit(filletId + ".inputs['Radius'].default_value = abs(_s(" + pyExpr + "))");
+        } else if (offsetTree2->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(offsetTree2)) {
+            ExprNodePtr absTree = ExprNode::makeFunctionCall("abs", {offsetTree2});
+            auto result = emitExpressionNodeTree(absTree);
+            connectExprResultNamed(result, filletId, "Radius");
+        } else {
+            double absOffset = std::abs(offsetVal.toNumber());
+            emit(filletId + ".inputs['Radius'].default_value = " + std::to_string(absOffset));
+        }
+
+        emit(filletId + ".inputs['Mode'].default_value = 'Poly'");
+        // Count = max(1, $fn / 4)
+        ExprNodePtr fnTree2 = getOrMakeLiteralTree(fn);
+        if (fnTree2->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(fnTree2)) {
+            ExprNodePtr fnDiv4 = ExprNode::makeBinary(ExprNode::Op::DIVIDE, fnTree2, ExprNode::makeLiteral(4.0));
+            auto fnResult = emitExpressionNodeTree(fnDiv4);
+            std::string maxId = newNodeId();
+            emit(maxId + " = nodes.new('ShaderNodeMath')");
+            emit(maxId + ".operation = 'MAXIMUM'");
+            emit(maxId + ".location = (x_pos, y_pos)");
+            connectExprResult(fnResult, maxId, 0);
+            emit(maxId + ".inputs[1].default_value = 1");
+            emit("links.new(" + maxId + ".outputs['Value'], " + filletId + ".inputs['Count'])");
+        } else if (in_module_ && fnTree2->hasVariableRefs() && exprTreeReferencesModuleParams(fnTree2)) {
+            std::string fnPy = exprTreeToPython(fnTree2);
+            emit(filletId + ".inputs['Count'].default_value = max(1, int(_s(" + fnPy + ")) // 4)");
+        } else {
+            int count = fnVal / 4;
+            if (count < 1) count = 1;
+            emit(filletId + ".inputs['Count'].default_value = " + std::to_string(count));
+        }
+
+        emit("link_nodes(links, last_geo, 'Curve', " + filletId + ", 'Curve')");
+        emit("last_geo = " + filletId);
+        emit("x_pos += 200");
+    }
 }
 
 void BlenderGenerator::emitHull(const Arguments& args) {
@@ -5785,9 +5783,11 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
     }
 
     // Check if this is a 2D boolean outside of an extrude context
-    // In that case, fill all 2D curves to flat mesh and use standard MeshBoolean
+    // For DIFFERENCE, skip this path — always use the curve-based approach (ReverseCurve + JoinGeometry)
+    // so the result stays as curves that CurveToMesh can use in linear_extrude.
+    // For UNION/INTERSECT, fill all 2D curves to flat mesh and use standard MeshBoolean.
     bool is2DSource = !actualChildren.empty() && is2DGeometry(actualChildren[0]);
-    if (is2DSource && !in_extrude_) {
+    if (is2DSource && !in_extrude_ && blenderOp != "DIFFERENCE") {
         int boolScopeId = node_counter_++;
         emit("# " + opName + " (2D mesh boolean)");
 
@@ -6016,6 +6016,9 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
         // Clean up near-coincident vertices from boolean operations
         // EXACT solver can produce nearly-duplicate vertices that cause non-manifold edges
+        // Skip for 2D curve path — MergeByDistance would change the node type and
+        // cause linear_extrude to misclassify the output as a mesh profile
+        if (!is2D) {
         std::string mergeId = newNodeId();
         emit("# MergeByDistance to clean up boolean artifacts");
         emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
@@ -6027,6 +6030,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         emit(firstGeo + " = " + mergeId);
         indent_--;
         emit("x_pos += 200");
+        }
     } else {
         // UNION and INTERSECT
         // In extrude context, always treat as 2D (building a 2D profile)
@@ -6361,60 +6365,73 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
 
         emit("if _is_mesh_profile:");
         indent_++;
-        // Mesh profile path: use ExtrudeMesh to extrude the flat mesh to full height
-        // First, delete the thin extrusion's top face and side faces to keep only bottom face
-        // Then extrude that bottom face to the desired height
-        emit("# Mesh profile: extract bottom face and extrude to height");
-        // Use face normal to select non-bottom faces (normal.Z >= -0.5)
-        emit("_norm = nodes.new('GeometryNodeInputNormal')");
-        emit("_norm.location = (x_pos, y_pos - 200)");
-        emit("_sep = nodes.new('ShaderNodeSeparateXYZ')");
-        emit("_sep.location = (x_pos + 150, y_pos - 200)");
-        emit("links.new(_norm.outputs['Normal'], _sep.inputs['Vector'])");
-        // Select faces where normal.Z >= -0.5 (top + side faces)
-        emit("_ge = nodes.new('ShaderNodeMath')");
-        emit("_ge.operation = 'GREATER_THAN'");
-        emit("_ge.location = (x_pos + 300, y_pos - 200)");
-        emit("links.new(_sep.outputs['Z'], _ge.inputs[0])");
-        emit("_ge.inputs[1].default_value = -0.5");
-        // Delete non-bottom faces
-        emit("_del = nodes.new('GeometryNodeDeleteGeometry')");
-        emit("_del.domain = 'FACE'");
-        emit("_del.location = (x_pos + 450, y_pos)");
-        emit("link_nodes(links, _profile_geo, 'Geometry', _del, 'Geometry')");
-        emit("links.new(_ge.outputs['Value'], _del.inputs['Selection'])");
-        // Flip remaining bottom faces (they face down, we need them facing up)
-        emit("_flip = nodes.new('GeometryNodeFlipFaces')");
-        emit("_flip.location = (x_pos + 600, y_pos)");
-        emit("links.new(geo_out(_del), _flip.inputs['Mesh'])");
-        // Merge loose vertices from deleted faces
-        emit("_mrg = nodes.new('GeometryNodeMergeByDistance')");
-        emit("_mrg.location = (x_pos + 750, y_pos)");
-        emit("links.new(_flip.outputs['Mesh'], _mrg.inputs['Geometry'])");
-        emit("_mrg.inputs['Distance'].default_value = 0.0001");
-        emit("x_pos += 950");
-        // Now extrude the remaining bottom face to full height
-        emit("_ext = nodes.new('GeometryNodeExtrudeMesh')");
-        emit("_ext.location = (x_pos, y_pos)");
-        emit("_ext.mode = 'FACES'");
-        emit("link_nodes(links, _mrg, 'Geometry', _ext, 'Mesh')");
+        // Mesh profile path: convert mesh back to curves via MeshToCurve,
+        // then use the standard CurveToMesh extrusion. MeshToCurve extracts
+        // boundary edges — for a flat 2D boolean result this gives the correct
+        // inner/outer curve outlines that CurveToMesh can sweep along a line.
+        emit("# Mesh profile → curves via MeshToCurve (boundary edges only)");
+        emit("# Select only boundary edges (face_count <= 1) to avoid internal edges");
+        emit("_en = nodes.new('GeometryNodeInputMeshEdgeNeighbors')");
+        emit("_en.location = (x_pos, y_pos - 150)");
+        emit("_cmp = nodes.new('FunctionNodeCompare')");
+        emit("_cmp.data_type = 'INT'");
+        emit("_cmp.operation = 'LESS_EQUAL'");
+        emit("_cmp.location = (x_pos + 200, y_pos - 150)");
+        emit("links.new(_en.outputs['Face Count'], _cmp.inputs[2])");
+        emit("_cmp.inputs[3].default_value = 1");
+        emit("_m2c = nodes.new('GeometryNodeMeshToCurve')");
+        emit("_m2c.location = (x_pos + 400, y_pos)");
+        emit("link_nodes(links, _profile_geo, 'Geometry', _m2c, 'Mesh')");
+        emit("links.new(_cmp.outputs['Result'], _m2c.inputs['Selection'])");
+        emit("x_pos += 600");
 
-        // Height offset vector
+        // CurveToMesh with the converted curves as profile
+        emit("_ctm_m = nodes.new('GeometryNodeCurveToMesh')");
+        emit("_ctm_m.location = (x_pos, y_pos)");
+        emit("links.new(" + lineId + ".outputs['Curve'], _ctm_m.inputs['Curve'])");
+        emit("links.new(_m2c.outputs['Curve'], _ctm_m.inputs['Profile Curve'])");
+        emit("_ctm_m.inputs['Fill Caps'].default_value = False");
+
+        // Bottom cap: FillCurve of converted curves + FlipFaces
+        emit("_fb_m = nodes.new('GeometryNodeFillCurve')");
+        emit("_fb_m.location = (x_pos + 200, y_pos - 100)");
+        emit("links.new(_m2c.outputs['Curve'], _fb_m.inputs['Curve'])");
+        emit("_ff_m = nodes.new('GeometryNodeFlipFaces')");
+        emit("_ff_m.location = (x_pos + 400, y_pos - 100)");
+        emit("links.new(_fb_m.outputs['Mesh'], _ff_m.inputs['Mesh'])");
+
+        // Top cap: FillCurve of converted curves + translate to Z=height
+        emit("_ft_m = nodes.new('GeometryNodeFillCurve')");
+        emit("_ft_m.location = (x_pos + 200, y_pos - 200)");
+        emit("links.new(_m2c.outputs['Curve'], _ft_m.inputs['Curve'])");
+        emit("_xt_m = nodes.new('GeometryNodeTransform')");
+        emit("_xt_m.location = (x_pos + 400, y_pos - 200)");
+        emit("links.new(_ft_m.outputs['Mesh'], _xt_m.inputs['Geometry'])");
         if (heightLinkedToGroupInput) {
             std::string combExtId = newNodeId();
             emit(combExtId + " = nodes.new('ShaderNodeCombineXYZ')");
-            emit(combExtId + ".location = (x_pos, y_pos - 200)");
+            emit(combExtId + ".location = (x_pos + 400, y_pos - 350)");
             auto extResult = emitExpressionNodeTree(heightTree);
             connectExprResultNamed(extResult, combExtId, "Z");
-            emit("links.new(" + combExtId + ".outputs['Vector'], _ext.inputs['Offset'])");
+            emit("links.new(" + combExtId + ".outputs['Vector'], _xt_m.inputs['Translation'])");
         } else if (!heightEndExpr.empty()) {
-            emit("_ext.inputs['Offset'].default_value = (0, 0, _s(" + heightEndExpr + "))");
+            emit("_xt_m.inputs['Translation'].default_value = (0, 0, _s(" + heightEndExpr + "))");
         } else {
-            emit("_ext.inputs['Offset'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+            emit("_xt_m.inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
         }
-        emit("_ext.inputs['Offset Scale'].default_value = 1.0");
-        emit("last_geo = _ext");
-        emit("x_pos += 200");
+
+        // Join walls + caps + MergeByDistance
+        emit("_jn_m = nodes.new('GeometryNodeJoinGeometry')");
+        emit("_jn_m.location = (x_pos + 600, y_pos)");
+        emit("links.new(_xt_m.outputs['Geometry'], _jn_m.inputs['Geometry'])");
+        emit("links.new(_ff_m.outputs['Mesh'], _jn_m.inputs['Geometry'])");
+        emit("links.new(_ctm_m.outputs['Mesh'], _jn_m.inputs['Geometry'])");
+        emit("_mg_m = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_mg_m.location = (x_pos + 800, y_pos)");
+        emit("_mg_m.inputs['Distance'].default_value = 0.0001");
+        emit("links.new(_jn_m.outputs['Geometry'], _mg_m.inputs['Geometry'])");
+        emit("last_geo = _mg_m");
+        emit("x_pos += 1000");
         indent_--;
 
         emit("else:");
