@@ -817,6 +817,61 @@ void printUsage(const char* program) {
               << "  " << program << " -I /path/to/libs model.scad output.py\n";
 }
 
+// Extract top-level variable names from the main file content
+// Only finds assignments at brace depth 0 (not inside modules/functions)
+static std::set<std::string> extractMainFileVars(const std::string& content) {
+    std::set<std::string> vars;
+    bool inLC = false, inBC = false, inStr = false;
+    int braceDepth = 0;
+    int parenDepth = 0;
+
+    for (size_t i = 0; i < content.size(); ) {
+        char c = content[i];
+        char nc = (i + 1 < content.size()) ? content[i + 1] : 0;
+
+        if (inBC) {
+            if (c == '*' && nc == '/') { inBC = false; i += 2; } else { i++; }
+            continue;
+        }
+        if (inLC) {
+            if (c == '\n') inLC = false;
+            i++; continue;
+        }
+        if (inStr) {
+            if (c == '\\') { i += 2; continue; }
+            if (c == '"') inStr = false;
+            i++; continue;
+        }
+        if (c == '/' && nc == '/') { inLC = true; i += 2; continue; }
+        if (c == '/' && nc == '*') { inBC = true; i += 2; continue; }
+        if (c == '"') { inStr = true; i++; continue; }
+        if (c == '{') { braceDepth++; i++; continue; }
+        if (c == '}') { braceDepth--; i++; continue; }
+        if (c == '(' || c == '[') { parenDepth++; i++; continue; }
+        if (c == ')' || c == ']') { parenDepth--; i++; continue; }
+
+        // At brace depth 0 and paren depth 0, look for identifier followed by '='
+        if (braceDepth == 0 && parenDepth == 0 && (isalpha(c) || c == '_' || c == '$')) {
+            std::string id;
+            size_t start = i;
+            while (i < content.size() && (isalnum(content[i]) || content[i] == '_' || content[i] == '$')) {
+                id += content[i++];
+            }
+            // Skip keywords
+            if (id == "module" || id == "function" || id == "include" || id == "use" ||
+                id == "if" || id == "else" || id == "for" || id == "let") continue;
+            // Skip whitespace, then check for '='
+            while (i < content.size() && (content[i] == ' ' || content[i] == '\t')) i++;
+            if (i < content.size() && content[i] == '=' && (i + 1 >= content.size() || content[i + 1] != '=')) {
+                vars.insert(id);
+            }
+        } else {
+            i++;
+        }
+    }
+    return vars;
+}
+
 int main(int argc, char* argv[]) {
     std::string inputFile;
     std::string outputFile;
@@ -966,6 +1021,7 @@ int main(int argc, char* argv[]) {
     // Generate Blender Python code
     scad2blender::BlenderGenerator generator;
     generator.setSourceDir(input_dir);
+    generator.setMainFileVars(extractMainFileVars(inputContent));
     std::string pythonCode = generator.generate(g_root);
 
     // Output the result

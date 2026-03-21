@@ -33,6 +33,7 @@ public:
     BlenderGenerator() = default;
 
     void setSourceDir(const std::string& dir) { source_dir_ = dir; }
+    void setMainFileVars(const std::set<std::string>& vars) { main_file_vars_ = vars; }
 
     /**
      * @brief Generate Python code from the AST
@@ -81,6 +82,7 @@ private:
     std::vector<std::set<std::string>> parent_module_params_stack_; // Stack of parent module param names
     std::map<std::string, std::vector<std::string>> captured_parent_params_; // module_name -> captured parent params
     std::string source_dir_;  // Directory of the source .scad file for resolving relative paths
+    std::set<std::string> main_file_vars_;  // Variables defined in the main .scad file (not includes)
 
     // User-defined function table (collected from AST FunctionNode nodes)
     struct FuncDef {

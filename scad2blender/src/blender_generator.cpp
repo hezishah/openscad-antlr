@@ -135,10 +135,13 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
     }
 
     // Also register top-level variables as group_input vars (they get sockets in build_geometry)
+    // If main_file_vars_ is set, only include variables defined in the main file
     for (const auto& [name, value] : variables_) {
         if (value.isNumber() || value.isBool() || value.isString() ||
             (value.isVector() && value.size() == 3)) {
-            group_input_vars_.insert(name);
+            if (main_file_vars_.empty() || main_file_vars_.count(name)) {
+                group_input_vars_.insert(name);
+            }
         }
     }
 
@@ -802,6 +805,12 @@ bool BlenderGenerator::exprTreeReferencesModuleParams(const ExprNodePtr& tree) {
     return false;
 }
 
+static bool isIntegerInput(const std::string& name) {
+    return name == "Vertices" || name == "Segments" || name == "Rings" ||
+           name == "Cuts" || name == "Count" || name == "Fill Segments" ||
+           name == "Vertices X" || name == "Vertices Y";
+}
+
 void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::string& inputName,
                                           const Value& value, const std::string& pythonValue) {
     // Try expression tree path first
@@ -820,11 +829,17 @@ void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::
                 indent_--;
                 emit("else:");
                 indent_++;
-                emit(nodeId + ".inputs['" + inputName + "'].default_value = " + varName);
+                if (isIntegerInput(inputName))
+                    emit(nodeId + ".inputs['" + inputName + "'].default_value = int(_s(" + varName + "))");
+                else
+                    emit(nodeId + ".inputs['" + inputName + "'].default_value = " + varName);
                 indent_--;
             } else {
                 std::string pyExpr = exprTreeToPython(tree);
-                emit(nodeId + ".inputs['" + inputName + "'].default_value = " + pyExpr);
+                if (isIntegerInput(inputName))
+                    emit(nodeId + ".inputs['" + inputName + "'].default_value = int(_s(" + pyExpr + "))");
+                else
+                    emit(nodeId + ".inputs['" + inputName + "'].default_value = " + pyExpr);
             }
             return;
         }
@@ -857,7 +872,10 @@ void BlenderGenerator::emitSetInputOrLink(const std::string& nodeId, const std::
             indent_--;
             emit("else:");
             indent_++;
-            emit(nodeId + ".inputs['" + inputName + "'].default_value = " + py);
+            if (isIntegerInput(inputName))
+                emit(nodeId + ".inputs['" + inputName + "'].default_value = int(_s(" + py + "))");
+            else
+                emit(nodeId + ".inputs['" + inputName + "'].default_value = " + py);
             indent_--;
         } else {
             // Module-local variable — evaluate to concrete value
@@ -1140,6 +1158,7 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emit("height = float(l) if l is not None else float(h)");
         emit("cyl = nodes.new('GeometryNodeMeshCylinder')");
         emit("cyl.location = (x_pos, y_pos)");
+        emit("cyl.fill_type = 'TRIANGLE_FAN'");
         emit("cyl.inputs['Radius'].default_value = radius");
         emit("cyl.inputs['Depth'].default_value = height");
         emit("cyl.inputs['Vertices'].default_value = 32");
@@ -1232,6 +1251,8 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         for (const auto& [name, value] : socketSnapshot) {
             // Only process top-level variables, not module-internal ones
             if (top_level_vars_.find(name) == top_level_vars_.end()) continue;
+            // Only include variables from the main file (not included libraries)
+            if (!main_file_vars_.empty() && !main_file_vars_.count(name)) continue;
 
             std::string socketName = name;
             if (name[0] == '$') {
@@ -1445,6 +1466,14 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emit("_final_geo = _merge");
     }
 
+    // Final MergeByDistance to clean up coincident vertices from boolean operations
+    emit("_merge_final = nodes.new('GeometryNodeMergeByDistance')");
+    emit("_merge_final.location = (x_pos, y_pos)");
+    emit("_merge_final.inputs['Distance'].default_value = 0.0001");
+    emit("link_nodes(links, _final_geo, 'Geometry', _merge_final, 'Geometry')");
+    emit("_final_geo = _merge_final");
+    emit("x_pos += 200");
+
     emit("link_nodes(links, _final_geo, 'Geometry', group_output, 'Geometry')");
     indent_--;
 
@@ -1571,6 +1600,17 @@ void BlenderGenerator::emitFooter() {
     emit("# Determine STL output path from script filename");
     emit("script_path = os.path.abspath(__file__)");
     emit("stl_path = os.path.splitext(script_path)[0] + '.stl'");
+    emitBlank();
+    emit("# Evaluate geometry nodes to bake the final mesh");
+    emit("depsgraph = bpy.context.evaluated_depsgraph_get()");
+    emit("eval_obj = obj.evaluated_get(depsgraph)");
+    emit("eval_mesh = bpy.data.meshes.new_from_object(eval_obj)");
+    emit("for mod in list(obj.modifiers):");
+    indent_++;
+    emit("obj.modifiers.remove(mod)");
+    indent_--;
+    emit("obj.data = eval_mesh");
+    emit("bpy.context.view_layer.objects.active = obj");
     emitBlank();
     emit("# Export to STL");
     emit("bpy.ops.object.select_all(action='DESELECT')");
@@ -3654,15 +3694,6 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
     Value center = getArg(args, "center", Value(false));
     Value fn = resolveFn(args);
 
-    // Use Cone node to support different top/bottom radii
-    emit("# Cylinder (using Cone for radius support)");
-    emit(nodeId + " = nodes.new('GeometryNodeMeshCone')");
-    emit(nodeId + ".location = (x_pos, y_pos)");
-
-    // Handle height
-    double hVal = h.isExpression() ? evaluateExpr(h) : h.toNumber();
-    emitSetInputOrLink(nodeId, "Depth", h, std::to_string(hVal));
-
     // Determine radius values - handle expressions and computed values
     Value radiusTop, radiusBottom;
     std::string radiusTopPython, radiusBottomPython;
@@ -3706,50 +3737,84 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
         radiusTopPython = std::to_string(d2Val / 2.0);
     }
 
-    // Emit radius settings
-    emitSetInputOrLink(nodeId, "Radius Top", radiusTop, radiusTopPython);
-    emitSetInputOrLink(nodeId, "Radius Bottom", radiusBottom, radiusBottomPython);
+    // Determine if radii are equal — use MeshCylinder (cleaner geometry) vs MeshCone
+    bool equalRadii = r1.isUndefined() && r2.isUndefined() && d1.isUndefined() && d2.isUndefined();
 
-    // Handle $fn
-    emitSetInputOrLink(nodeId, "Vertices", fn, std::to_string(static_cast<int>(evaluateExpr(fn))));
+    // Handle height
+    double hVal = h.isExpression() ? evaluateExpr(h) : h.toNumber();
+
+    if (equalRadii) {
+        // Use GeometryNodeMeshCylinder for equal-radius cylinders — cleaner primitive
+        emit("# Cylinder");
+        emit(nodeId + " = nodes.new('GeometryNodeMeshCylinder')");
+        emit(nodeId + ".location = (x_pos, y_pos)");
+        emit(nodeId + ".fill_type = 'TRIANGLE_FAN'");
+        emitSetInputOrLink(nodeId, "Depth", h, std::to_string(hVal));
+        emitSetInputOrLink(nodeId, "Radius", radiusTop, radiusTopPython);
+        emitSetInputOrLink(nodeId, "Vertices", fn, std::to_string(static_cast<int>(evaluateExpr(fn))));
+    } else {
+        // Use GeometryNodeMeshCone for different top/bottom radii
+        emit("# Cylinder (cone for different radii)");
+        emit(nodeId + " = nodes.new('GeometryNodeMeshCone')");
+        emit(nodeId + ".location = (x_pos, y_pos)");
+        emit(nodeId + ".fill_type = 'TRIANGLE_FAN'");
+        emitSetInputOrLink(nodeId, "Depth", h, std::to_string(hVal));
+        emitSetInputOrLink(nodeId, "Radius Top", radiusTop, radiusTopPython);
+        emitSetInputOrLink(nodeId, "Radius Bottom", radiusBottom, radiusBottomPython);
+        emitSetInputOrLink(nodeId, "Vertices", fn, std::to_string(static_cast<int>(evaluateExpr(fn))));
+    }
 
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
     emit("y_pos -= 50");
 
     // Handle center parameter
-    // Blender's MeshCone already places bottom at Z=0 and top at Z=Depth,
-    // which matches OpenSCAD's center=false behavior.
-    // For center=true, we need to translate by -h/2 to center it.
-    if (center.toBool() || isSimpleVariableRef(center)) {
+    // MeshCone: bottom at Z=0, top at Z=Depth (matches OpenSCAD center=false)
+    //   center=true → translate by -h/2
+    // MeshCylinder: centered at Z=0 (Z=-Depth/2 to Z=Depth/2)
+    //   center=false → translate by +h/2 (to get Z=0..Depth, matching OpenSCAD)
+    //   center=true → no translation needed (already centered)
+    bool needsCenterTranslate = false;
+    double translateSign = 0.0;
+    if (equalRadii) {
+        // MeshCylinder: need +h/2 for center=false (default)
+        if (!center.toBool() && !isSimpleVariableRef(center)) {
+            needsCenterTranslate = true;
+            translateSign = 1.0;  // +h/2
+        }
+    } else {
+        // MeshCone: need -h/2 for center=true
+        if (center.toBool() || isSimpleVariableRef(center)) {
+            needsCenterTranslate = true;
+            translateSign = -1.0;  // -h/2
+        }
+    }
+
+    if (needsCenterTranslate) {
         emitBlank();
-        emit("# Translate for center=true");
+        emit("# Translate for Z positioning");
         std::string transId = newNodeId();
         emit(transId + " = nodes.new('GeometryNodeTransform')");
         emit(transId + ".location = (x_pos, y_pos)");
 
         ExprNodePtr hTree = getOrMakeLiteralTree(h);
         if (hTree && hTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(hTree)) {
-            // Build -h / 2 expression tree and emit as Z component of CombineXYZ
-            ExprNodePtr negHalfH = ExprNode::makeBinary(
-                ExprNode::Op::DIVIDE,
-                ExprNode::makeUnary(ExprNode::Op::NEGATE, hTree),
-                ExprNode::makeLiteral(2.0));
-            emitScalarToVectorInput(transId, "Translation", negHalfH, 2, 0.0, 0.0, 0.0);
+            ExprNodePtr halfH = ExprNode::makeBinary(
+                ExprNode::Op::MULTIPLY,
+                hTree,
+                ExprNode::makeLiteral(translateSign * 0.5));
+            emitScalarToVectorInput(transId, "Translation", halfH, 2, 0.0, 0.0, 0.0);
         } else if (hTree && hTree->hasVariableRefs() && exprTreeReferencesModuleParams(hTree)) {
-            // Runtime Python variable — might be a Blender node ref or scalar.
-            // For simple VarRef to a module param, emit conditional code.
             if (hTree->kind == ExprNode::Kind::VarRef) {
                 std::string varName = pyName(hTree->var_name);
                 emit("if hasattr(" + varName + ", 'outputs'):");
                 indent_++;
-                // Build -h/2 as Math node chain + CombineXYZ
                 std::string mulId = newNodeId();
                 emit(mulId + " = nodes.new('ShaderNodeMath')");
                 emit(mulId + ".operation = 'MULTIPLY'");
                 emit(mulId + ".location = (x_pos, y_pos)");
                 emit("links.new(" + varName + ".outputs['Value'], " + mulId + ".inputs[0])");
-                emit(mulId + ".inputs[1].default_value = -0.5");
+                emit(mulId + ".inputs[1].default_value = " + pyDouble(translateSign * 0.5));
                 std::string xyzId = newNodeId();
                 emit(xyzId + " = nodes.new('ShaderNodeCombineXYZ')");
                 emit(xyzId + ".location = (x_pos, y_pos)");
@@ -3759,16 +3824,18 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
                 indent_--;
                 emit("else:");
                 indent_++;
-                emit(transId + ".inputs['Translation'].default_value = (0, 0, -(" + varName + ") / 2)");
+                emit(transId + ".inputs['Translation'].default_value = (0, 0, " +
+                     pyDouble(translateSign) + " * (" + varName + ") / 2)");
                 indent_--;
             } else {
                 std::string pyExpr = exprTreeToPython(hTree);
-                emit(transId + ".inputs['Translation'].default_value = (0, 0, -(" + pyExpr + ") / 2)");
+                emit(transId + ".inputs['Translation'].default_value = (0, 0, " +
+                     pyDouble(translateSign) + " * (" + pyExpr + ") / 2)");
             }
         } else {
             double hCenterVal = h.isExpression() ? evaluateExpr(h) : h.toNumber();
             emit(transId + ".inputs['Translation'].default_value = (0, 0, " +
-                 std::to_string(-hCenterVal / 2) + ")");
+                 pyDouble(translateSign * hCenterVal / 2) + ")");
         }
 
         emit("link_nodes(links, last_geo, 'Mesh', " + transId + ", 'Geometry')");
@@ -5901,7 +5968,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
             emit(boolId + ".location = (x_pos, y_pos)");
             emit(boolId + ".operation = '" + blenderOp + "'");
-            emit(boolId + ".solver = 'EXACT'");
+            emit(boolId + ".solver = '" + std::string(blenderOp == "UNION" ? "MANIFOLD" : "EXACT") + "'");
 
             if (blenderOp == "DIFFERENCE") {
                 // DIFFERENCE: base -> inputs[0], tool -> inputs[1]
@@ -6051,7 +6118,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 emit(unionId + " = nodes.new('GeometryNodeMeshBoolean')");
                 emit(unionId + ".location = (x_pos, y_pos)");
                 emit(unionId + ".operation = 'UNION'");
-                emit(unionId + ".solver = 'EXACT'");
+                emit(unionId + ".solver = 'MANIFOLD'");
                 emit("links.new(geo_out(last_geo), " + unionId + ".inputs[1])");
                 emit("last_geo = " + unionId);
                 emit("x_pos += 200");
@@ -6340,7 +6407,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
             emit(boolId + ".location = (x_pos, y_pos)");
             emit(boolId + ".operation = '" + blenderOp + "'");
-            emit(boolId + ".solver = 'EXACT'");
+            emit(boolId + ".solver = '" + std::string(blenderOp == "UNION" ? "MANIFOLD" : "EXACT") + "'");
 
             // In Blender 5.1+, UNION/INTERSECT use inputs[1] as multi-input
             // (inputs[0] is disabled). Both operands go to inputs[1].
@@ -6353,6 +6420,21 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             indent_--;  // end if last_geo is not None
         }
         } // end else (3D path)
+
+        // MergeByDistance to clean up boolean artifacts from EXACT solver
+        if (blenderOp == "UNION") {
+            std::string mergeId = newNodeId();
+            emit("# MergeByDistance to clean up UNION artifacts");
+            emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
+            emit(mergeId + ".location = (x_pos, y_pos)");
+            emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
+            emit("if " + firstGeo + " is not None:");
+            indent_++;
+            emit("links.new(geo_out(" + firstGeo + "), " + mergeId + ".inputs['Geometry'])");
+            emit(firstGeo + " = " + mergeId);
+            indent_--;
+            emit("x_pos += 200");
+        }
     }
 
     emit("last_geo = " + firstGeo);
@@ -8427,6 +8509,8 @@ void BlenderGenerator::collectGroupInputVars(ASTNode& node) {
                 // become group_input sockets.
                 if (top_level_vars_.find(assign->name()) == top_level_vars_.end()) {
                     // Skip module-internal variables
+                } else if (!main_file_vars_.empty() && !main_file_vars_.count(assign->name())) {
+                    // Skip variables not from the main file
                 } else {
                     const Value& val = assign->value();
                     if (val.isNumber() || val.isBool() || val.isString()) {
