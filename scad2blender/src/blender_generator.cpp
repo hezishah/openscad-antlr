@@ -1369,6 +1369,19 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
     emit("y_pos = 0");
     emit("last_geo = None");
     emit("all_geometry = []  # Collect all top-level geometry");
+
+    // Count expected top-level geometry components
+    int topLevelGeoCount = 0;
+    for (auto& child : node.children()) {
+        if (!child) continue;
+        if (child->type() != ASTNode::Type::Module &&
+            child->type() != ASTNode::Type::Assignment &&
+            child->type() != ASTNode::Type::FunctionDef &&
+            !child->isDisabled() && !child->isBackground()) {
+            topLevelGeoCount++;
+        }
+    }
+    emit("_expected_components = " + std::to_string(topLevelGeoCount));
     emitBlank();
 
     // Process top-level statements (excluding modules and assignments)
@@ -1474,6 +1487,53 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
     emit("_final_geo = _merge_final");
     emit("x_pos += 200");
 
+    // Island cleanup: remove disconnected mesh islands inside geometry nodes graph
+    // Only for single-component models (single top-level geometry statement)
+    if (topLevelGeoCount == 1) {
+        emitBlank();
+        emit("# Island cleanup: keep only the largest connected component");
+        emit("# MeshIsland → get island index per vertex");
+        emit("_island_node = nodes.new('GeometryNodeInputMeshIsland')");
+        emit("_island_node.location = (x_pos, y_pos - 200)");
+        emitBlank();
+        emit("# AccumulateField: count vertices per island (value=1.0, group by island index)");
+        emit("_accum = nodes.new('GeometryNodeAccumulateField')");
+        emit("_accum.data_type = 'FLOAT'");
+        emit("_accum.domain = 'POINT'");
+        emit("_accum.location = (x_pos, y_pos - 400)");
+        emit("_accum.inputs['Value'].default_value = 1.0");
+        emit("links.new(_island_node.outputs['Island Index'], _accum.inputs['Group ID'])");
+        emit("x_pos += 200");
+        emitBlank();
+        emit("# AttributeStatistic: find the maximum island size");
+        emit("_stats = nodes.new('GeometryNodeAttributeStatistic')");
+        emit("_stats.data_type = 'FLOAT'");
+        emit("_stats.domain = 'POINT'");
+        emit("_stats.location = (x_pos, y_pos - 400)");
+        emit("link_nodes(links, _final_geo, 'Geometry', _stats, 'Geometry')");
+        emit("links.new(_accum.outputs['Total'], _stats.inputs['Attribute'])");
+        emit("x_pos += 200");
+        emitBlank();
+        emit("# Compare: island_size < max_island_size → select vertices NOT in largest island");
+        emit("_compare = nodes.new('FunctionNodeCompare')");
+        emit("_compare.data_type = 'FLOAT'");
+        emit("_compare.operation = 'LESS_THAN'");
+        emit("_compare.location = (x_pos, y_pos - 400)");
+        emit("links.new(_accum.outputs['Total'], _compare.inputs[0])");
+        emit("links.new(_stats.outputs['Max'], _compare.inputs[1])");
+        emit("x_pos += 200");
+        emitBlank();
+        emit("# DeleteGeometry: remove vertices not in the largest island");
+        emit("_del_islands = nodes.new('GeometryNodeDeleteGeometry')");
+        emit("_del_islands.domain = 'POINT'");
+        emit("_del_islands.location = (x_pos, y_pos)");
+        emit("link_nodes(links, _final_geo, 'Geometry', _del_islands, 'Geometry')");
+        emit("links.new(_compare.outputs['Result'], _del_islands.inputs['Selection'])");
+        emit("_final_geo = _del_islands");
+        emit("x_pos += 200");
+    }
+    emitBlank();
+
     emit("link_nodes(links, _final_geo, 'Geometry', group_output, 'Geometry')");
     indent_--;
 
@@ -1572,7 +1632,7 @@ void BlenderGenerator::emitFooter() {
     emit("# Clean up temporary boolean objects");
     emit("for _o in list(bpy.data.objects):");
     indent_++;
-    emit("if _o.name.startswith('_diff_') or _o.name.startswith('_dxf_') or _o.name.startswith('_surf_'):");
+    emit("if _o.name.startswith('_diff_') or _o.name.startswith('_dxf_') or _o.name.startswith('_surf_') or _o.name.startswith('grid_data_'):");
     indent_++;
     emit("_mesh = _o.data");
     emit("bpy.data.objects.remove(_o, do_unlink=True)");
@@ -1600,17 +1660,6 @@ void BlenderGenerator::emitFooter() {
     emit("# Determine STL output path from script filename");
     emit("script_path = os.path.abspath(__file__)");
     emit("stl_path = os.path.splitext(script_path)[0] + '.stl'");
-    emitBlank();
-    emit("# Evaluate geometry nodes to bake the final mesh");
-    emit("depsgraph = bpy.context.evaluated_depsgraph_get()");
-    emit("eval_obj = obj.evaluated_get(depsgraph)");
-    emit("eval_mesh = bpy.data.meshes.new_from_object(eval_obj)");
-    emit("for mod in list(obj.modifiers):");
-    indent_++;
-    emit("obj.modifiers.remove(mod)");
-    indent_--;
-    emit("obj.data = eval_mesh");
-    emit("bpy.context.view_layer.objects.active = obj");
     emitBlank();
     emit("# Export to STL");
     emit("bpy.ops.object.select_all(action='DESELECT')");
