@@ -2662,6 +2662,121 @@ static InstanceArrayInfo detectInstanceArrayPattern(ForLoopNode& node) {
     return info;
 }
 
+// ─── Conditional translate grid pattern detection ───
+// Detects: for (i = [s:step:e])
+//              [for (j = [s2:step2:e2])]    // optional inner loop
+//                  if (<condition referencing loop var(s)>)
+//                      translate([f(i), f(j), ...])
+//                          body  // body does NOT reference loop vars
+struct ConditionalTranslateGridInfo {
+    bool valid = false;
+    std::string outerVar;
+    Value outerRange;
+    std::string innerVar;      // empty if single loop
+    Value innerRange;          // undefined if single loop
+    bool nested = false;       // true if double-nested
+    IfElseNode* ifNode = nullptr;
+    TransformNode* translateNode = nullptr;
+    std::vector<ASTNode*> bodyChildren;  // children below the translate
+};
+
+static ConditionalTranslateGridInfo detectConditionalTranslateGrid(ForLoopNode& node) {
+    ConditionalTranslateGridInfo info;
+
+    const Value& range = node.range();
+    if (!range.isRange()) return info;
+
+    info.outerVar = node.variable();
+    info.outerRange = range;
+
+    // Must have exactly one child (possibly wrapped in Union/Intersection)
+    if (node.children().size() != 1) return info;
+    ASTNode* current = node.children()[0].get();
+
+    // Unwrap implicit Union/Intersection wrappers
+    while (current && (current->type() == ASTNode::Type::Union ||
+                       current->type() == ASTNode::Type::Intersection) &&
+           current->children().size() == 1) {
+        current = current->children()[0].get();
+    }
+    if (!current) return info;
+
+    // Check for optional inner ForLoop
+    ForLoopNode* innerLoop = nullptr;
+    if (current->type() == ASTNode::Type::ForLoop) {
+        innerLoop = dynamic_cast<ForLoopNode*>(current);
+        if (!innerLoop) return info;
+        const Value& innerRange = innerLoop->range();
+        if (!innerRange.isRange()) return info;
+        info.nested = true;
+        info.innerVar = innerLoop->variable();
+        info.innerRange = innerRange;
+
+        if (innerLoop->children().size() != 1) return info;
+        current = innerLoop->children()[0].get();
+
+        // Unwrap wrappers inside inner loop too
+        while (current && (current->type() == ASTNode::Type::Union ||
+                           current->type() == ASTNode::Type::Intersection) &&
+               current->children().size() == 1) {
+            current = current->children()[0].get();
+        }
+        if (!current) return info;
+    }
+
+    // Current must be IfElseNode with no else branch
+    if (current->type() != ASTNode::Type::IfElse) return info;
+    auto* ifNode = dynamic_cast<IfElseNode*>(current);
+    if (!ifNode || ifNode->elseBranch()) return info;
+
+    // Condition must reference at least one loop variable
+    const Value& cond = ifNode->condition();
+    if (!cond.exprTree()) return info;
+    bool condRefsOuter = exprTreeReferencesVar(cond.exprTree(), info.outerVar);
+    bool condRefsInner = info.nested && exprTreeReferencesVar(cond.exprTree(), info.innerVar);
+    if (!condRefsOuter && !condRefsInner) return info;
+
+    info.ifNode = ifNode;
+
+    // IfElse must have exactly one child (possibly wrapped)
+    if (ifNode->children().size() != 1) return info;
+    current = ifNode->children()[0].get();
+
+    // Unwrap wrappers
+    while (current && (current->type() == ASTNode::Type::Union ||
+                       current->type() == ASTNode::Type::Intersection) &&
+           current->children().size() == 1) {
+        current = current->children()[0].get();
+    }
+    if (!current) return info;
+
+    // Must be a Translate that references at least one loop variable
+    if (current->type() != ASTNode::Type::Translate) return info;
+    auto* translate = dynamic_cast<TransformNode*>(current);
+    if (!translate) return info;
+
+    bool translateRefVar = false;
+    for (const auto& kv : translate->args()) {
+        if (valueReferencesVar(kv.second, info.outerVar)) translateRefVar = true;
+        if (info.nested && valueReferencesVar(kv.second, info.innerVar)) translateRefVar = true;
+    }
+    if (!translateRefVar) return info;
+
+    info.translateNode = translate;
+
+    // Body children (below the translate) must NOT reference any loop variable
+    for (const auto& child : translate->children()) {
+        if (!child) continue;
+        if (subtreeReferencesVar(child, info.outerVar)) return info;
+        if (info.nested && subtreeReferencesVar(child, info.innerVar)) return info;
+        info.bodyChildren.push_back(child.get());
+    }
+    if (info.bodyChildren.empty()) return info;
+
+    info.valid = true;
+    return info;
+}
+
 void BlenderGenerator::visit(ForLoopNode& node) {
     const Value& range = node.range();
 
@@ -2959,6 +3074,132 @@ void BlenderGenerator::visit(ForLoopNode& node) {
             indent_--;
 
             loop_variables_.erase(loopVar);
+            return;
+        }
+
+        // ─── Conditional translate grid (Instance on Points) ───
+        // Detects: for (i = range) [for (j = range)] if (cond) translate([f(i,j)]) { body }
+        // where body doesn't reference loop vars. Emit body once, build point cloud, instance.
+        ConditionalTranslateGridInfo gridInfo = detectConditionalTranslateGrid(node);
+        if (gridInfo.valid) {
+            std::string outerVar = gridInfo.outerVar;
+            std::string innerVar = gridInfo.innerVar;
+            emit("# Conditional translate grid (Instance on Points): " + outerVar +
+                 (gridInfo.nested ? " x " + innerVar : ""));
+
+            // Track loop variables so exprTreeToPython treats them as runtime Python vars
+            loop_variables_.insert(outerVar);
+            if (gridInfo.nested) loop_variables_.insert(innerVar);
+
+            // ─── 1. Emit template geometry (body children) ───
+            for (auto* bodyChild : gridInfo.bodyChildren) {
+                bodyChild->accept(*this);
+            }
+            emit("_template_geo = last_geo");
+
+            // ─── 2. Build Python position expressions from Translate args ───
+            const auto& transArgs = gridInfo.translateNode->args();
+            Value transVal;
+            {
+                auto it2 = transArgs.find("v");
+                if (it2 == transArgs.end()) it2 = transArgs.find("_0");
+                if (it2 != transArgs.end()) transVal = it2->second;
+            }
+
+            std::string posExprs[3] = {"0", "0", "0"};
+            if (transVal.isVector() && transVal.size() >= 2) {
+                for (int i = 0; i < 3 && i < static_cast<int>(transVal.size()); ++i) {
+                    ExprNodePtr tree = getOrMakeLiteralTree(transVal[i]);
+                    posExprs[i] = exprTreeToPython(tree);
+                }
+            }
+
+            // ─── 3. Build Python condition expression ───
+            std::string pyCondExpr = exprTreeToPython(gridInfo.ifNode->condition().exprTree());
+
+            // ─── 4. Build range expressions ───
+            auto buildRangePy = [&](const Value& rangeVal) -> std::tuple<std::string, std::string, std::string> {
+                ExprNodePtr startTree = rangeVal.rangeStartExpr();
+                ExprNodePtr endTree = rangeVal.rangeEndExpr();
+                ExprNodePtr stepTree = rangeVal.rangeStepExpr();
+                if (startTree) startTree = resolveExprTree(Value::expressionWithTree("", startTree));
+                if (endTree) endTree = resolveExprTree(Value::expressionWithTree("", endTree));
+                if (stepTree) stepTree = resolveExprTree(Value::expressionWithTree("", stepTree));
+                std::string s = startTree ? exprTreeToPython(startTree) : pyDouble(rangeVal.rangeStart());
+                std::string e = endTree ? exprTreeToPython(endTree) : pyDouble(rangeVal.rangeEnd());
+                std::string st = stepTree ? exprTreeToPython(stepTree) : pyDouble(rangeVal.rangeStep());
+                return {s, e, st};
+            };
+
+            auto [outerStart, outerEnd, outerStep] = buildRangePy(gridInfo.outerRange);
+
+            // ─── 5. Emit Python bmesh loop with condition filter ───
+            emit("import bmesh as _bmesh");
+            emit("_grid_bm = _bmesh.new()");
+            emit("for _outer_i in range(max(0, int((" + outerEnd + " - " + outerStart + ") / " + outerStep + ") + 1)):");
+            indent_++;
+            emit(outerVar + " = " + outerStart + " + _outer_i * " + outerStep);
+
+            if (gridInfo.nested) {
+                auto [innerStart, innerEnd, innerStep] = buildRangePy(gridInfo.innerRange);
+                emit("for _inner_i in range(max(0, int((" + innerEnd + " - " + innerStart + ") / " + innerStep + ") + 1)):");
+                indent_++;
+                emit(innerVar + " = " + innerStart + " + _inner_i * " + innerStep);
+            }
+
+            emit("if " + pyCondExpr + ":");
+            indent_++;
+            emit("_grid_bm.verts.new((" + posExprs[0] + ", " + posExprs[1] + ", " + posExprs[2] + "))");
+            indent_--;
+
+            if (gridInfo.nested) indent_--;  // end inner for
+            indent_--;  // end outer for
+
+            emit("_grid_mesh = bpy.data.meshes.new('grid_data_' + str(id(nodes)))");
+            emit("_grid_bm.to_mesh(_grid_mesh)");
+            emit("_grid_bm.free()");
+            emit("_grid_obj = bpy.data.objects.new('grid_data_' + str(id(nodes)), _grid_mesh)");
+            emit("bpy.context.collection.objects.link(_grid_obj)");
+            emit("_grid_obj.hide_viewport = True");
+            emit("_grid_obj.hide_render = True");
+
+            // ─── 6. Emit instancing node tree ───
+            emit("if len(_grid_mesh.vertices) > 0:");
+            indent_++;
+
+            // Object Info for point cloud
+            std::string objInfoId = newNodeId();
+            emit(objInfoId + " = nodes.new('GeometryNodeObjectInfo')");
+            emit(objInfoId + ".location = (x_pos, y_pos - 200)");
+            emit(objInfoId + ".transform_space = 'RELATIVE'");
+            emit(objInfoId + ".inputs['Object'].default_value = _grid_obj");
+            emit("x_pos += 200");
+
+            // Instance on Points
+            std::string iopId = newNodeId();
+            emit(iopId + " = nodes.new('GeometryNodeInstanceOnPoints')");
+            emit(iopId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + objInfoId + ".outputs['Geometry'], " + iopId + ".inputs['Points'])");
+            emit("link_nodes(links, _template_geo, 'Geometry', " + iopId + ", 'Instance')");
+            emit("x_pos += 200");
+
+            // Realize instances
+            std::string realizeId = newNodeId();
+            emit(realizeId + " = nodes.new('GeometryNodeRealizeInstances')");
+            emit(realizeId + ".location = (x_pos, y_pos)");
+            emit("links.new(" + iopId + ".outputs['Instances'], " +
+                 realizeId + ".inputs['Geometry'])");
+            emit("last_geo = " + realizeId);
+            emit("x_pos += 200");
+
+            indent_--;  // end if len > 0
+            emit("else:");
+            indent_++;
+            emit("last_geo = None");
+            indent_--;
+
+            loop_variables_.erase(outerVar);
+            if (gridInfo.nested) loop_variables_.erase(innerVar);
             return;
         }
 
