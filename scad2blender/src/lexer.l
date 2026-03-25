@@ -24,11 +24,14 @@ struct IncludeState {
     YY_BUFFER_STATE buffer;
     std::string file_dir;
     int lineno;
+    bool is_use;  // true if this level was entered via 'use' (not 'include')
 };
 static std::stack<IncludeState> include_stack;
 static std::string include_filename;
 static std::vector<std::string> include_paths;
 static std::string current_file_dir;
+static bool pending_is_use = false;  // set by 'use' rule, consumed by INCL handler
+static int use_depth = 0;  // >0 means we're inside a 'use' file (skip top-level statements)
 
 void set_include_paths(const std::vector<std::string>& paths) {
     include_paths = paths;
@@ -44,6 +47,10 @@ const std::vector<std::string>& get_include_paths() {
 
 const std::string& get_current_file_dir() {
     return current_file_dir;
+}
+
+bool is_in_use_context() {
+    return use_depth > 0;
 }
 
 %}
@@ -64,10 +71,10 @@ WS          [ \t\r]+
 %%
 
  /* Include/Use directives - must be before keyword rules */
-"include"[ \t]*"<"     { include_filename.clear(); BEGIN(INCL); }
-"include"[ \t]*\"      { include_filename.clear(); BEGIN(INCL); }
-"use"[ \t]*"<"         { include_filename.clear(); BEGIN(INCL); }
-"use"[ \t]*\"          { include_filename.clear(); BEGIN(INCL); }
+"include"[ \t]*"<"     { pending_is_use = false; include_filename.clear(); BEGIN(INCL); }
+"include"[ \t]*\"      { pending_is_use = false; include_filename.clear(); BEGIN(INCL); }
+"use"[ \t]*"<"         { pending_is_use = true; include_filename.clear(); BEGIN(INCL); }
+"use"[ \t]*\"          { pending_is_use = true; include_filename.clear(); BEGIN(INCL); }
 
 <INCL>[^>""\n]+        { include_filename += yytext; }
 <INCL>[>"]             {
@@ -100,7 +107,13 @@ WS          [ \t\r]+
         state.buffer = YY_CURRENT_BUFFER;
         state.file_dir = current_file_dir;
         state.lineno = yylineno;
+        state.is_use = pending_is_use;
         include_stack.push(state);
+
+        /* Track use context depth */
+        if (pending_is_use) {
+            use_depth++;
+        }
 
         /* Update current file directory */
         char* path_copy = strdup(resolved_path.c_str());
@@ -238,6 +251,10 @@ WS          [ \t\r]+
     if (!include_stack.empty()) {
         IncludeState state = include_stack.top();
         include_stack.pop();
+        /* Decrement use_depth when leaving a 'use' file */
+        if (state.is_use) {
+            use_depth--;
+        }
         yy_delete_buffer(YY_CURRENT_BUFFER);
         yy_switch_to_buffer(state.buffer);
         current_file_dir = state.file_dir;

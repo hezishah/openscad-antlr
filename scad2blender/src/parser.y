@@ -688,6 +688,7 @@ static std::vector<ExprNodePtr> args_to_expr_trees(const Arguments& args) {
 // Forward declarations (defined later in this file)
 extern const std::vector<std::string>& get_include_paths();
 extern const std::string& get_current_file_dir();
+extern bool is_in_use_context();
 static std::string resolve_include_file(const std::string& filename, const std::string& from_dir);
 
 struct DxfDimension {
@@ -1332,7 +1333,21 @@ statements:
     | statements statement {
         $$ = $1;
         if ($2) {
-            $$->push_back(ASTNodePtr($2));
+            // In 'use' context, only keep module defs, function defs, and assignments
+            // Skip top-level module instantiations (OpenSCAD 'use' semantics)
+            if (is_in_use_context()) {
+                auto t = $2->type();
+                if (t != ASTNode::Type::Module &&
+                    t != ASTNode::Type::FunctionDef &&
+                    t != ASTNode::Type::Assignment) {
+                    // Skip this statement — it's a top-level instantiation from a 'use' file
+                    $$ = $1;
+                } else {
+                    $$->push_back(ASTNodePtr($2));
+                }
+            } else {
+                $$->push_back(ASTNodePtr($2));
+            }
         }
     }
     ;
