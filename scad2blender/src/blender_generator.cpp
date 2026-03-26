@@ -1092,42 +1092,45 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emit("\"\"\"Simplified LinEx: linear_extrude on children_geo\"\"\"");
         emit("if children_geo is None: return None, y_pos");
         emit("height = _s(h) if callable(globals().get('_s', None)) else h");
-        emit("# Create line profile for CurveToMesh extrusion");
-        emit("profile = nodes.new('GeometryNodeCurvePrimitiveLine')");
-        emit("profile.location = (x_pos - 200, y_pos)");
-        emit("profile.inputs['Start'].default_value = (0, 0, 0)");
-        emit("profile.inputs['End'].default_value = (0, 0, float(height))");
+        emit("# Create line path for CurveToMesh extrusion");
+        emit("line = nodes.new('GeometryNodeCurvePrimitiveLine')");
+        emit("line.location = (x_pos - 200, y_pos)");
+        emit("line.inputs['Start'].default_value = (0, 0, 0)");
+        emit("line.inputs['End'].default_value = (0, 0, float(height))");
         emit("ctm = nodes.new('GeometryNodeCurveToMesh')");
         emit("ctm.location = (x_pos, y_pos)");
-        emit("ctm.inputs['Fill Caps'].default_value = False");
-        emit("links.new(geo_out(children_geo), ctm.inputs['Curve'])");
-        emit("links.new(profile.outputs['Curve'], ctm.inputs['Profile Curve'])");
-        emit("# Bottom cap");
-        emit("fill_bot = nodes.new('GeometryNodeFillCurve')");
-        emit("fill_bot.location = (x_pos, y_pos - 200)");
-        emit("links.new(geo_out(children_geo), fill_bot.inputs['Curve'])");
-        emit("flip = nodes.new('GeometryNodeFlipFaces')");
-        emit("flip.location = (x_pos + 200, y_pos - 200)");
-        emit("links.new(fill_bot.outputs['Mesh'], flip.inputs['Mesh'])");
-        emit("# Top cap");
-        emit("fill_top = nodes.new('GeometryNodeFillCurve')");
-        emit("fill_top.location = (x_pos, y_pos - 400)");
-        emit("links.new(geo_out(children_geo), fill_top.inputs['Curve'])");
-        emit("xform_top = nodes.new('GeometryNodeTransform')");
-        emit("xform_top.location = (x_pos + 200, y_pos - 400)");
-        emit("xform_top.inputs['Translation'].default_value = (0, 0, float(height))");
-        emit("links.new(fill_top.outputs['Mesh'], xform_top.inputs['Geometry'])");
-        emit("# Join + merge");
-        emit("join = nodes.new('GeometryNodeJoinGeometry')");
-        emit("join.location = (x_pos + 400, y_pos)");
-        emit("links.new(ctm.outputs['Mesh'], join.inputs['Geometry'])");
-        emit("links.new(flip.outputs['Mesh'], join.inputs['Geometry'])");
-        emit("links.new(xform_top.outputs['Geometry'], join.inputs['Geometry'])");
-        emit("merge = nodes.new('GeometryNodeMergeByDistance')");
-        emit("merge.location = (x_pos + 600, y_pos)");
-        emit("merge.inputs['Distance'].default_value = 0.0001");
-        emit("links.new(join.outputs['Geometry'], merge.inputs['Geometry'])");
-        emit("last_geo = merge");
+        emit("_cg = geo_out(children_geo)");
+        emit("_is_compound = _cg is not None and hasattr(_cg, 'bl_idname') and _cg.bl_idname == 'GeometryNodeJoinGeometry'");
+        emit("ctm.inputs['Fill Caps'].default_value = not _is_compound");
+        emit("links.new(line.outputs['Curve'], ctm.inputs['Curve'])");
+        emit("links.new(_cg, ctm.inputs['Profile Curve'])");
+        emit("last_geo = ctm");
+        emit("if _is_compound:");
+        indent_++;
+        emit("_fc_b = nodes.new('GeometryNodeFillCurve')");
+        emit("_fc_b.location = (x_pos + 200, y_pos - 100)");
+        emit("links.new(_cg, _fc_b.inputs['Curve'])");
+        emit("_ff_b = nodes.new('GeometryNodeFlipFaces')");
+        emit("_ff_b.location = (x_pos + 400, y_pos - 100)");
+        emit("links.new(_fc_b.outputs['Mesh'], _ff_b.inputs['Mesh'])");
+        emit("_fc_t = nodes.new('GeometryNodeFillCurve')");
+        emit("_fc_t.location = (x_pos + 200, y_pos - 200)");
+        emit("links.new(_cg, _fc_t.inputs['Curve'])");
+        emit("_xf_t = nodes.new('GeometryNodeTransform')");
+        emit("_xf_t.location = (x_pos + 400, y_pos - 200)");
+        emit("links.new(_fc_t.outputs['Mesh'], _xf_t.inputs['Geometry'])");
+        emit("_xf_t.inputs['Translation'].default_value = (0, 0, float(height))");
+        emit("_jn_c = nodes.new('GeometryNodeJoinGeometry')");
+        emit("_jn_c.location = (x_pos + 600, y_pos)");
+        emit("links.new(ctm.outputs['Mesh'], _jn_c.inputs['Geometry'])");
+        emit("links.new(_ff_b.outputs['Mesh'], _jn_c.inputs['Geometry'])");
+        emit("links.new(_xf_t.outputs['Geometry'], _jn_c.inputs['Geometry'])");
+        emit("_mrg_c = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_mrg_c.location = (x_pos + 800, y_pos)");
+        emit("links.new(_jn_c.outputs['Geometry'], _mrg_c.inputs['Geometry'])");
+        emit("_mrg_c.inputs['Distance'].default_value = 0.0001");
+        emit("last_geo = _mrg_c");
+        indent_--;
         emit("# Handle scale");
         emit("if isinstance(scale, (int, float)) and abs(scale - 1.0) > 0.001:");
         indent_++;
@@ -1955,10 +1958,72 @@ void BlenderGenerator::visit(TransformNode& node) {
             emit("# Color transform (visual only, not applied in Geometry Nodes)");
             processChildren(node);
             break;
-        case ASTNode::Type::Offset:
-            processChildren(node);
-            emitOffset(node.args());
+        case ASTNode::Type::Offset: {
+            // Optimization: offset() of a circle is just a circle with modified radius
+            // This avoids the expensive SetPosition+FilletCurve path that adds 10x vertices
+            bool offsetHandled = false;
+            auto& offsetChildren = node.children();
+            ASTNodePtr singleChild;
+            if (offsetChildren.size() == 1) {
+                singleChild = offsetChildren[0];
+            } else if (offsetChildren.size() == 1 && offsetChildren[0] &&
+                       offsetChildren[0]->type() == ASTNode::Type::Union &&
+                       offsetChildren[0]->children().size() == 1) {
+                singleChild = offsetChildren[0]->children()[0];
+            }
+            if (singleChild && singleChild->type() == ASTNode::Type::Circle) {
+                // offset(d) circle(r) → circle(r + d)
+                Value offR = getArg(node.args(), "r", getPositionalArg(node.args(), 0, Value()));
+                Value offDelta = getArg(node.args(), "delta", Value());
+                Value offVal;
+                if (!offR.isUndefined()) offVal = offR;
+                else if (!offDelta.isUndefined()) offVal = offDelta;
+                else offVal = getPositionalArg(node.args(), 0, Value(0.0));
+
+                // Get circle args
+                auto* circleChild = dynamic_cast<PrimitiveNode*>(singleChild.get());
+                if (!circleChild) { processChildren(node); emitOffset(node.args()); break; }
+                const auto& cArgs = circleChild->args();
+                Value cR = getArg(cArgs, "r", getPositionalArg(cArgs, 0, Value(1.0)));
+                Value cD = getArg(cArgs, "d", Value());
+
+                // Compute new radius = circleR + offsetVal
+                double circleRadius = cD.isUndefined() ? cR.toNumber() : cD.toNumber() / 2.0;
+                double offsetAmount = offVal.toNumber();
+                double newRadius = circleRadius + offsetAmount;
+
+                // Build modified circle args
+                Arguments newCircleArgs = cArgs;
+                newCircleArgs.erase("d");
+                // Check if circle radius or offset are expressions (module params)
+                ExprNodePtr circleRTree = cD.isUndefined() ? resolveExprTree(cR) : nullptr;
+                ExprNodePtr offsetTree = resolveExprTree(offVal);
+                bool circleIsExpr = circleRTree && circleRTree->hasVariableRefs();
+                bool offsetIsExpr = offsetTree && offsetTree->hasVariableRefs();
+                if (circleIsExpr || offsetIsExpr) {
+                    // Build expression tree: circleR + offset
+                    ExprNodePtr rTree = circleRTree ? circleRTree : ExprNode::makeLiteral(circleRadius);
+                    ExprNodePtr oTree = offsetTree ? offsetTree : ExprNode::makeLiteral(offsetAmount);
+                    if (!cD.isUndefined()) {
+                        ExprNodePtr dTree = resolveExprTree(cD);
+                        rTree = ExprNode::makeBinary(ExprNode::Op::DIVIDE,
+                            dTree ? dTree : ExprNode::makeLiteral(cD.toNumber()),
+                            ExprNode::makeLiteral(2.0));
+                    }
+                    ExprNodePtr sumTree = ExprNode::makeBinary(ExprNode::Op::ADD, rTree, oTree);
+                    newCircleArgs["r"] = Value::expressionWithTree("", sumTree);
+                } else {
+                    newCircleArgs["r"] = Value(newRadius);
+                }
+                emitCircle(newCircleArgs);
+                offsetHandled = true;
+            }
+            if (!offsetHandled) {
+                processChildren(node);
+                emitOffset(node.args());
+            }
             break;
+        }
         case ASTNode::Type::Hull: {
             bool wasInHull = in_hull_;
             in_hull_ = true;
@@ -6011,6 +6076,55 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
 
     emit("# Offset");
 
+    // Runtime optimization: if offsetting a circle, just create a new circle with modified radius
+    // This avoids the expensive SetPosition+FilletCurve path that adds ~10x unnecessary vertices
+    if (useRounding) {
+        std::string skipLabel = newNodeId();
+        emit("if last_geo is not None and hasattr(last_geo, 'bl_idname') and last_geo.bl_idname == 'GeometryNodeCurvePrimitiveCircle':");
+        indent_++;
+        emit("_offset_circle = nodes.new('GeometryNodeCurvePrimitiveCircle')");
+        emit("_offset_circle.location = (x_pos, y_pos)");
+        // Copy resolution from original circle
+        emit("for _lnk in last_geo.inputs['Resolution'].links:");
+        indent_++;
+        emit("links.new(_lnk.from_socket, _offset_circle.inputs['Resolution'])");
+        indent_--;
+        emit("if not last_geo.inputs['Resolution'].links:");
+        indent_++;
+        emit("_offset_circle.inputs['Resolution'].default_value = last_geo.inputs['Resolution'].default_value");
+        indent_--;
+        // New radius = original radius + offset
+        emit("_orig_r = last_geo.inputs['Radius'].default_value");
+        // Use exprTreeToPython for correct expression (e.g. _vdiv(wall, 2) inside modules)
+        ExprNodePtr offsetTreeCircle = getOrMakeLiteralTree(offsetVal);
+        std::string offsetPyCircle;
+        if (offsetTreeCircle->hasVariableRefs()) {
+            offsetPyCircle = exprTreeToPython(offsetTreeCircle);
+        } else {
+            offsetPyCircle = pyDouble(offsetVal.toNumber());
+        }
+        emit("_off_val = float(_s(" + offsetPyCircle + "))");
+        // Check if Radius has a link (dynamic)
+        emit("if last_geo.inputs['Radius'].links:");
+        indent_++;
+        emit("_add_node = nodes.new('ShaderNodeMath')");
+        emit("_add_node.operation = 'ADD'");
+        emit("_add_node.location = (x_pos, y_pos - 100)");
+        emit("links.new(last_geo.inputs['Radius'].links[0].from_socket, _add_node.inputs[0])");
+        emit("_add_node.inputs[1].default_value = _off_val");
+        emit("links.new(_add_node.outputs['Value'], _offset_circle.inputs['Radius'])");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("_offset_circle.inputs['Radius'].default_value = _orig_r + _off_val");
+        indent_--;
+        emit("last_geo = _offset_circle");
+        emit("x_pos += 200");
+        indent_--;
+        emit("else:");
+        indent_++;
+    }
+
     if (!useRounding) {
         // delta mode: subdivide straight edges for smooth offset without corner rounding.
         std::string subdivId = newNodeId();
@@ -6156,6 +6270,8 @@ void BlenderGenerator::emitOffset(const Arguments& args) {
         emit("link_nodes(links, last_geo, 'Curve', " + filletId + ", 'Curve')");
         emit("last_geo = " + filletId);
         emit("x_pos += 200");
+        // Close the else: block from the circle-detection optimization
+        indent_--;
     }
 }
 
@@ -7099,119 +7215,73 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         emit("links.new(_cmp.outputs['Result'], _m2c.inputs['Selection'])");
         emit("x_pos += 600");
 
-        // CurveToMesh with the converted curves as profile
+        // CurveToMesh with Fill Caps = True
         emit("_ctm_m = nodes.new('GeometryNodeCurveToMesh')");
         emit("_ctm_m.location = (x_pos, y_pos)");
         emit("links.new(" + lineId + ".outputs['Curve'], _ctm_m.inputs['Curve'])");
         emit("links.new(_m2c.outputs['Curve'], _ctm_m.inputs['Profile Curve'])");
-        emit("_ctm_m.inputs['Fill Caps'].default_value = False");
+        emit("_ctm_m.inputs['Fill Caps'].default_value = True");
 
-        // Bottom cap: FillCurve of converted curves + FlipFaces
-        emit("_fb_m = nodes.new('GeometryNodeFillCurve')");
-        emit("_fb_m.location = (x_pos + 200, y_pos - 100)");
-        emit("links.new(_m2c.outputs['Curve'], _fb_m.inputs['Curve'])");
-        emit("_ff_m = nodes.new('GeometryNodeFlipFaces')");
-        emit("_ff_m.location = (x_pos + 400, y_pos - 100)");
-        emit("links.new(_fb_m.outputs['Mesh'], _ff_m.inputs['Mesh'])");
-
-        // Top cap: FillCurve of converted curves + translate to Z=height
-        emit("_ft_m = nodes.new('GeometryNodeFillCurve')");
-        emit("_ft_m.location = (x_pos + 200, y_pos - 200)");
-        emit("links.new(_m2c.outputs['Curve'], _ft_m.inputs['Curve'])");
-        emit("_xt_m = nodes.new('GeometryNodeTransform')");
-        emit("_xt_m.location = (x_pos + 400, y_pos - 200)");
-        emit("links.new(_ft_m.outputs['Mesh'], _xt_m.inputs['Geometry'])");
-        if (heightLinkedToGroupInput) {
-            std::string combExtId = newNodeId();
-            emit(combExtId + " = nodes.new('ShaderNodeCombineXYZ')");
-            emit(combExtId + ".location = (x_pos + 400, y_pos - 350)");
-            auto extResult = emitExpressionNodeTree(heightTree);
-            connectExprResultNamed(extResult, combExtId, "Z");
-            emit("links.new(" + combExtId + ".outputs['Vector'], _xt_m.inputs['Translation'])");
-        } else if (!heightEndExpr.empty()) {
-            emit("_xt_m.inputs['Translation'].default_value = (0, 0, _s(" + heightEndExpr + "))");
-        } else {
-            emit("_xt_m.inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
-        }
-
-        // Join walls + caps + MergeByDistance
-        emit("_jn_m = nodes.new('GeometryNodeJoinGeometry')");
-        emit("_jn_m.location = (x_pos + 600, y_pos)");
-        emit("links.new(_xt_m.outputs['Geometry'], _jn_m.inputs['Geometry'])");
-        emit("links.new(_ff_m.outputs['Mesh'], _jn_m.inputs['Geometry'])");
-        emit("links.new(_ctm_m.outputs['Mesh'], _jn_m.inputs['Geometry'])");
-        emit("_mg_m = nodes.new('GeometryNodeMergeByDistance')");
-        emit("_mg_m.location = (x_pos + 800, y_pos)");
-        emit("_mg_m.inputs['Distance'].default_value = 0.0001");
-        emit("links.new(_jn_m.outputs['Geometry'], _mg_m.inputs['Geometry'])");
-        emit("last_geo = _mg_m");
-        emit("x_pos += 1000");
+        emit("last_geo = _ctm_m");
+        emit("x_pos += 200");
         indent_--;
 
         emit("else:");
         indent_++;
         std::string profileVar = "_profile_geo";
 
-        // CurveToMesh with Fill Caps = False
-        // Fill Caps=True creates nested geometry with flipped normals on compound curves
-        // Instead we cap manually with FillCurve + FlipFaces + Transform + Join + Merge
+        // CurveToMesh — detect compound profile (ring from 2D difference) for proper capping
         std::string ctmId = newNodeId();
         emit(ctmId + " = nodes.new('GeometryNodeCurveToMesh')");
         emit(ctmId + ".location = (x_pos, y_pos)");
         emit("links.new(" + lineId + ".outputs['Curve'], " + ctmId + ".inputs['Curve'])");
         emit("link_nodes(links, " + profileVar + ", 'Curve', " + ctmId + ", 'Profile Curve')");
-        emit(ctmId + ".inputs['Fill Caps'].default_value = False");
-
-        // Bottom cap: FillCurve of the profile, with FlipFaces (normals point down)
-        std::string fillBot = newNodeId();
-        emit(fillBot + " = nodes.new('GeometryNodeFillCurve')");
-        emit(fillBot + ".location = (x_pos + 200, y_pos - 100)");
-        emit("link_nodes(links, " + profileVar + ", 'Curve', " + fillBot + ", 'Curve')");
-        std::string flipId = newNodeId();
-        emit(flipId + " = nodes.new('GeometryNodeFlipFaces')");
-        emit(flipId + ".location = (x_pos + 400, y_pos - 100)");
-        emit("links.new(" + fillBot + ".outputs['Mesh'], " + flipId + ".inputs['Mesh'])");
-
-        // Top cap: FillCurve of the profile, translated to Z=height
-        std::string fillTop = newNodeId();
-        emit(fillTop + " = nodes.new('GeometryNodeFillCurve')");
-        emit(fillTop + ".location = (x_pos + 200, y_pos - 200)");
-        emit("link_nodes(links, " + profileVar + ", 'Curve', " + fillTop + ", 'Curve')");
-        std::string xformTop = newNodeId();
-        emit(xformTop + " = nodes.new('GeometryNodeTransform')");
-        emit(xformTop + ".location = (x_pos + 400, y_pos - 200)");
-        emit("links.new(" + fillTop + ".outputs['Mesh'], " + xformTop + ".inputs['Geometry'])");
-        if (heightLinkedToGroupInput) {
-            // Link top cap translation Z to same group_input expression
+        // For compound profiles (ring from 2D boolean), Fill Caps creates independent disc fills
+        // that cover the hole. Use FillCurve manual caps for proper annular capping.
+        emit("_is_compound = " + profileVar + " is not None and hasattr(" + profileVar + ", 'bl_idname') and " + profileVar + ".bl_idname == 'GeometryNodeJoinGeometry'");
+        emit(ctmId + ".inputs['Fill Caps'].default_value = not _is_compound");
+        emit("if _is_compound:");
+        indent_++;
+        emit("_fc_bot = nodes.new('GeometryNodeFillCurve')");
+        emit("_fc_bot.location = (x_pos + 200, y_pos - 100)");
+        emit("link_nodes(links, " + profileVar + ", 'Curve', _fc_bot, 'Curve')");
+        emit("_ff_bot = nodes.new('GeometryNodeFlipFaces')");
+        emit("_ff_bot.location = (x_pos + 400, y_pos - 100)");
+        emit("links.new(_fc_bot.outputs['Mesh'], _ff_bot.inputs['Mesh'])");
+        emit("_fc_top = nodes.new('GeometryNodeFillCurve')");
+        emit("_fc_top.location = (x_pos + 200, y_pos - 200)");
+        emit("link_nodes(links, " + profileVar + ", 'Curve', _fc_top, 'Curve')");
+        emit("_xf_top = nodes.new('GeometryNodeTransform')");
+        emit("_xf_top.location = (x_pos + 400, y_pos - 200)");
+        emit("links.new(_fc_top.outputs['Mesh'], _xf_top.inputs['Geometry'])");
+        // Height translation for top cap
+        if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
             std::string combCapId = newNodeId();
             emit(combCapId + " = nodes.new('ShaderNodeCombineXYZ')");
             emit(combCapId + ".location = (x_pos + 400, y_pos - 350)");
             auto capResult = emitExpressionNodeTree(heightTree);
             connectExprResultNamed(capResult, combCapId, "Z");
-            emit("links.new(" + combCapId + ".outputs['Vector'], " + xformTop + ".inputs['Translation'])");
-        } else if (!heightEndExpr.empty()) {
-            emit(xformTop + ".inputs['Translation'].default_value = (0, 0, _s(" + heightEndExpr + "))");
+            emit("links.new(" + combCapId + ".outputs['Vector'], _xf_top.inputs['Translation'])");
         } else {
-            emit(xformTop + ".inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+            emit("_xf_top.inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
         }
-
-        // Join walls + bottom cap + top cap
-        std::string joinId = newNodeId();
-        emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinId + ".location = (x_pos + 600, y_pos)");
-        emit("links.new(" + ctmId + ".outputs['Mesh'], " + joinId + ".inputs['Geometry'])");
-        emit("links.new(" + flipId + ".outputs['Mesh'], " + joinId + ".inputs['Geometry'])");
-        emit("links.new(" + xformTop + ".outputs['Geometry'], " + joinId + ".inputs['Geometry'])");
-
-        // MergeByDistance to weld shared boundary vertices
-        std::string mergeId = newNodeId();
-        emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
-        emit(mergeId + ".location = (x_pos + 800, y_pos)");
-        emit("links.new(" + joinId + ".outputs['Geometry'], " + mergeId + ".inputs['Geometry'])");
-        emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
-
-        emit("last_geo = " + mergeId);
+        emit("_jn_caps = nodes.new('GeometryNodeJoinGeometry')");
+        emit("_jn_caps.location = (x_pos + 600, y_pos)");
+        emit("links.new(" + ctmId + ".outputs['Mesh'], _jn_caps.inputs['Geometry'])");
+        emit("links.new(_ff_bot.outputs['Mesh'], _jn_caps.inputs['Geometry'])");
+        emit("links.new(_xf_top.outputs['Geometry'], _jn_caps.inputs['Geometry'])");
+        emit("_mrg_caps = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_mrg_caps.location = (x_pos + 800, y_pos)");
+        emit("links.new(_jn_caps.outputs['Geometry'], _mrg_caps.inputs['Geometry'])");
+        emit("_mrg_caps.inputs['Distance'].default_value = 0.0001");
+        emit("last_geo = _mrg_caps");
         emit("x_pos += 1000");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("last_geo = " + ctmId);
+        emit("x_pos += 200");
+        indent_--;
         indent_--;  // close 'else:' (curve profile path)
     } else {
         // CurveToMesh approach — supports twist and scale (only works for simple single-spline profiles)
@@ -7301,66 +7371,50 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         emit(ctmId + ".location = (x_pos, y_pos)");
         emit("links.new(" + pathCurve + ".outputs['" + pathOutput + "'], " + ctmId + ".inputs['Curve'])");
         emit("link_nodes(links, " + profileGeo + ", 'Curve', " + ctmId + ", 'Profile Curve')");
-        emit(ctmId + ".inputs['Fill Caps'].default_value = False");
-
-        // Bottom cap: FillCurve with FlipFaces (normals pointing down at Z=0)
-        std::string fillBot2 = newNodeId();
-        emit(fillBot2 + " = nodes.new('GeometryNodeFillCurve')");
-        emit(fillBot2 + ".location = (x_pos + 200, y_pos - 100)");
-        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + fillBot2 + ", 'Curve')");
-        std::string flipId2 = newNodeId();
-        emit(flipId2 + " = nodes.new('GeometryNodeFlipFaces')");
-        emit(flipId2 + ".location = (x_pos + 400, y_pos - 100)");
-        emit("links.new(" + fillBot2 + ".outputs['Mesh'], " + flipId2 + ".inputs['Mesh'])");
-
-        // Top cap: FillCurve translated to Z=height
-        std::string fillTop2 = newNodeId();
-        emit(fillTop2 + " = nodes.new('GeometryNodeFillCurve')");
-        emit(fillTop2 + ".location = (x_pos + 200, y_pos - 200)");
-        emit("link_nodes(links, " + profileGeo + ", 'Curve', " + fillTop2 + ", 'Curve')");
-        std::string xformTop2 = newNodeId();
-        emit(xformTop2 + " = nodes.new('GeometryNodeTransform')");
-        emit(xformTop2 + ".location = (x_pos + 400, y_pos - 200)");
-        emit("links.new(" + fillTop2 + ".outputs['Mesh'], " + xformTop2 + ".inputs['Geometry'])");
+        // Compound profile (ring) needs manual FillCurve caps for proper annular capping
+        emit("_is_compound = " + profileGeo + " is not None and hasattr(" + profileGeo + ", 'bl_idname') and " + profileGeo + ".bl_idname == 'GeometryNodeJoinGeometry'");
+        emit(ctmId + ".inputs['Fill Caps'].default_value = not _is_compound");
+        emit("if _is_compound:");
+        indent_++;
+        emit("_fc_bot = nodes.new('GeometryNodeFillCurve')");
+        emit("_fc_bot.location = (x_pos + 200, y_pos - 100)");
+        emit("link_nodes(links, " + profileGeo + ", 'Curve', _fc_bot, 'Curve')");
+        emit("_ff_bot = nodes.new('GeometryNodeFlipFaces')");
+        emit("_ff_bot.location = (x_pos + 400, y_pos - 100)");
+        emit("links.new(_fc_bot.outputs['Mesh'], _ff_bot.inputs['Mesh'])");
+        emit("_fc_top = nodes.new('GeometryNodeFillCurve')");
+        emit("_fc_top.location = (x_pos + 200, y_pos - 200)");
+        emit("link_nodes(links, " + profileGeo + ", 'Curve', _fc_top, 'Curve')");
+        emit("_xf_top = nodes.new('GeometryNodeTransform')");
+        emit("_xf_top.location = (x_pos + 400, y_pos - 200)");
+        emit("links.new(_fc_top.outputs['Mesh'], _xf_top.inputs['Geometry'])");
         if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
             std::string combCapId = newNodeId();
             emit(combCapId + " = nodes.new('ShaderNodeCombineXYZ')");
             emit(combCapId + ".location = (x_pos + 400, y_pos - 350)");
             auto capResult = emitExpressionNodeTree(heightTree);
             connectExprResultNamed(capResult, combCapId, "Z");
-            emit("links.new(" + combCapId + ".outputs['Vector'], " + xformTop2 + ".inputs['Translation'])");
-        } else if (in_module_ && heightTree->hasVariableRefs() && exprTreeReferencesModuleParams(heightTree)) {
-            if (exprTreeHasOnlyGroupInputVars(heightTree)) {
-                std::string combCapId = newNodeId();
-                emit(combCapId + " = nodes.new('ShaderNodeCombineXYZ')");
-                emit(combCapId + ".location = (x_pos + 400, y_pos - 350)");
-                auto capResult = emitExpressionNodeTree(heightTree);
-                connectExprResultNamed(capResult, combCapId, "Z");
-                emit("links.new(" + combCapId + ".outputs['Vector'], " + xformTop2 + ".inputs['Translation'])");
-            } else {
-                std::string hPy = exprTreeToPython(heightTree);
-                emit(xformTop2 + ".inputs['Translation'].default_value = (0, 0, _s(" + hPy + "))");
-            }
+            emit("links.new(" + combCapId + ".outputs['Vector'], _xf_top.inputs['Translation'])");
         } else {
-            emit(xformTop2 + ".inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+            emit("_xf_top.inputs['Translation'].default_value = (0, 0, " + pyDouble(hVal) + ")");
         }
-        // Join walls + caps
-        std::string joinId2 = newNodeId();
-        emit(joinId2 + " = nodes.new('GeometryNodeJoinGeometry')");
-        emit(joinId2 + ".location = (x_pos + 600, y_pos)");
-        emit("links.new(" + ctmId + ".outputs['Mesh'], " + joinId2 + ".inputs['Geometry'])");
-        emit("links.new(" + flipId2 + ".outputs['Mesh'], " + joinId2 + ".inputs['Geometry'])");
-        emit("links.new(" + xformTop2 + ".outputs['Geometry'], " + joinId2 + ".inputs['Geometry'])");
-
-        // MergeByDistance to weld boundary vertices
-        std::string mergeId2 = newNodeId();
-        emit(mergeId2 + " = nodes.new('GeometryNodeMergeByDistance')");
-        emit(mergeId2 + ".location = (x_pos + 800, y_pos)");
-        emit("links.new(" + joinId2 + ".outputs['Geometry'], " + mergeId2 + ".inputs['Geometry'])");
-        emit(mergeId2 + ".inputs['Distance'].default_value = 0.0001");
-
-        emit("last_geo = " + mergeId2);
+        emit("_jn_caps = nodes.new('GeometryNodeJoinGeometry')");
+        emit("_jn_caps.location = (x_pos + 600, y_pos)");
+        emit("links.new(" + ctmId + ".outputs['Mesh'], _jn_caps.inputs['Geometry'])");
+        emit("links.new(_ff_bot.outputs['Mesh'], _jn_caps.inputs['Geometry'])");
+        emit("links.new(_xf_top.outputs['Geometry'], _jn_caps.inputs['Geometry'])");
+        emit("_mrg_caps = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_mrg_caps.location = (x_pos + 800, y_pos)");
+        emit("links.new(_jn_caps.outputs['Geometry'], _mrg_caps.inputs['Geometry'])");
+        emit("_mrg_caps.inputs['Distance'].default_value = 0.0001");
+        emit("last_geo = _mrg_caps");
         emit("x_pos += 1000");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("last_geo = " + ctmId);
+        emit("x_pos += 200");
+        indent_--;
 
         // Apply scale after CurveToMesh using SetPosition
         // scaleFactor = 1 + (Z / height) * (targetScale - 1)
