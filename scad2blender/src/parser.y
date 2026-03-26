@@ -3206,14 +3206,11 @@ expr:
             if (resolved.isVector() && (size_t)idx < resolved.size()) {
                 $$ = new Value(resolved.toVector()[idx]);
             } else {
-                // Can't resolve — use repr() (not toPython()) to preserve the raw name
-                std::string rawName = $1->repr();
-                // Strip surrounding <expr: > if present
-                if (rawName.size() > 7 && rawName.substr(0, 7) == "<expr: ") {
-                    rawName = rawName.substr(7, rawName.size() - 8);
-                }
-                auto tree = ExprNode::makeVarRef(rawName + "." + *$3);
-                $$ = new Value(Value::expressionWithTree(rawName + "." + *$3, tree));
+                // Can't resolve — defer as __index__(expr, idx) for code generator
+                auto idx_tree = ExprNode::makeLiteral((double)idx);
+                auto fc = ExprNode::makeFunctionCall("__index__", {$1->exprTree(), idx_tree});
+                std::string exprName = "__index__(" + $1->repr() + "," + std::to_string(idx) + ")";
+                $$ = new Value(Value::expressionWithTree(exprName, fc));
             }
         } else {
             $$ = new Value();

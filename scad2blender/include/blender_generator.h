@@ -76,6 +76,8 @@ private:
     std::set<std::string> loop_variables_;            // Active for-loop variable names
     std::set<std::string> group_input_vars_;  // Variables with group_input sockets
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
+    std::map<std::string, std::string> module_param_to_gi_socket_;  // active module's param → group_input socket
+    std::map<std::string, std::map<std::string, std::string>> module_gi_maps_;  // per-module gi maps
     std::set<std::string> for_loop_range_vars_; // Variables used as for-loop range bounds
     std::set<std::string> non_geometric_modules_; // Modules that produce no geometry
     std::set<std::string> python_helper_functions_; // Recursive functions needing Python helpers
@@ -176,6 +178,9 @@ private:
     void emitModulesRecursive(ASTNode* node);
     bool nodeProducesGeometry(ASTNode* node);
     void classifyModuleGeometry(ASTNode* node);
+    void buildModuleGiMaps(ASTNodePtr& root);
+    void propagateGiMaps(const std::string& moduleName, const std::map<std::string, std::string>& parentMap);
+    ExprNodePtr substituteParams(const ExprNodePtr& body, const std::vector<std::string>& params, const std::vector<ExprNodePtr>& args);
 
     // Helper to evaluate an expression Value to a numeric result by resolving variable refs
     double evaluateExpr(const Value& value);
@@ -189,6 +194,7 @@ private:
     std::string exprTreeToPython(const ExprNodePtr& tree);
     std::string exprTreeToPythonInner(const ExprNodePtr& tree);
     int expr_depth_ = 0;
+    bool suppress_expr_extraction_ = false;  // suppress _expr_N extraction in lambda-scoped contexts
     std::unordered_map<ExprNode*, std::string> expr_cache_;
 
     // Check if an expression tree contains a call to a specific function
