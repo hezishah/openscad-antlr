@@ -67,6 +67,7 @@ private:
     bool in_module_ = false;
     bool in_hull_ = false;
     bool in_extrude_ = false;
+    bool in_difference_ = false;
     bool has_3d_geometry_ = false;  // Set when any 3D primitive or extrusion is emitted
     int eval_steps_ = 0;
     int eval_call_count_ = 0;
@@ -128,6 +129,9 @@ private:
     void emitOffset(const Arguments& args);
     void emitHull(const Arguments& args);
     void emitMinkowski(const Arguments& args);
+    void emitResize(const Arguments& args);
+    void emitColor(const Arguments& args);
+    void emitProjection(const Arguments& args, ASTNode& node);
     void emitRoof(const Arguments& args);
 
     // Boolean generators

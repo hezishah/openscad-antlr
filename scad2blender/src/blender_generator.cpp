@@ -239,6 +239,9 @@ void BlenderGenerator::emitBlank() {
 }
 
 std::string BlenderGenerator::indent() const {
+    if (indent_ < 0) {
+        return "";
+    }
     return std::string(indent_ * 4, ' ');
 }
 
@@ -1755,7 +1758,13 @@ void BlenderGenerator::emitFooter() {
     indent_--;
     indent_--;
     indent_--;
+    indent_--;
+    // Force indent to 1 (inside main) — the 5 decrements above assume specific nesting
+    // but code generation paths may leave indent_ off by 1
+    indent_ = 1;
     emitBlank();
+
+    // Select the object and evaluate geometry nodes
     emit("# Select the object");
     emit("bpy.context.view_layer.objects.active = obj");
     emit("obj.select_set(True)");
@@ -1763,7 +1772,6 @@ void BlenderGenerator::emitFooter() {
     emit("# Evaluate the geometry nodes modifier to produce mesh");
     emit("depsgraph = bpy.context.evaluated_depsgraph_get()");
     emit("eval_obj = obj.evaluated_get(depsgraph)");
-    emit("eval_mesh = eval_obj.to_mesh()");
     emitBlank();
     emit("# Copy evaluated mesh back so the object has real geometry for export");
     emit("obj.data = bpy.data.meshes.new_from_object(eval_obj)");
@@ -1773,6 +1781,8 @@ void BlenderGenerator::emitFooter() {
     emit("obj.modifiers.clear()");
     emit("bpy.data.node_groups.remove(node_group)");
     emitBlank();
+
+    // Clean up temporary objects
     emit("# Clean up temporary boolean objects");
     emit("for _o in list(bpy.data.objects):");
     indent_++;
@@ -1801,6 +1811,45 @@ void BlenderGenerator::emitFooter() {
     indent_--;
     indent_--;
     emitBlank();
+
+    // BMesh cleanup
+    emit("# BMesh cleanup: merge, dissolve degenerate, remove duplicates, recalc normals");
+    emit("import bmesh");
+    emit("bm = bmesh.new()");
+    emit("bm.from_mesh(obj.data)");
+    emit("bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)");
+    emit("bmesh.ops.dissolve_degenerate(bm, edges=bm.edges, dist=0.001)");
+    emit("# Remove duplicate faces");
+    emit("face_sigs = {}");
+    emit("dup_faces = []");
+    emit("for f in bm.faces:");
+    indent_++;
+    emit("sig = tuple(sorted(v.index for v in f.verts))");
+    emit("if sig in face_sigs:");
+    indent_++;
+    emit("dup_faces.append(f)");
+    indent_--;
+    emit("else:");
+    indent_++;
+    emit("face_sigs[sig] = f");
+    indent_--;
+    indent_--;
+    emit("if dup_faces:");
+    indent_++;
+    emit("bmesh.ops.delete(bm, geom=dup_faces, context='FACES')");
+    indent_--;
+    emit("# Remove loose vertices/edges");
+    emit("loose = [v for v in bm.verts if not v.link_faces]");
+    emit("if loose:");
+    indent_++;
+    emit("bmesh.ops.delete(bm, geom=loose, context='VERTS')");
+    indent_--;
+    emit("bmesh.ops.recalc_face_normals(bm, faces=bm.faces)");
+    emit("bm.to_mesh(obj.data)");
+    emit("bm.free()");
+    emitBlank();
+
+    // STL export
     emit("# Determine STL output path from script filename");
     emit("script_path = os.path.abspath(__file__)");
     emit("stl_path = os.path.splitext(script_path)[0] + '.stl'");
@@ -1817,6 +1866,12 @@ void BlenderGenerator::emitFooter() {
     emit("bpy.ops.wm.stl_export(filepath=stl_path, export_selected_objects=True)");
     indent_--;
     emit("print(f'Exported STL to: {stl_path}')");
+    emitBlank();
+
+    // Print mesh stats
+    emit("me = obj.data");
+    emit("print(f'Mesh: {len(me.vertices)}v {len(me.polygons)}f')");
+
     indent_--;
     emitBlank();
     emit("if __name__ == '__main__':");
@@ -1928,6 +1983,10 @@ void BlenderGenerator::visit(PrimitiveNode& node) {
         case ASTNode::Type::Surface:
             emitSurface(node.args());
             break;
+        case ASTNode::Type::Projection:
+            processChildren(node);
+            emitProjection(node.args(), node);
+            break;
         default:
             emit("# Unsupported primitive type");
             break;
@@ -1953,10 +2012,8 @@ void BlenderGenerator::visit(TransformNode& node) {
             emitMirror(node.args());
             break;
         case ASTNode::Type::Color:
-            // Color is not directly supported in Geometry Nodes,
-            // just process children and pass geometry through
-            emit("# Color transform (visual only, not applied in Geometry Nodes)");
             processChildren(node);
+            emitColor(node.args());
             break;
         case ASTNode::Type::Offset: {
             // Optimization: offset() of a circle is just a circle with modified radius
@@ -2097,6 +2154,166 @@ void BlenderGenerator::visit(TransformNode& node) {
                 }
             }
             if (!handled) {
+                // 3D Minkowski: detect sphere or cube as second child
+                if (mkChildren.size() == 2) {
+                    int sphereIdx = -1, cubeIdx = -1;
+                    for (int ci = 0; ci < 2; ci++) {
+                        if (mkChildren[ci] && mkChildren[ci]->type() == ASTNode::Type::Sphere) {
+                            sphereIdx = ci;
+                        } else if (mkChildren[ci] && mkChildren[ci]->type() == ASTNode::Type::Cube) {
+                            cubeIdx = ci;
+                        }
+                    }
+                    // sphere + other shape
+                    if (sphereIdx >= 0) {
+                        int shapeIdx3D = 1 - sphereIdx;
+                        // minkowski() { shape; sphere(r); } → subdivide + offset along normals
+                        auto* sphereNode = dynamic_cast<PrimitiveNode*>(mkChildren[sphereIdx].get());
+                        if (sphereNode) {
+                            const auto& sArgs = sphereNode->args();
+                            Value sR = getArg(sArgs, "r", getPositionalArg(sArgs, 0, Value(1.0)));
+                            Value sD = getArg(sArgs, "d", Value());
+                            double radius = sD.isUndefined() ? sR.toNumber() : sD.toNumber() / 2.0;
+
+                            emit("# Minkowski 3D (shape + sphere → subdivide + normal offset)");
+                            mkChildren[shapeIdx3D]->accept(*this);
+
+                            // Subdivide for smoother result
+                            std::string subId = newNodeId();
+                            emit(subId + " = nodes.new('GeometryNodeSubdivideMesh')");
+                            emit(subId + ".location = (x_pos, y_pos)");
+                            emit(subId + ".inputs['Level'].default_value = 2");
+                            emit("link_nodes(links, last_geo, 'Geometry', " + subId + ", 'Mesh')");
+                            emit("last_geo = " + subId);
+                            emit("x_pos += 200");
+
+                            // Get face normals via InputNormal
+                            std::string normalId = newNodeId();
+                            emit(normalId + " = nodes.new('GeometryNodeInputNormal')");
+                            emit(normalId + ".location = (x_pos, y_pos - 200)");
+
+                            // Scale normals by radius
+                            std::string scaleId = newNodeId();
+                            emit(scaleId + " = nodes.new('ShaderNodeVectorMath')");
+                            emit(scaleId + ".operation = 'SCALE'");
+                            emit(scaleId + ".location = (x_pos + 200, y_pos - 200)");
+                            emit("links.new(" + normalId + ".outputs['Normal'], " + scaleId + ".inputs[0])");
+                            emit(scaleId + ".inputs['Scale'].default_value = " + pyDouble(radius));
+
+                            // SetPosition with offset = scaled normal
+                            std::string setPosId = newNodeId();
+                            emit(setPosId + " = nodes.new('GeometryNodeSetPosition')");
+                            emit(setPosId + ".location = (x_pos + 400, y_pos)");
+                            emit("link_nodes(links, last_geo, 'Geometry', " + setPosId + ", 'Geometry')");
+                            emit("links.new(" + scaleId + ".outputs['Vector'], " + setPosId + ".inputs['Offset'])");
+                            emit("last_geo = " + setPosId);
+                            emit("x_pos += 600");
+
+                            handled = true;
+                        }
+                    } else if (cubeIdx >= 0 && sphereIdx < 0) {
+                        // cube + other shape (but not sphere+cube which is handled above)
+                        int shapeIdx3D = 1 - cubeIdx;
+                        // minkowski() { shape; cube([sx,sy,sz]); } → bounding box scale approximation
+                        auto* cubeNode = dynamic_cast<PrimitiveNode*>(mkChildren[cubeIdx].get());
+                        if (cubeNode) {
+                            const auto& cubeArgs = cubeNode->args();
+                            Value cubeSize = getArg(cubeArgs, "size", getPositionalArg(cubeArgs, 0, Value(1.0)));
+                            double sx = 1.0, sy = 1.0, sz = 1.0;
+                            if (cubeSize.isVector() && cubeSize.size() >= 3) {
+                                sx = cubeSize[0].toNumber();
+                                sy = cubeSize[1].toNumber();
+                                sz = cubeSize[2].toNumber();
+                            } else {
+                                sx = sy = sz = cubeSize.toNumber();
+                            }
+
+                            emit("# Minkowski 3D (shape + cube → BBox scale approximation)");
+                            mkChildren[shapeIdx3D]->accept(*this);
+
+                            // BoundingBox to get current size
+                            std::string bboxId = newNodeId();
+                            emit(bboxId + " = nodes.new('GeometryNodeBoundBox')");
+                            emit(bboxId + ".location = (x_pos, y_pos - 200)");
+                            emit("link_nodes(links, last_geo, 'Geometry', " + bboxId + ", 'Geometry')");
+
+                            // current_size = max - min
+                            std::string subVecId = newNodeId();
+                            emit(subVecId + " = nodes.new('ShaderNodeVectorMath')");
+                            emit(subVecId + ".operation = 'SUBTRACT'");
+                            emit(subVecId + ".location = (x_pos + 200, y_pos - 200)");
+                            emit("links.new(" + bboxId + ".outputs['Max'], " + subVecId + ".inputs[0])");
+                            emit("links.new(" + bboxId + ".outputs['Min'], " + subVecId + ".inputs[1])");
+
+                            // Separate current size
+                            std::string sepId = newNodeId();
+                            emit(sepId + " = nodes.new('ShaderNodeSeparateXYZ')");
+                            emit(sepId + ".location = (x_pos + 400, y_pos - 200)");
+                            emit("links.new(" + subVecId + ".outputs['Vector'], " + sepId + ".inputs['Vector'])");
+
+                            // Per-axis: (current + cubeAxis) / current = scale factor
+                            std::string divXId = newNodeId();
+                            emit(divXId + " = nodes.new('ShaderNodeMath')");
+                            emit(divXId + ".operation = 'DIVIDE'");
+                            emit(divXId + ".location = (x_pos + 600, y_pos - 100)");
+                            std::string addXId = newNodeId();
+                            emit(addXId + " = nodes.new('ShaderNodeMath')");
+                            emit(addXId + ".operation = 'ADD'");
+                            emit(addXId + ".location = (x_pos + 600, y_pos - 200)");
+                            emit("links.new(" + sepId + ".outputs['X'], " + addXId + ".inputs[0])");
+                            emit(addXId + ".inputs[1].default_value = " + pyDouble(sx));
+                            emit("links.new(" + addXId + ".outputs['Value'], " + divXId + ".inputs[0])");
+                            emit("links.new(" + sepId + ".outputs['X'], " + divXId + ".inputs[1])");
+
+                            std::string divYId = newNodeId();
+                            emit(divYId + " = nodes.new('ShaderNodeMath')");
+                            emit(divYId + ".operation = 'DIVIDE'");
+                            emit(divYId + ".location = (x_pos + 600, y_pos)");
+                            std::string addYId = newNodeId();
+                            emit(addYId + " = nodes.new('ShaderNodeMath')");
+                            emit(addYId + ".operation = 'ADD'");
+                            emit(addYId + ".location = (x_pos + 600, y_pos - 100)");
+                            emit("links.new(" + sepId + ".outputs['Y'], " + addYId + ".inputs[0])");
+                            emit(addYId + ".inputs[1].default_value = " + pyDouble(sy));
+                            emit("links.new(" + addYId + ".outputs['Value'], " + divYId + ".inputs[0])");
+                            emit("links.new(" + sepId + ".outputs['Y'], " + divYId + ".inputs[1])");
+
+                            std::string divZId = newNodeId();
+                            emit(divZId + " = nodes.new('ShaderNodeMath')");
+                            emit(divZId + ".operation = 'DIVIDE'");
+                            emit(divZId + ".location = (x_pos + 600, y_pos + 100)");
+                            std::string addZId = newNodeId();
+                            emit(addZId + " = nodes.new('ShaderNodeMath')");
+                            emit(addZId + ".operation = 'ADD'");
+                            emit(addZId + ".location = (x_pos + 600, y_pos)");
+                            emit("links.new(" + sepId + ".outputs['Z'], " + addZId + ".inputs[0])");
+                            emit(addZId + ".inputs[1].default_value = " + pyDouble(sz));
+                            emit("links.new(" + addZId + ".outputs['Value'], " + divZId + ".inputs[0])");
+                            emit("links.new(" + sepId + ".outputs['Z'], " + divZId + ".inputs[1])");
+
+                            // Combine scale factors
+                            std::string combId = newNodeId();
+                            emit(combId + " = nodes.new('ShaderNodeCombineXYZ')");
+                            emit(combId + ".location = (x_pos + 800, y_pos)");
+                            emit("links.new(" + divXId + ".outputs['Value'], " + combId + ".inputs['X'])");
+                            emit("links.new(" + divYId + ".outputs['Value'], " + combId + ".inputs['Y'])");
+                            emit("links.new(" + divZId + ".outputs['Value'], " + combId + ".inputs['Z'])");
+
+                            // Transform with computed scale
+                            std::string xformId = newNodeId();
+                            emit(xformId + " = nodes.new('GeometryNodeTransform')");
+                            emit(xformId + ".location = (x_pos + 1000, y_pos)");
+                            emit("link_nodes(links, last_geo, 'Geometry', " + xformId + ", 'Geometry')");
+                            emit("links.new(" + combId + ".outputs['Vector'], " + xformId + ".inputs['Scale'])");
+                            emit("last_geo = " + xformId);
+                            emit("x_pos += 1200");
+
+                            handled = true;
+                        }
+                    }
+                }
+            }
+            if (!handled) {
                 processChildren(node);
                 emitMinkowski(node.args());
             }
@@ -2113,6 +2330,10 @@ void BlenderGenerator::visit(TransformNode& node) {
             emitMultmatrix(node.args());
             break;
         }
+        case ASTNode::Type::Resize:
+            processChildren(node);
+            emitResize(node.args());
+            break;
         default:
             emit("# Unsupported transform type");
             processChildren(node);
@@ -6293,6 +6514,287 @@ void BlenderGenerator::emitMinkowski(const Arguments& args) {
     emit("# To implement Minkowski, you would need custom node setup or scripting");
 }
 
+void BlenderGenerator::emitColor(const Arguments& args) {
+    // color([r,g,b,a]) or color("name", alpha)
+    emit("# Color (SetMaterial)");
+
+    double r = 0.8, g = 0.8, b = 0.8, a = 1.0;
+
+    Value colorVal = getArg(args, "c", getPositionalArg(args, 0, Value()));
+    Value alphaVal = getArg(args, "alpha", getPositionalArg(args, 1, Value(1.0)));
+
+    if (colorVal.isString()) {
+        // Named color lookup
+        std::string name = colorVal.toString();
+        // Common OpenSCAD/CSS color names
+        static const std::map<std::string, std::tuple<double,double,double>> namedColors = {
+            {"red", {1,0,0}}, {"green", {0,0.5,0}}, {"blue", {0,0,1}},
+            {"yellow", {1,1,0}}, {"cyan", {0,1,1}}, {"magenta", {1,0,1}},
+            {"white", {1,1,1}}, {"black", {0,0,0}}, {"gray", {0.5,0.5,0.5}},
+            {"grey", {0.5,0.5,0.5}}, {"orange", {1,0.647,0}}, {"purple", {0.5,0,0.5}},
+            {"pink", {1,0.753,0.796}}, {"brown", {0.647,0.165,0.165}},
+            {"silver", {0.753,0.753,0.753}}, {"gold", {1,0.843,0}},
+            {"navy", {0,0,0.5}}, {"teal", {0,0.5,0.5}}, {"maroon", {0.5,0,0}},
+            {"olive", {0.5,0.5,0}}, {"lime", {0,1,0}}, {"aqua", {0,1,1}},
+            {"coral", {1,0.498,0.314}}, {"salmon", {0.98,0.502,0.447}},
+            {"darkgray", {0.663,0.663,0.663}}, {"lightgray", {0.827,0.827,0.827}},
+            {"darkblue", {0,0,0.545}}, {"darkgreen", {0,0.392,0}},
+            {"darkred", {0.545,0,0}}, {"lightblue", {0.678,0.847,0.902}},
+        };
+        // Lowercase for lookup
+        std::string lower = name;
+        for (auto& ch : lower) ch = std::tolower(ch);
+        auto it = namedColors.find(lower);
+        if (it != namedColors.end()) {
+            r = std::get<0>(it->second);
+            g = std::get<1>(it->second);
+            b = std::get<2>(it->second);
+        }
+        a = alphaVal.toNumber();
+    } else if (colorVal.isVector()) {
+        if (colorVal.size() >= 3) {
+            r = colorVal[0].toNumber();
+            g = colorVal[1].toNumber();
+            b = colorVal[2].toNumber();
+        }
+        if (colorVal.size() >= 4) {
+            a = colorVal[3].toNumber();
+        } else {
+            a = alphaVal.toNumber();
+        }
+    }
+
+    // Create material name from color values
+    std::string matName = "Color_" + std::to_string(int(r*255)) + "_" +
+                          std::to_string(int(g*255)) + "_" + std::to_string(int(b*255));
+
+    // Emit material creation
+    emit("_mat_name = '" + matName + "'");
+    emit("_mat = bpy.data.materials.get(_mat_name)");
+    emit("if _mat is None:");
+    indent_++;
+    emit("_mat = bpy.data.materials.new(name=_mat_name)");
+    indent_--;
+    emit("_mat.diffuse_color = (" + pyDouble(r) + ", " + pyDouble(g) + ", " +
+         pyDouble(b) + ", " + pyDouble(a) + ")");
+
+    // SetMaterial node
+    std::string nodeId = newNodeId();
+    emit(nodeId + " = nodes.new('GeometryNodeSetMaterial')");
+    emit(nodeId + ".location = (x_pos, y_pos)");
+    emit(nodeId + ".inputs['Material'].default_value = _mat");
+    emit("link_nodes(links, last_geo, 'Geometry', " + nodeId + ", 'Geometry')");
+    emit("last_geo = " + nodeId);
+    emit("x_pos += 200");
+}
+
+void BlenderGenerator::emitResize(const Arguments& args) {
+    // resize([newx, newy, newz], auto) → BoundingBox + per-axis scale
+    emit("# Resize");
+
+    Value newSize = getArg(args, "newsize", getPositionalArg(args, 0, Value({0.0, 0.0, 0.0})));
+    Value autoVal = getArg(args, "auto", getPositionalArg(args, 1, Value(false)));
+
+    double nx = 0, ny = 0, nz = 0;
+    if (newSize.isVector() && newSize.size() >= 3) {
+        nx = newSize[0].toNumber();
+        ny = newSize[1].toNumber();
+        nz = newSize[2].toNumber();
+    } else if (newSize.isNumber()) {
+        nx = newSize.toNumber();
+    }
+
+    // Parse auto parameter
+    bool autoX = false, autoY = false, autoZ = false;
+    if (autoVal.isBool() && autoVal.toBool()) {
+        autoX = autoY = autoZ = true;
+    } else if (autoVal.isVector() && autoVal.size() >= 3) {
+        autoX = autoVal[0].toBool();
+        autoY = autoVal[1].toBool();
+        autoZ = autoVal[2].toBool();
+    }
+
+    // BoundingBox
+    std::string bboxId = newNodeId();
+    emit(bboxId + " = nodes.new('GeometryNodeBoundBox')");
+    emit(bboxId + ".location = (x_pos, y_pos - 200)");
+    emit("link_nodes(links, last_geo, 'Geometry', " + bboxId + ", 'Geometry')");
+
+    // current_size = max - min
+    std::string subId = newNodeId();
+    emit(subId + " = nodes.new('ShaderNodeVectorMath')");
+    emit(subId + ".operation = 'SUBTRACT'");
+    emit(subId + ".location = (x_pos + 200, y_pos - 200)");
+    emit("links.new(" + bboxId + ".outputs['Max'], " + subId + ".inputs[0])");
+    emit("links.new(" + bboxId + ".outputs['Min'], " + subId + ".inputs[1])");
+
+    // Separate current size into X, Y, Z
+    std::string sepId = newNodeId();
+    emit(sepId + " = nodes.new('ShaderNodeSeparateXYZ')");
+    emit(sepId + ".location = (x_pos + 400, y_pos - 200)");
+    emit("links.new(" + subId + ".outputs['Vector'], " + sepId + ".inputs['Vector'])");
+
+    // Find the first specified axis (non-zero target) for auto-scale reference
+    // Per-axis: if target != 0 → scale = target/current; if target == 0 and auto → use reference scale
+    // We need to compute scale factors per axis
+
+    // For each axis, emit a divide node: target / current
+    auto emitAxisScale = [&](const std::string& axis, double target) -> std::string {
+        std::string divId = newNodeId();
+        emit(divId + " = nodes.new('ShaderNodeMath')");
+        emit(divId + ".operation = 'DIVIDE'");
+        emit(divId + ".location = (x_pos + 600, y_pos - 200)");
+        emit(divId + ".inputs[0].default_value = " + pyDouble(target));
+        emit("links.new(" + sepId + ".outputs['" + axis + "'], " + divId + ".inputs[1])");
+        return divId;
+    };
+
+    // Compute scale factors for specified axes
+    std::string scaleXId, scaleYId, scaleZId;
+    std::string refScaleId; // reference scale for auto axes
+
+    if (nx != 0) {
+        scaleXId = emitAxisScale("X", nx);
+        if (refScaleId.empty()) refScaleId = scaleXId;
+    }
+    if (ny != 0) {
+        scaleYId = emitAxisScale("Y", ny);
+        if (refScaleId.empty()) refScaleId = scaleYId;
+    }
+    if (nz != 0) {
+        scaleZId = emitAxisScale("Z", nz);
+        if (refScaleId.empty()) refScaleId = scaleZId;
+    }
+
+    // For auto axes with target == 0, use the reference scale factor
+    // For non-auto axes with target == 0, scale factor = 1.0 (no change)
+    auto resolveAxis = [&](double target, bool isAuto, std::string& axisId) {
+        if (target == 0) {
+            if (isAuto && !refScaleId.empty()) {
+                axisId = refScaleId;
+            } else {
+                // No resize on this axis — scale = 1.0
+                std::string litId = newNodeId();
+                emit(litId + " = nodes.new('ShaderNodeMath')");
+                emit(litId + ".operation = 'ADD'");
+                emit(litId + ".location = (x_pos + 600, y_pos)");
+                emit(litId + ".inputs[0].default_value = 1.0");
+                emit(litId + ".inputs[1].default_value = 0.0");
+                axisId = litId;
+            }
+        }
+    };
+
+    resolveAxis(nx, autoX, scaleXId);
+    resolveAxis(ny, autoY, scaleYId);
+    resolveAxis(nz, autoZ, scaleZId);
+
+    // Combine scale factors
+    std::string combId = newNodeId();
+    emit(combId + " = nodes.new('ShaderNodeCombineXYZ')");
+    emit(combId + ".location = (x_pos + 800, y_pos)");
+    emit("links.new(" + scaleXId + ".outputs['Value'], " + combId + ".inputs['X'])");
+    emit("links.new(" + scaleYId + ".outputs['Value'], " + combId + ".inputs['Y'])");
+    emit("links.new(" + scaleZId + ".outputs['Value'], " + combId + ".inputs['Z'])");
+
+    // Transform
+    std::string xformId = newNodeId();
+    emit(xformId + " = nodes.new('GeometryNodeTransform')");
+    emit(xformId + ".location = (x_pos + 1000, y_pos)");
+    emit("link_nodes(links, last_geo, 'Geometry', " + xformId + ", 'Geometry')");
+    emit("links.new(" + combId + ".outputs['Vector'], " + xformId + ".inputs['Scale'])");
+    emit("last_geo = " + xformId);
+    emit("x_pos += 1200");
+}
+
+void BlenderGenerator::emitProjection(const Arguments& args, ASTNode& node) {
+    // projection(cut=false) → project 3D shape onto XY plane
+    Value cutVal = getArg(args, "cut", getPositionalArg(args, 0, Value(false)));
+    bool cut = cutVal.toBool();
+
+    if (cut) {
+        // cut=true: cross-section at Z=0 using boolean intersect with thin plane
+        emit("# Projection (cut=true: cross-section at Z=0)");
+
+        // Create a large thin cube at Z=0 as the cutting plane
+        std::string planeId = newNodeId();
+        emit(planeId + " = nodes.new('GeometryNodeMeshCube')");
+        emit(planeId + ".location = (x_pos, y_pos - 200)");
+        emit(planeId + ".inputs['Size'].default_value = (10000.0, 10000.0, 0.001)");
+
+        // Boolean intersect with the cutting plane
+        std::string boolId = newNodeId();
+        emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+        emit(boolId + ".operation = 'INTERSECT'");
+        emit(boolId + ".location = (x_pos + 200, y_pos)");
+        emit("try:");
+        indent_++;
+        emit(boolId + ".solver = 'EXACT'");
+        indent_--;
+        emit("except: pass");
+        // Link child geometry and plane to multi-input via geo_out()
+        emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
+        emit("links.new(" + planeId + ".outputs['Mesh'], " + boolId + ".inputs[1])");
+        emit("last_geo = " + boolId);
+        emit("x_pos += 400");
+
+        // Convert mesh to curve for 2D result
+        std::string m2cId = newNodeId();
+        emit(m2cId + " = nodes.new('GeometryNodeMeshToCurve')");
+        emit(m2cId + ".location = (x_pos, y_pos)");
+        emit("links.new(" + boolId + ".outputs['Mesh'], " + m2cId + ".inputs['Mesh'])");
+        emit("last_geo = " + m2cId);
+        emit("x_pos += 200");
+    } else {
+        // cut=false: flatten to XY plane + convex hull approximation
+        emit("# Projection (cut=false: flatten to XY + convex hull)");
+
+        // Get input position
+        std::string posId = newNodeId();
+        emit(posId + " = nodes.new('GeometryNodeInputPosition')");
+        emit(posId + ".location = (x_pos, y_pos - 300)");
+
+        // Separate XYZ
+        std::string sepId = newNodeId();
+        emit(sepId + " = nodes.new('ShaderNodeSeparateXYZ')");
+        emit(sepId + ".location = (x_pos + 200, y_pos - 300)");
+        emit("links.new(" + posId + ".outputs['Position'], " + sepId + ".inputs['Vector'])");
+
+        // Combine with Z=0
+        std::string combId = newNodeId();
+        emit(combId + " = nodes.new('ShaderNodeCombineXYZ')");
+        emit(combId + ".location = (x_pos + 400, y_pos - 300)");
+        emit("links.new(" + sepId + ".outputs['X'], " + combId + ".inputs['X'])");
+        emit("links.new(" + sepId + ".outputs['Y'], " + combId + ".inputs['Y'])");
+        emit(combId + ".inputs['Z'].default_value = 0.0");
+
+        // SetPosition to flatten Z
+        std::string setPosId = newNodeId();
+        emit(setPosId + " = nodes.new('GeometryNodeSetPosition')");
+        emit(setPosId + ".location = (x_pos + 600, y_pos)");
+        emit("link_nodes(links, last_geo, 'Geometry', " + setPosId + ", 'Geometry')");
+        emit("links.new(" + combId + ".outputs['Vector'], " + setPosId + ".inputs['Position'])");
+        emit("last_geo = " + setPosId);
+        emit("x_pos += 800");
+
+        // Convex hull as silhouette approximation
+        std::string hullId = newNodeId();
+        emit(hullId + " = nodes.new('GeometryNodeConvexHull')");
+        emit(hullId + ".location = (x_pos, y_pos)");
+        emit("link_nodes(links, last_geo, 'Geometry', " + hullId + ", 'Geometry')");
+        emit("last_geo = " + hullId);
+        emit("x_pos += 200");
+
+        // Convert mesh to curve for 2D result
+        std::string m2cId = newNodeId();
+        emit(m2cId + " = nodes.new('GeometryNodeMeshToCurve')");
+        emit(m2cId + ".location = (x_pos, y_pos)");
+        emit("links.new(geo_out(last_geo), " + m2cId + ".inputs['Mesh'])");
+        emit("last_geo = " + m2cId);
+        emit("x_pos += 200");
+    }
+}
+
 void BlenderGenerator::emitRoof(const Arguments& args) {
     // OpenSCAD roof() creates a 3D shape from a 2D profile where each vertex's
     // height equals its distance to the nearest boundary edge (straight skeleton).
@@ -6587,7 +7089,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
             emit(boolId + ".location = (x_pos, y_pos)");
             emit(boolId + ".operation = '" + blenderOp + "'");
-            emit(boolId + ".solver = 'EXACT'");
+            emit(boolId + ".solver = '" + std::string(blenderOp == "UNION" ? "MANIFOLD" : "EXACT") + "'");
 
             if (blenderOp == "DIFFERENCE") {
                 // DIFFERENCE: base -> inputs[0], tool -> inputs[1]
@@ -6603,6 +7105,9 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit("y_pos -= 50");
             indent_--;  // end else
             indent_--;  // end if last_geo is not None
+
+            // Reset last_geo so skipped conditionals don't re-union old geometry
+            emit("last_geo = " + firstGeo);
         }
 
         emit("last_geo = " + firstGeo);
@@ -6668,6 +7173,9 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 indent_--;
                 indent_--;
                 emit("y_pos -= 50");
+
+                // Reset last_geo so skipped conditionals don't re-subtract old geometry
+                emit("last_geo = " + firstGeo);
             }
         } else {
             // 3D path: use in-graph GeometryNodeMeshBoolean with DIFFERENCE operation.
@@ -6726,7 +7234,9 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             indent_--;
 
             // Process first child as base
-            actualChildren[0]->accept(*this);
+            {
+                actualChildren[0]->accept(*this);
+            }
 
             emit("last_geo = " + fillHelper + "(last_geo)");
             emit(firstGeo + " = last_geo");
@@ -6749,19 +7259,19 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
                 // If the tool is a JoinGeometry (e.g., from a for-loop), merge
                 // overlapping parts with UNION first to avoid EXACT solver failures.
-                std::string unionedTool = "last_geo";
                 std::string unionId = newNodeId();
                 emit("if last_geo.bl_idname == 'GeometryNodeJoinGeometry':");
                 indent_++;
                 emit(unionId + " = nodes.new('GeometryNodeMeshBoolean')");
                 emit(unionId + ".location = (x_pos, y_pos)");
                 emit(unionId + ".operation = 'UNION'");
-                emit(unionId + ".solver = 'EXACT'");
+                emit(unionId + ".solver = 'MANIFOLD'");
                 emit("links.new(geo_out(last_geo), " + unionId + ".inputs[1])");
                 emit("last_geo = " + unionId);
                 emit("x_pos += 200");
                 indent_--;
 
+                // DIFFERENCE: chain (base - tool)
                 std::string boolId = newNodeId();
                 emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
                 emit(boolId + ".location = (x_pos, y_pos)");
@@ -6776,6 +7286,9 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 emit("y_pos -= 50");
                 indent_--;  // end else
                 indent_--;  // end if last_geo is not None
+
+                // Reset last_geo so skipped conditionals don't re-subtract old geometry
+                emit("last_geo = " + firstGeo);
             }
         }  // end 3D DIFFERENCE path
 
@@ -6788,7 +7301,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         emit("# MergeByDistance to clean up boolean artifacts");
         emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
         emit(mergeId + ".location = (x_pos, y_pos)");
-        emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
+        emit(mergeId + ".inputs['Distance'].default_value = 0.001");
         emit("if " + firstGeo + " is not None:");
         indent_++;
         emit("links.new(geo_out(" + firstGeo + "), " + mergeId + ".inputs['Geometry'])");
@@ -6828,6 +7341,9 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 indent_--;
                 indent_--;
                 emit("y_pos -= 50");
+
+                // Reset last_geo so skipped conditionals don't re-join old geometry
+                emit("last_geo = " + firstGeo);
             }
         } else if (is2D && blenderOp == "INTERSECT") {
             // 2D INTERSECT: extrude both operands into thin volumes, do 3D intersect
@@ -6900,9 +7416,10 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 indent_--;
                 indent_--;
                 emit("y_pos -= 50");
-            }
 
-            // When in extrude context, convert mesh back to curve for CurveToMesh
+                // Reset last_geo so skipped conditionals don't re-intersect old geometry
+                emit("last_geo = " + firstGeo);
+            }            // When in extrude context, convert mesh back to curve for CurveToMesh
             // Select only boundary edges on the Z=0 face (bottom of thin extrusion)
             if (in_extrude_) {
                 emit("# Convert INTERSECT mesh result back to curves for extrusion");
@@ -7064,7 +7581,11 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
             emit(boolId + ".location = (x_pos, y_pos)");
             emit(boolId + ".operation = '" + blenderOp + "'");
-            emit(boolId + ".solver = 'EXACT'");
+            // UNION: use MANIFOLD solver — produces cleaner topology at overlapping
+            // boundaries. EXACT creates NM edges at complex intersections.
+            // INTERSECT: use EXACT — MANIFOLD can produce 0 geometry on complex models.
+            std::string solver = (blenderOp == "UNION") ? "MANIFOLD" : "EXACT";
+            emit(boolId + ".solver = '" + solver + "'");
 
             // In Blender 5.1+, UNION/INTERSECT use inputs[1] as multi-input
             // (inputs[0] is disabled). Both operands go to inputs[1].
@@ -7075,6 +7596,11 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit("y_pos -= 50");
             indent_--;  // end else
             indent_--;  // end if last_geo is not None
+
+            // Reset last_geo to firstGeo so that if the NEXT child's conditional
+            // doesn't execute, the identity check (last_geo is not firstGeo) prevents
+            // re-unioning the same geometry.
+            emit("last_geo = " + firstGeo);
         }
         } // end else (3D path)
 
@@ -7084,7 +7610,7 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             emit("# MergeByDistance to clean up UNION artifacts");
             emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
             emit(mergeId + ".location = (x_pos, y_pos)");
-            emit(mergeId + ".inputs['Distance'].default_value = 0.0001");
+            emit(mergeId + ".inputs['Distance'].default_value = 0.001");
             emit("if " + firstGeo + " is not None:");
             indent_++;
             emit("links.new(geo_out(" + firstGeo + "), " + mergeId + ".inputs['Geometry'])");
