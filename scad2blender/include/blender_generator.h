@@ -75,6 +75,8 @@ private:
     bool module_uses_children_ = false;
     std::set<std::string> current_module_params_;  // Parameter names of the module being emitted
     std::set<std::string> loop_variables_;            // Active for-loop variable names
+    std::set<std::string> local_assigned_vars_;        // Variables assigned in current module body (Python build-time scope)
+    std::map<std::string, std::string> local_expr_to_var_;  // Maps expression string → Python var name for locally assigned runtime vars
     std::set<std::string> group_input_vars_;  // Variables with group_input sockets
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
     std::map<std::string, std::string> module_param_to_gi_socket_;  // active module's param → group_input socket
@@ -82,8 +84,17 @@ private:
     std::set<std::string> for_loop_range_vars_; // Variables used as for-loop range bounds
     std::set<std::string> non_geometric_modules_; // Modules that produce no geometry
     std::set<std::string> python_helper_functions_; // Recursive functions needing Python helpers
+    std::set<std::string> recursive_modules_;  // Self-calling modules → fallback to old Python path
+    std::set<std::string> param_loop_modules_;  // Modules with for-loops whose bounds depend on params
+    std::set<std::string> param_grid_modules_;  // Param-loop modules convertible to IoP
+    std::set<std::string> iop_ancestor_modules_; // Modules that transitively call param_grid modules
+    std::string current_ng_module_name_;          // Name of module currently being emitted as node group
+    std::map<std::string, EmitResult> loop_var_node_map_;  // loop var → Index-derived node (for IoP)
+    bool emitting_node_group_ = false;         // True inside node-group module body emission
     std::vector<std::set<std::string>> parent_module_params_stack_; // Stack of parent module param names
     std::map<std::string, std::vector<std::string>> captured_parent_params_; // module_name -> captured parent params
+    std::map<std::string, ModuleNode*> module_nodes_;  // module name -> AST node pointer
+    std::map<std::string, std::map<std::string, double>> module_call_site_defaults_;  // module -> param -> value from call site
     std::string source_dir_;  // Directory of the source .scad file for resolving relative paths
     std::set<std::string> main_file_vars_;  // Variables defined in the main .scad file (not includes)
 
@@ -176,9 +187,17 @@ private:
     bool vectorHasExprTrees(const Value& v);
     void collectGroupInputVars(ASTNode& node);
     void collectModulesRecursive(ASTNode* node);
+    void detectRecursiveModules(ASTNode* root);
+    void detectParamLoopModules(ASTNode* root);
+    void detectParamGridModules(ASTNode* root);
+    void computeIoPAncestors(ASTNode* root);
+    bool useManifoldSolver() const;  // True when current node group transitively uses IoP
+    void emitModuleNodeGroupDecls(ASTNode* root);
     void collectFunctionsRecursive(ASTNode* node);
     void collectForLoopRangeVars(ASTNode* node);
     void collectVarRefsFromExpr(const ExprNodePtr& expr);
+    void collectCallSiteDefaults(ASTNode* root);
+    void collectCallSiteDefaultsWalk(ASTNode* node, std::map<std::string, double>& scope);
     void emitModulesRecursive(ASTNode* node);
     bool nodeProducesGeometry(ASTNode* node);
     void classifyModuleGeometry(ASTNode* node);

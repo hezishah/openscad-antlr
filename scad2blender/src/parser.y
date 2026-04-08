@@ -105,6 +105,11 @@ static std::vector<bool> g_in_module_def_stack;
 // trees so that the code generator can link them to group_input sockets.
 static std::set<std::string> g_module_literal_vars;
 static std::vector<std::set<std::string>> g_module_literal_vars_stack;
+// Track module-local variables assigned from runtime expressions (e.g., bt = override_bottom_tweak(...))
+// When referenced later in the same module body, these should produce VarRef so the code generator
+// can use the computed Python variable instead of trying to evaluate at C++ time.
+static std::set<std::string> g_module_runtime_vars;
+static std::vector<std::set<std::string>> g_module_runtime_vars_stack;
 
 // Track top-level (global) variables. When referenced inside module bodies,
 // these produce VarRef expression trees so the code generator can link them
@@ -1434,6 +1439,12 @@ statement:
                 g_module_literal_vars.insert(*$1);
             }
         }
+        // Track module-local runtime assignments (expressions with variable refs)
+        // e.g., bt = override_bottom_tweak(material=material, ...)
+        if (g_in_function_def && storeVal.isExpression() &&
+            storeVal.exprTree() && storeVal.exprTree()->hasVariableRefs()) {
+            g_module_runtime_vars.insert(*$1);
+        }
         $$ = new AssignmentNode(*$1, storeVal);
         delete $1;
         delete $3;
@@ -1539,6 +1550,8 @@ module_stmt:
         g_in_function_def = true;
         g_module_literal_vars_stack.push_back(g_module_literal_vars);
         g_module_literal_vars.clear();
+        g_module_runtime_vars_stack.push_back(g_module_runtime_vars);
+        g_module_runtime_vars.clear();
         for (const auto& param : *$4) {
             set_variable(param, Value::expressionWithTree(param, ExprNode::makeVarRef(param)));
         }
@@ -1547,6 +1560,8 @@ module_stmt:
         g_in_function_def_stack.pop_back();
         g_module_literal_vars = g_module_literal_vars_stack.back();
         g_module_literal_vars_stack.pop_back();
+        g_module_runtime_vars = g_module_runtime_vars_stack.back();
+        g_module_runtime_vars_stack.pop_back();
         pop_scope();  // restore scope
         auto node = new ModuleNode(*$2, *$4);
         // Use the saved defaults (from before body parsing)

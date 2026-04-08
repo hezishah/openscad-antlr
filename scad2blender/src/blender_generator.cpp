@@ -4752,27 +4752,8 @@ void BlenderGenerator::emitText(const Arguments& args) {
     // Set character spacing - handle expression
     emitSetInputOrLink(nodeId, "Character Spacing", spacing, pyDouble(spacing.toNumber()));
 
-    // Set alignment
-    std::string halignStr = halign.isString() ? halign.toString() : "left";
-    std::string valignStr = valign.isString() ? valign.toString() : "baseline";
-
-    if (halignStr == "center") {
-        emit(nodeId + ".align_x = 'CENTER'");
-    } else if (halignStr == "right") {
-        emit(nodeId + ".align_x = 'RIGHT'");
-    } else {
-        emit(nodeId + ".align_x = 'LEFT'");
-    }
-
-    if (valignStr == "center") {
-        emit(nodeId + ".align_y = 'MIDDLE'");
-    } else if (valignStr == "top") {
-        emit(nodeId + ".align_y = 'TOP'");
-    } else if (valignStr == "bottom") {
-        emit(nodeId + ".align_y = 'BOTTOM'");
-    } else {
-        emit(nodeId + ".align_y = 'BOTTOM'");  // baseline maps to bottom
-    }
+    // Set alignment to center
+    emit(nodeId + ".inputs[3].default_value = 'Center'");
 
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
@@ -7686,10 +7667,75 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         }
         emit("x_pos += 200");
 
+        // Detect text profiles (StringToCurves → RealizeInstances) and use
+        // FillCurve → ExtrudeMesh approach which handles letter holes correctly.
+        emit("_profile_geo = " + profileGeo);
+        emit("_is_text_profile = False");
+        emit("if _profile_geo is not None:");
+        indent_++;
+        emit("_src = _profile_geo");
+        emit("for _ in range(5):");
+        indent_++;
+        emit("if _src.bl_idname == 'GeometryNodeStringToCurves': _is_text_profile = True; break");
+        emit("if _src.bl_idname == 'GeometryNodeRealizeInstances':");
+        indent_++;
+        emit("_gi = _src.inputs.get('Geometry')");
+        emit("if _gi and _gi.links: _src = _gi.links[0].from_node");
+        emit("else: break");
+        indent_--;
+        emit("elif _src.bl_idname == 'GeometryNodeTransform':");
+        indent_++;
+        emit("_gi = _src.inputs.get('Geometry')");
+        emit("if _gi and _gi.links: _src = _gi.links[0].from_node");
+        emit("else: break");
+        indent_--;
+        emit("else: break");
+        indent_--;
+        indent_--;
+
+        emit("if _is_text_profile:");
+        indent_++;
+        // Text profile: FillCurve → ExtrudeMesh(FACES, Individual=False) + JoinGeometry + MergeByDistance
+        emit("# Text profile: FillCurve + ExtrudeMesh for correct letter hole handling");
+        emit("_fc = nodes.new('GeometryNodeFillCurve')");
+        emit("_fc.location = (x_pos, y_pos)");
+        emit("link_nodes(links, _profile_geo, 'Curve', _fc, 'Curve')");
+        emit("x_pos += 200");
+        emit("_ext = nodes.new('GeometryNodeExtrudeMesh')");
+        emit("_ext.location = (x_pos, y_pos)");
+        emit("_ext.mode = 'FACES'");
+        emit("_ext.inputs['Individual'].default_value = False");
+        emit("links.new(_fc.outputs['Mesh'], _ext.inputs['Mesh'])");
+        // Height for extrude offset
+        if (heightTree->hasVariableRefs() && exprTreeHasOnlyGroupInputVars(heightTree)) {
+            std::string combExtId = newNodeId();
+            emit(combExtId + " = nodes.new('ShaderNodeCombineXYZ')");
+            emit(combExtId + ".location = (x_pos, y_pos - 200)");
+            auto extResult = emitExpressionNodeTree(heightTree);
+            connectExprResultNamed(extResult, combExtId, "Z");
+            emit("links.new(" + combExtId + ".outputs['Vector'], _ext.inputs['Offset'])");
+        } else {
+            emit("_ext.inputs['Offset'].default_value = (0, 0, " + pyDouble(hVal) + ")");
+        }
+        emit("x_pos += 200");
+        emit("_jn_text = nodes.new('GeometryNodeJoinGeometry')");
+        emit("_jn_text.location = (x_pos, y_pos)");
+        emit("links.new(_ext.outputs['Mesh'], _jn_text.inputs['Geometry'])");
+        emit("links.new(_fc.outputs['Mesh'], _jn_text.inputs['Geometry'])");
+        emit("_mrg_text = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_mrg_text.location = (x_pos + 200, y_pos)");
+        emit("links.new(_jn_text.outputs['Geometry'], _mrg_text.inputs['Geometry'])");
+        emit("_mrg_text.inputs['Distance'].default_value = 0.0001");
+        emit("last_geo = _mrg_text");
+        emit("x_pos += 400");
+        indent_--;
+
+        emit("else:");
+        indent_++;
+
         // If the profile geometry came from a mesh operation (e.g., 2D INTERSECT),
         // use ExtrudeMesh instead of CurveToMesh since CurveToMesh needs curves.
         emit("# Check if profile is mesh (from boolean INTERSECT) - use different extrusion");
-        emit("_profile_geo = " + profileGeo);
         emit("_is_mesh_profile = False");
         emit("if _profile_geo is not None:");
         indent_++;
@@ -7809,6 +7855,7 @@ void BlenderGenerator::emitLinearExtrude(const Arguments& args) {
         emit("x_pos += 200");
         indent_--;
         indent_--;  // close 'else:' (curve profile path)
+        indent_--;  // close 'else:' (non-text profile path)
     } else {
         // CurveToMesh approach — supports twist and scale (only works for simple single-spline profiles)
         emit("# Linear Extrude (CurveToMesh approach)");
