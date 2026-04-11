@@ -59,6 +59,7 @@ public:
 private:
     std::ostringstream code_;
     int indent_ = 0;
+    int module_base_indent_ = 1;  // base indent for module function body (for hoisted expr vars)
     int node_counter_ = 0;
     std::string last_output_;
     std::map<std::string, std::vector<std::string>> defined_modules_;  // name -> parameter names
@@ -84,6 +85,7 @@ private:
     std::set<std::string> for_loop_range_vars_; // Variables used as for-loop range bounds
     std::set<std::string> non_geometric_modules_; // Modules that produce no geometry
     std::set<std::string> python_helper_functions_; // Recursive functions needing Python helpers
+    std::map<std::string, std::string> function_owner_module_; // funcName → owning module name (for module-scoped functions)
     std::set<std::string> recursive_modules_;  // Self-calling modules → fallback to old Python path
     std::set<std::string> param_loop_modules_;  // Modules with for-loops whose bounds depend on params
     std::set<std::string> param_grid_modules_;  // Param-loop modules convertible to IoP
@@ -154,6 +156,7 @@ private:
 
     // Utility
     void processChildren(ASTNode& node);
+    std::string valueToPythonRecursive(const Value& v);
     std::string vectorToPython(const Value& v);
     bool vectorHasExpressions(const Value& v);
     bool moduleUsesChildren(ASTNode& node);
@@ -193,12 +196,13 @@ private:
     void computeIoPAncestors(ASTNode* root);
     bool useManifoldSolver() const;  // True when current node group transitively uses IoP
     void emitModuleNodeGroupDecls(ASTNode* root);
-    void collectFunctionsRecursive(ASTNode* node);
+    void collectFunctionsRecursive(ASTNode* node, const std::string& ownerModule = "");
     void collectForLoopRangeVars(ASTNode* node);
     void collectVarRefsFromExpr(const ExprNodePtr& expr);
     void collectCallSiteDefaults(ASTNode* root);
     void collectCallSiteDefaultsWalk(ASTNode* node, std::map<std::string, double>& scope);
     void emitModulesRecursive(ASTNode* node);
+    void emitModuleScopedHelpers(const std::string& moduleName);
     bool nodeProducesGeometry(ASTNode* node);
     void classifyModuleGeometry(ASTNode* node);
     void buildModuleGiMaps(ASTNodePtr& root);
@@ -218,7 +222,13 @@ private:
     std::string exprTreeToPythonInner(const ExprNodePtr& tree);
     int expr_depth_ = 0;
     bool suppress_expr_extraction_ = false;  // suppress _expr_N extraction in lambda-scoped contexts
-    std::unordered_map<ExprNode*, std::string> expr_cache_;
+    struct ExprCacheEntry {
+        std::string value;      // cached result (variable name or expression)
+        std::string full_expr;  // full expression (for re-hoisting in sibling scopes)
+        int indent_level;       // indent level when hoisted (-1 if not hoisted)
+    };
+    std::unordered_map<ExprNode*, ExprCacheEntry> expr_cache_;
+    std::unordered_map<std::string, std::string> expr_string_cache_;  // string-level dedup for identical expressions
 
     // Check if an expression tree contains a call to a specific function
     bool exprTreeCallsFunction(const ExprNodePtr& tree, const std::string& funcName);

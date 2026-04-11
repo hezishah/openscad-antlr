@@ -20,6 +20,14 @@ ExprNodePtr ExprNode::makeLiteral(double v) {
     return node;
 }
 
+ExprNodePtr ExprNode::makeStringLiteral(const std::string& s) {
+    auto node = std::make_shared<ExprNode>();
+    node->kind = Kind::Literal;
+    node->literal_value = 0.0;
+    node->string_value = s;
+    return node;
+}
+
 ExprNodePtr ExprNode::makeVarRef(const std::string& name) {
     auto node = std::make_shared<ExprNode>();
     node->kind = Kind::VarRef;
@@ -193,15 +201,33 @@ std::string Value::toPython() const {
             break;
         }
 
-        case Type::Vector:
-            ss << "(";
+        case Type::Vector: {
+            // Check if any element is a ForLoop expression that needs splatting
+            bool hasForLoop = false;
+            for (size_t i = 0; i < vec_val_.size(); ++i) {
+                if (vec_val_[i].isExpression() && vec_val_[i].exprTree() &&
+                    vec_val_[i].exprTree()->kind == ExprNode::Kind::ForLoop) {
+                    hasForLoop = true;
+                    break;
+                }
+            }
+            // Use list syntax [...] when splatting is needed (tuples don't support *)
+            ss << (hasForLoop ? "[" : "(");
             for (size_t i = 0; i < vec_val_.size(); ++i) {
                 if (i > 0) ss << ", ";
-                ss << vec_val_[i].toPython();
+                // ForLoop elements need unpacking — OpenSCAD flattens for-comprehension
+                // results into the parent vector
+                if (hasForLoop && vec_val_[i].isExpression() && vec_val_[i].exprTree() &&
+                    vec_val_[i].exprTree()->kind == ExprNode::Kind::ForLoop) {
+                    ss << "*" << vec_val_[i].toPython();
+                } else {
+                    ss << vec_val_[i].toPython();
+                }
             }
-            if (vec_val_.size() == 1) ss << ",";
-            ss << ")";
+            if (!hasForLoop && vec_val_.size() == 1) ss << ",";
+            ss << (hasForLoop ? "]" : ")");
             break;
+        }
 
         case Type::Range:
             // Python range representation
@@ -232,7 +258,7 @@ std::string Value::toPython() const {
                 {"$vpd", "0"},
                 {"$vpr", "0"},
                 {"$vpt", "0"},
-                {"$preview", "True"},
+                {"$preview", "False"},
                 {"$t", "0"},
                 {"$fa", "12"},
                 {"$fs", "2"},

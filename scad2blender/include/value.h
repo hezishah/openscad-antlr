@@ -41,7 +41,8 @@ struct ExprNode {
                     AND, OR, NOT };
 
     Kind kind;
-    double literal_value = 0.0;   // Literal
+    double literal_value = 0.0;   // Literal (numeric)
+    std::string string_value;     // Literal (string — non-empty means this is a string literal)
     std::string var_name;         // VarRef
     Op op = Op::ADD;              // UnaryOp/BinaryOp
     ExprNodePtr left, right;      // BinaryOp (left only for UnaryOp)
@@ -53,8 +54,10 @@ struct ExprNode {
 
     ExprNodePtr else_branch;                                       // Conditional: else expr
     std::vector<std::pair<std::string, ExprNodePtr>> let_bindings; // LetBinding: name→expr pairs
+    bool is_each = false;  // Set when 'each' keyword wraps this expression (for flattening)
 
     static ExprNodePtr makeLiteral(double v);
+    static ExprNodePtr makeStringLiteral(const std::string& s);
     static ExprNodePtr makeVarRef(const std::string& name);
     static ExprNodePtr makeUnary(Op op, ExprNodePtr operand);
     static ExprNodePtr makeBinary(Op op, ExprNodePtr left, ExprNodePtr right);

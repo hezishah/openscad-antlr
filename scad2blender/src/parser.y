@@ -163,7 +163,10 @@ static Value evaluate_expr_tree(const ExprNodePtr& tree, const std::map<std::str
 
     switch (tree->kind) {
         case ExprNode::Kind::Literal:
-            result = Value(tree->literal_value);
+            if (!tree->string_value.empty())
+                result = Value(tree->string_value);
+            else
+                result = Value(tree->literal_value);
             break;
 
         case ExprNode::Kind::VarRef: {
@@ -470,6 +473,7 @@ static Value evaluate_expr_tree(const ExprNodePtr& tree, const std::map<std::str
             // Evaluate range
             Value range_val = evaluate_expr_tree(tree->left, bindings);
             Vector results;
+            bool body_has_each = tree->right && tree->right->is_each;
             if (range_val.isRange()) {
                 double start = range_val.rangeStart();
                 double end = range_val.rangeEnd();
@@ -481,7 +485,14 @@ static Value evaluate_expr_tree(const ExprNodePtr& tree, const std::map<std::str
                         new_bindings[tree->var_name] = Value(i);
                         Value body_val = evaluate_expr_tree(tree->right, new_bindings);
                         if (!body_val.isUndefined()) {
-                            results.push_back(body_val);
+                            // 'each' flattens one level: if body is a vector, splice elements
+                            if (body_has_each && body_val.isVector()) {
+                                for (size_t j = 0; j < body_val.size(); j++) {
+                                    results.push_back(body_val[j]);
+                                }
+                            } else {
+                                results.push_back(body_val);
+                            }
                         }
                     }
                 }
@@ -491,7 +502,13 @@ static Value evaluate_expr_tree(const ExprNodePtr& tree, const std::map<std::str
                     new_bindings[tree->var_name] = range_val[i];
                     Value body_val = evaluate_expr_tree(tree->right, new_bindings);
                     if (!body_val.isUndefined()) {
-                        results.push_back(body_val);
+                        if (body_has_each && body_val.isVector()) {
+                            for (size_t j = 0; j < body_val.size(); j++) {
+                                results.push_back(body_val[j]);
+                            }
+                        } else {
+                            results.push_back(body_val);
+                        }
                     }
                 }
             }
@@ -551,6 +568,15 @@ static Value evaluate_function_call(const std::string& name, const std::vector<V
     }
     // Special case: len(vector) or len(string)
     if (name == "len" && arg_vals.size() == 1) {
+        // If arg has an expression tree with VarRefs (e.g., len(RotEx(0)) where RotEx
+        // body references module params), defer len() to runtime even if we got a
+        // concrete (but degenerate) result — the concrete result is wrong because
+        // module params were unresolved during evaluation.
+        ExprNodePtr argTree = arg_vals[0].exprTree();
+        if (argTree && argTree->hasVariableRefs()) {
+            auto lenTree = ExprNode::makeFunctionCall("len", {argTree});
+            return Value::expressionWithTree("len(...)", lenTree);
+        }
         if (arg_vals[0].isVector()) return Value(static_cast<double>(arg_vals[0].size()));
         if (arg_vals[0].isString()) return Value(static_cast<double>(arg_vals[0].toString().size()));
     }
@@ -843,6 +869,7 @@ static Value try_evaluate_function(const std::string& name, const Arguments& arg
     // Extract ExprNode trees from positional args in numeric order
     auto arg_trees = args_to_expr_trees(args);
 
+
     // During function definition, parameters are symbolic — don't eagerly evaluate.
     // Build a FunctionCall ExprNode tree for deferred evaluation at call time.
     if (g_in_function_def) {
@@ -899,13 +926,29 @@ static Value try_evaluate_function(const std::string& name, const Arguments& arg
                     arg_names_list.push_back(kv.first);
                 }
             }
-            auto fc_tree = ExprNode::makeFunctionCall(name, all_trees);
-            fc_tree->arg_names = arg_names_list;
+            // Check if any arg tree has variable refs
+            bool anyNamedVarRefs = false;
+            for (const auto& tree : all_trees) {
+                if (tree && tree->hasVariableRefs()) { anyNamedVarRefs = true; break; }
+            }
+            if (anyNamedVarRefs) {
+                auto fc_tree = ExprNode::makeFunctionCall(name, all_trees);
+                fc_tree->arg_names = arg_names_list;
+                return Value::expressionWithTree(name + "(...)", fc_tree);
+            }
+            // No VarRefs — fall through to concrete named-args evaluation below
+        }
+        // Positional-only: check if any arg tree has variable refs
+        bool anyVarRefs = false;
+        for (const auto& tree : arg_trees) {
+            if (tree && tree->hasVariableRefs()) { anyVarRefs = true; break; }
+        }
+        if (anyVarRefs) {
+            // Defer: build FunctionCall tree for runtime evaluation
+            auto fc_tree = ExprNode::makeFunctionCall(name, arg_trees);
             return Value::expressionWithTree(name + "(...)", fc_tree);
         }
-        // Positional-only: build FunctionCall tree
-        auto fc_tree = ExprNode::makeFunctionCall(name, arg_trees);
-        return Value::expressionWithTree(name + "(...)", fc_tree);
+        // No VarRefs — fall through to concrete evaluation below
     }
 
     // Check if there are named args (keys that don't start with "_")
@@ -1000,11 +1043,33 @@ static Value try_evaluate_function(const std::string& name, const Arguments& arg
             }
 
             Value result = evaluate_function_call(name, positioned, scope_bindings);
+            // Check if any arg tree OR the function body has variable refs
+            // (function body may reference enclosing module params not in call args)
+            bool hasVarRefs = false;
+            for (const auto& tree : all_arg_trees) {
+                if (tree && tree->hasVariableRefs()) { hasVarRefs = true; break; }
+            }
+            if (!hasVarRefs && fit != g_function_table.end() && fit->second.body) {
+                if (fit->second.body->hasVariableRefs()) hasVarRefs = true;
+            }
             if (result.isNumber()) {
-                result.setExprTree(ExprNode::makeLiteral(result.toNumber()));
+                if (hasVarRefs) {
+                    auto fc_tree = ExprNode::makeFunctionCall(name, all_arg_trees);
+                    fc_tree->arg_names = arg_names;
+                    result.setExprTree(fc_tree);
+                } else {
+                    result.setExprTree(ExprNode::makeLiteral(result.toNumber()));
+                }
                 return result;
             }
-            if (result.isVector()) return result;
+            if (result.isVector()) {
+                if (hasVarRefs) {
+                    auto fc_tree = ExprNode::makeFunctionCall(name, all_arg_trees);
+                    fc_tree->arg_names = arg_names;
+                    result.setExprTree(fc_tree);
+                }
+                return result;
+            }
         }
 
         // Fall back to FunctionCall ExprNode with named args
@@ -1014,6 +1079,20 @@ static Value try_evaluate_function(const std::string& name, const Arguments& arg
     }
 
     // Original positional-only path
+    // Special case: len() where the argument calls a user-defined function whose body
+    // has VarRefs (e.g., len(RotEx(0)) where RotEx references module params).
+    // The arg tree for RotEx(0) is FunctionCall("RotEx", [Literal(0)]) — no direct VarRefs,
+    // but the function BODY has VarRefs. We must defer len() to runtime.
+    if (name == "len" && arg_trees.size() == 1 && arg_trees.at(0) &&
+        arg_trees.at(0)->kind == ExprNode::Kind::FunctionCall) {
+        auto fit_len = g_function_table.find(arg_trees.at(0)->func_name);
+        if (fit_len != g_function_table.end() && fit_len->second.body &&
+            fit_len->second.body->hasVariableRefs()) {
+            auto lenTree = ExprNode::makeFunctionCall("len", arg_trees);
+            return Value::expressionWithTree("len(...)", lenTree);
+        }
+    }
+
     // Build a list of arg values by evaluating trees using current scope
     std::map<std::string, Value> scope_bindings2(current_scope().begin(), current_scope().end());
     std::vector<Value> arg_vals;
@@ -1024,14 +1103,20 @@ static Value try_evaluate_function(const std::string& name, const Arguments& arg
     Value result = evaluate_function_call(name, arg_vals, scope_bindings2);
 
     // If we got a concrete result, return it — but preserve the function call
-    // expression tree if any argument had variable references (for module params, loop vars)
-    if (result.isNumber()) {
-        // Check if any arg tree has variable refs
-        bool hasVarRefs = false;
-        for (const auto& tree : arg_trees) {
-            if (tree && tree->hasVariableRefs()) { hasVarRefs = true; break; }
+    // expression tree if any argument OR the function body has variable references
+    // (function body may reference enclosing module params not in call args)
+    bool hasVarRefs2 = false;
+    for (const auto& tree : arg_trees) {
+        if (tree && tree->hasVariableRefs()) { hasVarRefs2 = true; break; }
+    }
+    if (!hasVarRefs2) {
+        auto fit2 = g_function_table.find(name);
+        if (fit2 != g_function_table.end() && fit2->second.body) {
+            if (fit2->second.body->hasVariableRefs()) hasVarRefs2 = true;
         }
-        if (hasVarRefs) {
+    }
+    if (result.isNumber()) {
+        if (hasVarRefs2) {
             auto fc_tree = ExprNode::makeFunctionCall(name, arg_trees);
             result.setExprTree(fc_tree);
         } else {
@@ -1040,12 +1125,7 @@ static Value try_evaluate_function(const std::string& name, const Arguments& arg
         return result;
     }
     if (result.isVector()) {
-        // Preserve function call tree if any arg has variable refs
-        bool hasVarRefs = false;
-        for (const auto& tree : arg_trees) {
-            if (tree && tree->hasVariableRefs()) { hasVarRefs = true; break; }
-        }
-        if (hasVarRefs) {
+        if (hasVarRefs2) {
             auto fc_tree = ExprNode::makeFunctionCall(name, arg_trees);
             result.setExprTree(fc_tree);
         }
@@ -1444,6 +1524,24 @@ statement:
         if (g_in_function_def && storeVal.isExpression() &&
             storeVal.exprTree() && storeVal.exprTree()->hasVariableRefs()) {
             g_module_runtime_vars.insert(*$1);
+        }
+        // Track module-local vector assignments containing string elements.
+        // Strings degrade to 0.0 when inlined into numeric expression trees,
+        // so these must be kept as VarRefs for the code generator to emit by name.
+        // e.g., iso_Gewinde = [["M1", 0.25, 1, ...], ...]
+        if (g_in_function_def && storeVal.isVector()) {
+            bool hasStrings = false;
+            for (size_t i = 0; i < storeVal.size() && !hasStrings; i++) {
+                if (storeVal[i].isString()) hasStrings = true;
+                else if (storeVal[i].isVector()) {
+                    for (size_t j = 0; j < storeVal[i].size(); j++) {
+                        if (storeVal[i][j].isString()) { hasStrings = true; break; }
+                    }
+                }
+            }
+            if (hasStrings) {
+                g_module_literal_vars.insert(*$1);
+            }
         }
         $$ = new AssignmentNode(*$1, storeVal);
         delete $1;
@@ -2376,7 +2474,11 @@ expr:
     | TOK_TRUE { $$ = new Value(true); }
     | TOK_FALSE { $$ = new Value(false); }
     | TOK_UNDEF { $$ = new Value(); }
-    | TOK_STRING { $$ = new Value(*$1); delete $1; }
+    | TOK_STRING {
+        $$ = new Value(*$1);
+        $$->setExprTree(ExprNode::makeStringLiteral(*$1));
+        delete $1;
+    }
     | TOK_ID {
         // When inside a module/function body (g_in_function_def), look up the variable.
         // If it has a concrete value (not a bare VarRef from module params), use that
@@ -2424,7 +2526,7 @@ expr:
                             }
                             auto vecTree = std::make_shared<ExprNode>();
                             vecTree->kind = ExprNode::Kind::VectorLiteral;
-                            vecTree->func_args = elems;
+                            vecTree->vec_elements = elems;
                             $$->setExprTree(vecTree);
                         }
                     }
@@ -2647,7 +2749,9 @@ expr:
         delete $1; delete $3;
     }
     | expr '*' expr {
-        if ($1->isExpression() || $3->isExpression()) {
+        if ($1->isExpression() || $3->isExpression() ||
+            ($1->exprTree() && $1->exprTree()->hasVariableRefs()) ||
+            ($3->exprTree() && $3->exprTree()->hasVariableRefs())) {
             // Check if either operand has VarRef trees that should be preserved
             bool hasVarRefs = ($1->exprTree() && $1->exprTree()->hasVariableRefs()) ||
                               ($3->exprTree() && $3->exprTree()->hasVariableRefs());
@@ -2666,7 +2770,19 @@ expr:
                     std::vector<ExprNodePtr> elems;
                     for (size_t i = 0; i < $1->size(); i++) {
                         auto et = (*$1)[i].exprTree();
-                        elems.push_back(et ? et : ExprNode::makeLiteral((*$1)[i].isNumber() ? (*$1)[i].toNumber() : 0));
+                        if (et) {
+                            elems.push_back(et);
+                        } else if ((*$1)[i].isVector()) {
+                            // Nested vector (e.g., matrix row): recursively build VectorLiteral
+                            std::vector<ExprNodePtr> inner;
+                            for (size_t j = 0; j < (*$1)[i].size(); j++) {
+                                auto iet = (*$1)[i].toVector()[j].exprTree();
+                                inner.push_back(iet ? iet : ExprNode::makeLiteral((*$1)[i].toVector()[j].isNumber() ? (*$1)[i].toVector()[j].toNumber() : 0));
+                            }
+                            elems.push_back(ExprNode::makeVectorLiteral(inner));
+                        } else {
+                            elems.push_back(ExprNode::makeLiteral((*$1)[i].isNumber() ? (*$1)[i].toNumber() : 0));
+                        }
                     }
                     ltree = ExprNode::makeVectorLiteral(elems);
                 }
@@ -2676,7 +2792,18 @@ expr:
                     std::vector<ExprNodePtr> elems;
                     for (size_t i = 0; i < $3->size(); i++) {
                         auto et = (*$3)[i].exprTree();
-                        elems.push_back(et ? et : ExprNode::makeLiteral((*$3)[i].isNumber() ? (*$3)[i].toNumber() : 0));
+                        if (et) {
+                            elems.push_back(et);
+                        } else if ((*$3)[i].isVector()) {
+                            std::vector<ExprNodePtr> inner;
+                            for (size_t j = 0; j < (*$3)[i].size(); j++) {
+                                auto iet = (*$3)[i].toVector()[j].exprTree();
+                                inner.push_back(iet ? iet : ExprNode::makeLiteral((*$3)[i].toVector()[j].isNumber() ? (*$3)[i].toVector()[j].toNumber() : 0));
+                            }
+                            elems.push_back(ExprNode::makeVectorLiteral(inner));
+                        } else {
+                            elems.push_back(ExprNode::makeLiteral((*$3)[i].isNumber() ? (*$3)[i].toNumber() : 0));
+                        }
                     }
                     rtree = ExprNode::makeVectorLiteral(elems);
                 }
@@ -3018,8 +3145,23 @@ expr:
         } else if (lv.isBool() && rv.isBool()) {
             $$ = new Value(lv.toBool() == rv.toBool());
         } else {
-            auto ltree = $1->exprTree() ? $1->exprTree() : ExprNode::makeLiteral($1->toNumber());
-            auto rtree = $3->exprTree() ? $3->exprTree() : ExprNode::makeLiteral($3->toNumber());
+            // Build expression trees, handling vectors as VectorLiteral
+            auto buildTree = [](Value* v) -> ExprNodePtr {
+                if (v->exprTree()) return v->exprTree();
+                if (v->isVector()) {
+                    std::vector<ExprNodePtr> elems;
+                    for (size_t i = 0; i < v->size(); i++) {
+                        const Value& elem = v->toVector()[i];
+                        if (elem.exprTree()) elems.push_back(elem.exprTree());
+                        else elems.push_back(ExprNode::makeLiteral(elem.toNumber()));
+                    }
+                    return ExprNode::makeVectorLiteral(elems);
+                }
+                if (v->isString()) return ExprNode::makeStringLiteral(v->toString());
+                return ExprNode::makeLiteral(v->toNumber());
+            };
+            auto ltree = buildTree($1);
+            auto rtree = buildTree($3);
             auto tree = ExprNode::makeBinary(ExprNode::Op::EQUAL, ltree, rtree);
             $$ = new Value(Value::expressionWithTree("(" + $1->toPython() + " == " + $3->toPython() + ")", tree));
         }
@@ -3042,8 +3184,22 @@ expr:
         } else if (lv.isBool() && rv.isBool()) {
             $$ = new Value(lv.toBool() != rv.toBool());
         } else {
-            auto ltree = $1->exprTree() ? $1->exprTree() : ExprNode::makeLiteral($1->toNumber());
-            auto rtree = $3->exprTree() ? $3->exprTree() : ExprNode::makeLiteral($3->toNumber());
+            auto buildTree = [](Value* v) -> ExprNodePtr {
+                if (v->exprTree()) return v->exprTree();
+                if (v->isVector()) {
+                    std::vector<ExprNodePtr> elems;
+                    for (size_t i = 0; i < v->size(); i++) {
+                        const Value& elem = v->toVector()[i];
+                        if (elem.exprTree()) elems.push_back(elem.exprTree());
+                        else elems.push_back(ExprNode::makeLiteral(elem.toNumber()));
+                    }
+                    return ExprNode::makeVectorLiteral(elems);
+                }
+                if (v->isString()) return ExprNode::makeStringLiteral(v->toString());
+                return ExprNode::makeLiteral(v->toNumber());
+            };
+            auto ltree = buildTree($1);
+            auto rtree = buildTree($3);
             auto tree = ExprNode::makeBinary(ExprNode::Op::NOT_EQUAL, ltree, rtree);
             $$ = new Value(Value::expressionWithTree("(" + $1->toPython() + " != " + $3->toPython() + ")", tree));
         }
@@ -3115,6 +3271,12 @@ expr:
                         elems.push_back(et ? et : ExprNode::makeLiteral(0));
                     }
                     then_tree = ExprNode::makeVectorLiteral(elems);
+                } else if ($3->isRange()) {
+                    // Preserve range with expression trees as __range__(start, end, step)
+                    ExprNodePtr sExpr = $3->rangeStartExpr() ? $3->rangeStartExpr() : ExprNode::makeLiteral($3->rangeStart());
+                    ExprNodePtr eExpr = $3->rangeEndExpr() ? $3->rangeEndExpr() : ExprNode::makeLiteral($3->rangeEnd());
+                    ExprNodePtr tExpr = $3->rangeStepExpr() ? $3->rangeStepExpr() : ExprNode::makeLiteral($3->rangeStep());
+                    then_tree = ExprNode::makeFunctionCall("__range__", {sExpr, eExpr, tExpr});
                 } else {
                     then_tree = ExprNode::makeLiteral(0);
                 }
@@ -3130,6 +3292,11 @@ expr:
                         elems.push_back(et ? et : ExprNode::makeLiteral(0));
                     }
                     else_tree = ExprNode::makeVectorLiteral(elems);
+                } else if ($5->isRange()) {
+                    ExprNodePtr sExpr = $5->rangeStartExpr() ? $5->rangeStartExpr() : ExprNode::makeLiteral($5->rangeStart());
+                    ExprNodePtr eExpr = $5->rangeEndExpr() ? $5->rangeEndExpr() : ExprNode::makeLiteral($5->rangeEnd());
+                    ExprNodePtr tExpr = $5->rangeStepExpr() ? $5->rangeStepExpr() : ExprNode::makeLiteral($5->rangeStep());
+                    else_tree = ExprNode::makeFunctionCall("__range__", {sExpr, eExpr, tExpr});
                 } else {
                     else_tree = ExprNode::makeLiteral(0);
                 }
@@ -3155,10 +3322,15 @@ expr:
             Value resolved = evaluate_expr_tree($1->exprTree(), bindings);
             if (resolved.isVector()) {
                 size_t idx = static_cast<size_t>($3->toNumber());
-                if (idx < resolved.size()) {
+                if (idx < resolved.size() && !resolved.toVector()[idx].isUndefined()) {
                     $$ = new Value(resolved.toVector()[idx]);
                 } else {
-                    $$ = new Value();
+                    // Element is out of range or undef — defer to runtime
+                    ExprNodePtr vec_tree = $1->exprTree();
+                    ExprNodePtr idx_tree = $3->exprTree();
+                    if (!idx_tree) idx_tree = ExprNode::makeLiteral($3->toNumber());
+                    auto fc = ExprNode::makeFunctionCall("__index__", {vec_tree, idx_tree});
+                    $$ = new Value(Value::expressionWithTree("0", fc));
                 }
             } else {
                 // Can't resolve at parse time — build deferred __index__ ExprNode
@@ -3211,17 +3383,42 @@ expr:
         if (*$3 == "x") idx = 0;
         else if (*$3 == "y") idx = 1;
         else if (*$3 == "z") idx = 2;
-        if (idx >= 0 && $1->isVector() && (size_t)idx < $1->size()) {
+        if (idx >= 0 && $1->isVector() && (size_t)idx < $1->size() && !g_in_module_def && !g_in_function_def) {
+            // Eager extraction only when NOT in module/function body
+            // In module/function bodies, vector contents may depend on parameters
+            // that change at runtime, so we must defer to __index__
             $$ = new Value($1->toVector()[idx]);
+        } else if (idx >= 0 && $1->isVector() && (g_in_module_def || g_in_function_def)) {
+            // In module/function body: wrap vector in VectorLiteral tree and defer
+            std::vector<ExprNodePtr> elems;
+            for (size_t i = 0; i < $1->size(); i++) {
+                const Value& elem = $1->toVector()[i];
+                if (elem.isExpression() && elem.exprTree()) {
+                    elems.push_back(elem.exprTree());
+                } else {
+                    elems.push_back(ExprNode::makeLiteral(elem.toNumber()));
+                }
+            }
+            auto vec_tree = ExprNode::makeVectorLiteral(elems);
+            auto idx_tree = ExprNode::makeLiteral((double)idx);
+            auto fc = ExprNode::makeFunctionCall("__index__", {vec_tree, idx_tree});
+            std::string exprName = "__index__(" + $1->repr() + "," + std::to_string(idx) + ")";
+            $$ = new Value(Value::expressionWithTree(exprName, fc));
         } else if (idx >= 0 && $1->isExpression() && $1->exprTree()) {
-            // Try evaluating the expression tree to get a vector
-            // Use current scope bindings so variable references like 'cut' can resolve
-            std::map<std::string, Value> bindings(current_scope().begin(), current_scope().end());
-            Value resolved = evaluate_expr_tree($1->exprTree(), bindings);
-            if (resolved.isVector() && (size_t)idx < resolved.size()) {
-                $$ = new Value(resolved.toVector()[idx]);
+            // Expression: try evaluating, but defer in module/function body
+            if (!g_in_module_def && !g_in_function_def) {
+                std::map<std::string, Value> bindings(current_scope().begin(), current_scope().end());
+                Value resolved = evaluate_expr_tree($1->exprTree(), bindings);
+                if (resolved.isVector() && (size_t)idx < resolved.size()) {
+                    $$ = new Value(resolved.toVector()[idx]);
+                } else {
+                    auto idx_tree = ExprNode::makeLiteral((double)idx);
+                    auto fc = ExprNode::makeFunctionCall("__index__", {$1->exprTree(), idx_tree});
+                    std::string exprName = "__index__(" + $1->repr() + "," + std::to_string(idx) + ")";
+                    $$ = new Value(Value::expressionWithTree(exprName, fc));
+                }
             } else {
-                // Can't resolve — defer as __index__(expr, idx) for code generator
+                // In module/function body — always defer
                 auto idx_tree = ExprNode::makeLiteral((double)idx);
                 auto fc = ExprNode::makeFunctionCall("__index__", {$1->exprTree(), idx_tree});
                 std::string exprName = "__index__(" + $1->repr() + "," + std::to_string(idx) + ")";
@@ -3429,7 +3626,10 @@ expr:
         if ($6 != $$) delete $6;
     }
     | TOK_EACH expr %prec UNARY {
-        // each flattens — just pass through the expression
+        // Mark expression for flattening by 'each' keyword
+        if ($2->exprTree()) {
+            $2->exprTree()->is_each = true;
+        }
         $$ = $2;
     }
     | TOK_ASSERT '(' arguments ')' expr %prec UNARY {
@@ -3556,7 +3756,14 @@ expr:
         }
         delete $3; delete $5; delete $7;
     }
-    | TOK_FOR '(' TOK_ID '=' expr ')' expr {
+    | TOK_FOR '(' TOK_ID '=' expr ')' {
+        // Mid-rule: add loop variable as expression VarRef so body references
+        // produce expression trees instead of baking the start value
+        push_scope();
+        auto tree = ExprNode::makeVarRef(*$3);
+        set_variable(*$3, Value::expressionWithTree(*$3, tree));
+    } expr {
+        pop_scope();
         // For-loop comprehension: [for(i=[0:n]) expr]
         // Build range ExprNode from the range expression
         ExprNodePtr range_tree = $5->exprTree();
@@ -3575,14 +3782,14 @@ expr:
                 range_tree = ExprNode::makeLiteral($5->toNumber());
             }
         }
-        ExprNodePtr body_tree = $7->exprTree();
+        ExprNodePtr body_tree = $8->exprTree();
         if (!body_tree) {
-            if ($7->isNumber()) body_tree = ExprNode::makeLiteral($7->toNumber());
-            else if ($7->isVector()) {
+            if ($8->isNumber()) body_tree = ExprNode::makeLiteral($8->toNumber());
+            else if ($8->isVector()) {
                 std::vector<ExprNodePtr> elems;
-                for (size_t i = 0; i < $7->size(); i++) {
-                    ExprNodePtr et = (*$7)[i].exprTree();
-                    if (!et && (*$7)[i].isNumber()) et = ExprNode::makeLiteral((*$7)[i].toNumber());
+                for (size_t i = 0; i < $8->size(); i++) {
+                    ExprNodePtr et = (*$8)[i].exprTree();
+                    if (!et && (*$8)[i].isNumber()) et = ExprNode::makeLiteral((*$8)[i].toNumber());
                     elems.push_back(et ? et : ExprNode::makeLiteral(0));
                 }
                 body_tree = ExprNode::makeVectorLiteral(elems);
@@ -3599,11 +3806,9 @@ expr:
             has_unresolved_range = true;
         }
         if (!has_unresolved_range && (range_val.isRange() || range_val.isVector())) {
-            // Create a temporary binding-like approach: put range directly
-            // We need a way to pass the range. Re-create the for_tree with a special literal.
-            // Actually, let's just evaluate directly here.
             Vector results;
             bool can_eval = true;
+            bool body_has_each = body_tree && body_tree->is_each;
             if (range_val.isRange()) {
                 double start = range_val.rangeStart();
                 double end = range_val.rangeEnd();
@@ -3614,7 +3819,13 @@ expr:
                         std::map<std::string, Value> bindings;
                         bindings[*$3] = Value(i);
                         Value body_val = evaluate_expr_tree(body_tree, bindings);
-                        if (!body_val.isUndefined()) results.push_back(body_val);
+                        if (!body_val.isUndefined()) {
+                            if (body_has_each && body_val.isVector()) {
+                                for (size_t j = 0; j < body_val.size(); j++) results.push_back(body_val[j]);
+                            } else {
+                                results.push_back(body_val);
+                            }
+                        }
                         else can_eval = false;
                     }
                 }
@@ -3623,7 +3834,13 @@ expr:
                     std::map<std::string, Value> bindings;
                     bindings[*$3] = range_val[i];
                     Value body_val = evaluate_expr_tree(body_tree, bindings);
-                    if (!body_val.isUndefined()) results.push_back(body_val);
+                    if (!body_val.isUndefined()) {
+                        if (body_has_each && body_val.isVector()) {
+                            for (size_t j = 0; j < body_val.size(); j++) results.push_back(body_val[j]);
+                        } else {
+                            results.push_back(body_val);
+                        }
+                    }
                     else can_eval = false;
                 }
             }
@@ -3635,9 +3852,19 @@ expr:
         } else {
             $$ = new Value(Value::expressionWithTree("0", for_tree));
         }
-        delete $3; delete $5; delete $7;
+        delete $3; delete $5; delete $8;
     }
-    | TOK_FOR '(' argument_list ')' expr {
+    | TOK_FOR '(' argument_list ')' {
+        // Mid-rule: add all for-loop variables as expression VarRefs
+        push_scope();
+        for (auto& kv : *$3) {
+            if (kv.first.find("_") != 0) {
+                auto tree = ExprNode::makeVarRef(kv.first);
+                set_variable(kv.first, Value::expressionWithTree(kv.first, tree));
+            }
+        }
+    } expr {
+        pop_scope();
         // Multi-variable for loop comprehension: for(i=R1, w=R2, ...) body
         // Collect iterators in insertion order from g_ordered_args
         struct ForIter { std::string var; Value range; };
@@ -3657,14 +3884,14 @@ expr:
             }
         }
         // Build body expression tree
-        ExprNodePtr body_tree = $5->exprTree();
+        ExprNodePtr body_tree = $6->exprTree();
         if (!body_tree) {
-            if ($5->isNumber()) body_tree = ExprNode::makeLiteral($5->toNumber());
-            else if ($5->isVector()) {
+            if ($6->isNumber()) body_tree = ExprNode::makeLiteral($6->toNumber());
+            else if ($6->isVector()) {
                 std::vector<ExprNodePtr> elems;
-                for (size_t i = 0; i < $5->size(); i++) {
-                    ExprNodePtr et = (*$5)[i].exprTree();
-                    if (!et && (*$5)[i].isNumber()) et = ExprNode::makeLiteral((*$5)[i].toNumber());
+                for (size_t i = 0; i < $6->size(); i++) {
+                    ExprNodePtr et = (*$6)[i].exprTree();
+                    if (!et && (*$6)[i].isNumber()) et = ExprNode::makeLiteral((*$6)[i].toNumber());
                     elems.push_back(et ? et : ExprNode::makeLiteral(0));
                 }
                 body_tree = ExprNode::makeVectorLiteral(elems);
@@ -3732,7 +3959,7 @@ expr:
         } else {
             $$ = new Value(Value::expressionWithTree("0", current));
         }
-        delete $3; delete $5;
+        delete $3; delete $6;
     }
     ;
 
@@ -3761,6 +3988,15 @@ vector_expr:
                 for (size_t i = 0; i < v.size(); i++) {
                     ExprNodePtr et = v[i].exprTree();
                     if (!et && v[i].isNumber()) et = ExprNode::makeLiteral(v[i].toNumber());
+                    else if (!et && v[i].isVector()) {
+                        // Nested vector without its own expr tree: build VectorLiteral from elements
+                        std::vector<ExprNodePtr> inner;
+                        for (size_t j = 0; j < v[i].size(); j++) {
+                            auto iet = v[i].toVector()[j].exprTree();
+                            inner.push_back(iet ? iet : ExprNode::makeLiteral(v[i].toVector()[j].isNumber() ? v[i].toVector()[j].toNumber() : 0));
+                        }
+                        et = ExprNode::makeVectorLiteral(inner);
+                    }
                     elems.push_back(et ? et : ExprNode::makeLiteral(0));
                 }
                 $$->setExprTree(ExprNode::makeVectorLiteral(elems));
@@ -3775,7 +4011,8 @@ vector_expr:
             auto it = $2->find("_" + std::to_string(i));
             if (it == $2->end()) break;
             v.push_back(it->second);
-            if (it->second.isExpression() && it->second.exprTree()) hasExprTrees = true;
+            if (it->second.exprTree() && it->second.exprTree()->hasVariableRefs()) hasExprTrees = true;
+            else if (it->second.isExpression() && it->second.exprTree()) hasExprTrees = true;
         }
         $$ = new Value(v);
         if (hasExprTrees) {
@@ -3783,6 +4020,14 @@ vector_expr:
             for (size_t i = 0; i < v.size(); i++) {
                 ExprNodePtr et = v[i].exprTree();
                 if (!et && v[i].isNumber()) et = ExprNode::makeLiteral(v[i].toNumber());
+                else if (!et && v[i].isVector()) {
+                    std::vector<ExprNodePtr> inner;
+                    for (size_t j = 0; j < v[i].size(); j++) {
+                        auto iet = v[i].toVector()[j].exprTree();
+                        inner.push_back(iet ? iet : ExprNode::makeLiteral(v[i].toVector()[j].isNumber() ? v[i].toVector()[j].toNumber() : 0));
+                    }
+                    et = ExprNode::makeVectorLiteral(inner);
+                }
                 elems.push_back(et ? et : ExprNode::makeLiteral(0));
             }
             $$->setExprTree(ExprNode::makeVectorLiteral(elems));
