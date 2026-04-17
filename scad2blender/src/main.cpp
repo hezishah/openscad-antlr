@@ -809,6 +809,7 @@ void printUsage(const char* program) {
               << "  -v, --verbose  Enable verbose output\n"
               << "  -o <file>      Specify output file\n"
               << "  -I <dir>       Add include search path\n"
+              << "  -B <path>      Path to Blender binary (enables pre-baking of node groups)\n"
               << "\nIf output file is not specified, writes to stdout.\n"
               << "\nExamples:\n"
               << "  " << program << " model.scad output.py\n"
@@ -872,9 +873,47 @@ static std::set<std::string> extractMainFileVars(const std::string& content) {
     return vars;
 }
 
+// Extract module names defined at top level in the main source file
+static std::set<std::string> extractMainFileModules(const std::string& content) {
+    std::set<std::string> modules;
+    bool inLC = false, inBC = false, inStr = false;
+    int braceDepth = 0;
+
+    for (size_t i = 0; i < content.size(); ) {
+        char c = content[i];
+        char nc = (i + 1 < content.size()) ? content[i + 1] : 0;
+
+        if (inBC) { if (c == '*' && nc == '/') { inBC = false; i += 2; } else { i++; } continue; }
+        if (inLC) { if (c == '\n') inLC = false; i++; continue; }
+        if (inStr) { if (c == '\\') { i += 2; continue; } if (c == '"') inStr = false; i++; continue; }
+        if (c == '/' && nc == '/') { inLC = true; i += 2; continue; }
+        if (c == '/' && nc == '*') { inBC = true; i += 2; continue; }
+        if (c == '"') { inStr = true; i++; continue; }
+        if (c == '{') { braceDepth++; i++; continue; }
+        if (c == '}') { braceDepth--; i++; continue; }
+
+        // At brace depth 0, look for "module" keyword followed by module name
+        if (braceDepth == 0 && c == 'm' && content.substr(i, 6) == "module" &&
+            (i == 0 || !isalnum(content[i-1])) &&
+            i + 6 < content.size() && !isalnum(content[i+6]) && content[i+6] != '_') {
+            i += 6;
+            while (i < content.size() && (content[i] == ' ' || content[i] == '\t')) i++;
+            std::string name;
+            while (i < content.size() && (isalnum(content[i]) || content[i] == '_')) {
+                name += content[i++];
+            }
+            if (!name.empty()) modules.insert(name);
+        } else {
+            i++;
+        }
+    }
+    return modules;
+}
+
 int main(int argc, char* argv[]) {
     std::string inputFile;
     std::string outputFile;
+    std::string blenderPath;
     bool verbose = false;
     std::vector<std::string> extra_include_paths;
 
@@ -897,6 +936,13 @@ int main(int argc, char* argv[]) {
                 extra_include_paths.push_back(argv[++i]);
             } else {
                 std::cerr << "Error: -I requires an argument\n";
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-B") == 0) {
+            if (i + 1 < argc) {
+                blenderPath = argv[++i];
+            } else {
+                std::cerr << "Error: -B requires an argument (path to Blender binary)\n";
                 return 1;
             }
         } else if (argv[i][0] == '-') {
@@ -1022,6 +1068,10 @@ int main(int argc, char* argv[]) {
     scad2blender::BlenderGenerator generator;
     generator.setSourceDir(input_dir);
     generator.setMainFileVars(extractMainFileVars(inputContent));
+    generator.setMainFileModules(extractMainFileModules(inputContent));
+    if (!blenderPath.empty()) {
+        generator.setBlenderPath(blenderPath);
+    }
     std::string pythonCode = generator.generate(g_root);
 
     // Output the result
@@ -1034,6 +1084,14 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         out << pythonCode;
+
+        // Write companion .mesh file if prebake produced one
+        std::string meshFile = outputFile.substr(0, outputFile.rfind('.')) + ".mesh";
+        if (generator.writeBakedMeshFile(meshFile)) {
+            if (verbose) {
+                std::cerr << "Baked mesh written to: " << meshFile << "\n";
+            }
+        }
 
         if (verbose) {
             std::cerr << "Output written to: " << outputFile << "\n";

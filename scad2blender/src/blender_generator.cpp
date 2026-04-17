@@ -179,6 +179,9 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
     // Pre-compute module param → group_input socket mappings
     buildModuleGiMaps(root);
 
+    // Count module call sites to identify frequently-called modules for caching
+    countModuleCalls(root.get());
+
     // Emit module functions (recursively, to emit nested modules too)
     for (auto& child : root->children()) {
         if (!child) continue;
@@ -203,7 +206,235 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
 
     emitFooter();
 
+    // If Blender path is set, pre-bake the full geometry via subprocess
+    if (!blender_path_.empty()) {
+        prebakeFullGeometry(code_.str());
+    }
+
     return code_.str();
+}
+
+void BlenderGenerator::prebakeFullGeometry(const std::string& pass2Script) {
+    // Build a modified script that skips STL export and outputs mesh data via binary temp file
+    std::string tempScript = "/tmp/_scad2blender_prebake.py";
+    std::string meshDataPath = "/tmp/_scad2blender_prebake.mesh";
+    {
+        std::ofstream out(tempScript);
+        if (!out) {
+            std::cerr << "[prebake] Cannot write temp script\n";
+            return;
+        }
+        // Strip STL export lines from the script to save time
+        // Write the script but replace the STL export section with mesh data output
+        std::istringstream iss(pass2Script);
+        std::string line;
+        bool skipExport = false;
+        while (std::getline(iss, line)) {
+            // Skip STL export section (from "Determine STL" to "Exported STL")
+            if (line.find("Determine STL output") != std::string::npos) {
+                skipExport = true;
+                continue;
+            }
+            if (skipExport) {
+                if (line.find("Exported STL") != std::string::npos) {
+                    skipExport = false;
+                    continue;
+                }
+                continue;
+            }
+            out << line << "\n";
+        }
+        // Append binary mesh data export (faster than text)
+        out << "\n# --- Pre-bake mesh export ---\n";
+        out << "import struct as _struct\n";
+        out << "_me = bpy.data.objects.get('OpenSCAD_Object')\n";
+        out << "if _me and _me.data and len(_me.data.vertices) > 0:\n";
+        out << "    _m = _me.data\n";
+        out << "    _nv = len(_m.vertices)\n";
+        out << "    _nf = len(_m.polygons)\n";
+        out << "    with open('" << meshDataPath << "', 'wb') as _fp:\n";
+        out << "        _fp.write(_struct.pack('<II', _nv, _nf))\n";
+        out << "        for _v in _m.vertices:\n";
+        out << "            _fp.write(_struct.pack('<ddd', _v.co.x, _v.co.y, _v.co.z))\n";
+        out << "        for _f in _m.polygons:\n";
+        out << "            _vis = list(_f.vertices)\n";
+        out << "            _fp.write(_struct.pack('<I', len(_vis)))\n";
+        out << "            for _i in _vis:\n";
+        out << "                _fp.write(_struct.pack('<I', _i))\n";
+        out << "    print(f'BAKE_OK {_nv} {_nf}')\n";
+        out << "else:\n";
+        out << "    print('BAKE_MESH_EMPTY')\n";
+    }
+
+    // Run Blender subprocess
+    std::string cmd = blender_path_ + " --background --python " + tempScript + " 2>/dev/null";
+    std::cerr << "[prebake] Running Blender subprocess...\n";
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        std::cerr << "[prebake] Cannot run Blender\n";
+        return;
+    }
+
+    // Read stdout to check for success
+    bool bakeOk = false;
+    int expectedVerts = 0, expectedFaces = 0;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        std::string line(buf);
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+            line.pop_back();
+        if (line.substr(0, 8) == "BAKE_OK ") {
+            if (sscanf(line.c_str(), "BAKE_OK %d %d", &expectedVerts, &expectedFaces) == 2) {
+                bakeOk = true;
+            }
+        }
+        if (line == "BAKE_MESH_EMPTY") {
+            std::cerr << "[prebake] Blender produced empty mesh — keeping original script\n";
+            pclose(pipe);
+            return;
+        }
+    }
+    int status = pclose(pipe);
+
+    if (status != 0 || !bakeOk) {
+        std::cerr << "[prebake] Blender subprocess failed (status=" << status << ") — keeping original script\n";
+        return;
+    }
+
+    // Read binary mesh data from temp file
+    full_baked_mesh_.vertices.clear();
+    full_baked_mesh_.faces.clear();
+    {
+        std::ifstream mf(meshDataPath, std::ios::binary);
+        if (!mf) {
+            std::cerr << "[prebake] Cannot read mesh data file — keeping original script\n";
+            return;
+        }
+        uint32_t nv, nf;
+        mf.read(reinterpret_cast<char*>(&nv), 4);
+        mf.read(reinterpret_cast<char*>(&nf), 4);
+        full_baked_mesh_.vertices.resize(nv);
+        for (uint32_t i = 0; i < nv; i++) {
+            double xyz[3];
+            mf.read(reinterpret_cast<char*>(xyz), 24);
+            full_baked_mesh_.vertices[i] = {xyz[0], xyz[1], xyz[2]};
+        }
+        full_baked_mesh_.faces.resize(nf);
+        for (uint32_t i = 0; i < nf; i++) {
+            uint32_t flen;
+            mf.read(reinterpret_cast<char*>(&flen), 4);
+            full_baked_mesh_.faces[i].resize(flen);
+            for (uint32_t j = 0; j < flen; j++) {
+                uint32_t idx;
+                mf.read(reinterpret_cast<char*>(&idx), 4);
+                full_baked_mesh_.faces[i][j] = idx;
+            }
+        }
+        // Clean up temp file
+        std::remove(meshDataPath.c_str());
+    }
+
+    if (full_baked_mesh_.vertices.empty()) {
+        std::cerr << "[prebake] No vertices in mesh data — keeping original script\n";
+        return;
+    }
+
+    std::cerr << "[prebake] Baked " << full_baked_mesh_.vertices.size() << "v "
+              << full_baked_mesh_.faces.size() << "f — replacing script with direct mesh\n";
+
+    // Replace code_ with a minimal script that creates the mesh from companion .mesh file
+    code_.str("");
+    code_.clear();
+    indent_ = 0;
+
+    emit("\"\"\"");
+    emit("Pre-baked Blender mesh from OpenSCAD (generated by scad2blender)");
+    emit("\"\"\"");
+    emitBlank();
+    emit("import bpy");
+    emit("import os");
+    emit("import struct");
+    emitBlank();
+
+    emit("def main():");
+    indent_++;
+
+    emit("# Load pre-baked mesh from companion binary file");
+    emit("script_path = os.path.abspath(__file__)");
+    emit("mesh_path = os.path.splitext(script_path)[0] + '.mesh'");
+    emit("with open(mesh_path, 'rb') as fp:");
+    indent_++;
+    emit("nv, nf = struct.unpack('<II', fp.read(8))");
+    emit("_verts = [struct.unpack('<ddd', fp.read(24)) for _ in range(nv)]");
+    emit("_faces = []");
+    emit("for _ in range(nf):");
+    indent_++;
+    emit("fl = struct.unpack('<I', fp.read(4))[0]");
+    emit("_faces.append(struct.unpack(f'<{fl}I', fp.read(4*fl)))");
+    indent_--;
+    indent_--;
+    emitBlank();
+
+    // Create mesh from data using from_pydata (fastest method)
+    emit("# Build mesh from pre-baked data");
+    emit("mesh = bpy.data.meshes.new('OpenSCAD_Mesh')");
+    emit("mesh.from_pydata(_verts, [], _faces)");
+    emit("mesh.update()");
+    emit("obj = bpy.data.objects.new('OpenSCAD_Object', mesh)");
+    emit("bpy.context.collection.objects.link(obj)");
+    emitBlank();
+
+    // STL export
+    emit("# Determine STL output path from script filename");
+    emit("stl_path = os.path.splitext(script_path)[0] + '.stl'");
+    emitBlank();
+    emit("# Export to STL");
+    emit("bpy.ops.object.select_all(action='DESELECT')");
+    emit("obj.select_set(True)");
+    emit("bpy.context.view_layer.objects.active = obj");
+    emit("try:");
+    indent_++;
+    emit("bpy.ops.export_mesh.stl(filepath=stl_path, use_selection=True)");
+    indent_--;
+    emit("except (AttributeError, RuntimeError):");
+    indent_++;
+    emit("bpy.ops.wm.stl_export(filepath=stl_path, export_selected_objects=True)");
+    indent_--;
+    emit("print(f'Exported STL to: {stl_path}')");
+    emitBlank();
+
+    // Print mesh stats
+    emit("me = obj.data");
+    emit("print(f'Mesh: {len(me.vertices)}v {len(me.polygons)}f')");
+
+    indent_--;
+    emitBlank();
+    emit("if __name__ == '__main__':");
+    indent_++;
+    emit("main()");
+    indent_--;
+}
+
+bool BlenderGenerator::writeBakedMeshFile(const std::string& meshPath) {
+    if (full_baked_mesh_.vertices.empty()) return false;
+    std::ofstream out(meshPath, std::ios::binary);
+    if (!out) return false;
+    uint32_t nv = full_baked_mesh_.vertices.size();
+    uint32_t nf = full_baked_mesh_.faces.size();
+    out.write(reinterpret_cast<const char*>(&nv), 4);
+    out.write(reinterpret_cast<const char*>(&nf), 4);
+    for (auto& v : full_baked_mesh_.vertices) {
+        out.write(reinterpret_cast<const char*>(v.data()), 24);
+    }
+    for (auto& f : full_baked_mesh_.faces) {
+        uint32_t flen = f.size();
+        out.write(reinterpret_cast<const char*>(&flen), 4);
+        for (int idx : f) {
+            uint32_t ui = idx;
+            out.write(reinterpret_cast<const char*>(&ui), 4);
+        }
+    }
+    return true;
 }
 
 void BlenderGenerator::emit(const std::string& line) {
@@ -265,6 +496,23 @@ void BlenderGenerator::emitHeader() {
     emit("_MODULE_CALL_LIMIT = 500");
     emit("_module_depth = {}");
     emit("_MAX_MODULE_DEPTH = 8");
+    emit("_module_ng_cache = {}  # module_name -> {param_key_tuple -> baked_object}");
+    emitBlank();
+    // Helper to make cache keys hashable (convert lists/dicts to tuples)
+    emit("def _ng_safe_key(v):");
+    indent_++;
+    emit("if isinstance(v, list): return tuple(_ng_safe_key(x) for x in v)");
+    emit("if isinstance(v, dict): return tuple(sorted((k, _ng_safe_key(val)) for k, val in v.items()))");
+    emit("try:");
+    indent_++;
+    emit("hash(v)");
+    emit("return v");
+    indent_--;
+    emit("except TypeError:");
+    indent_++;
+    emit("return str(v)");
+    indent_--;
+    indent_--;
     emitBlank();
 }
 
@@ -1155,8 +1403,72 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
     emit("_module_depth['" + node.name() + "'] -= 1");
     emit("return children_geo, y_pos");
     indent_--;
+
+    // ─── Mesh-bake caching for frequently-called leaf modules ───
+    bool isCacheable = cacheable_modules_.count(node.name()) > 0;
+    if (isCacheable) {
+        // Build a cache key from the constant parameters
+        std::vector<std::string> paramNames;
+        for (const auto& p : node.parameters()) {
+            paramNames.push_back(pyName(p));
+        }
+        auto cpit2 = captured_parent_params_.find(node.name());
+        if (cpit2 != captured_parent_params_.end()) {
+            for (const auto& cp : cpit2->second) {
+                if (std::find(paramNames.begin(), paramNames.end(), cp) == paramNames.end())
+                    paramNames.push_back(cp);
+            }
+        }
+        std::string keyTupleStr = "(";
+        for (size_t pi = 0; pi < paramNames.size(); ++pi) {
+            if (pi > 0) keyTupleStr += ", ";
+            keyTupleStr += "_ng_safe_key(" + paramNames[pi] + ")";
+        }
+        if (paramNames.size() == 1) keyTupleStr += ",";
+        keyTupleStr += ")";
+
+        emit("# Mesh-bake caching: evaluate module once, reuse as ObjectInfo");
+        emit("_cache_key = " + keyTupleStr);
+        emit("_cached_obj = _module_ng_cache.get('" + node.name() + "', {}).get(_cache_key)");
+        emit("if _cached_obj is not None:");
+        indent_++;
+        emit("if _cached_obj == '__empty__':");
+        indent_++;
+        emit("# Previously baked as empty — return no geometry");
+        emit("_module_depth['" + node.name() + "'] -= 1");
+        emit("return None, y_pos");
+        indent_--;
+        emit("# Reuse cached baked mesh via ObjectInfo");
+        emit("_oi = nodes.new('GeometryNodeObjectInfo')");
+        emit("_oi.inputs['Object'].default_value = _cached_obj");
+        emit("_oi.transform_space = 'RELATIVE'");
+        emit("_oi.location = (x_pos, y_pos)");
+        emit("x_pos += 200");
+        emit("last_geo = _oi");
+        emit("_module_depth['" + node.name() + "'] -= 1");
+        emit("return last_geo, y_pos");
+        indent_--;
+        emitBlank();
+        emit("# First call: build into temp node group, evaluate, bake to hidden object");
+        emit("_parent_nodes = nodes");
+        emit("_parent_links = links");
+        emit("_parent_gi = group_input");
+        emit("_cg = bpy.data.node_groups.new(name='_bake_" + node.name() + "', type='GeometryNodeTree')");
+        emit("nodes = _cg.nodes");
+        emit("links = _cg.links");
+        emit("nodes.clear()");
+        emit("group_input = nodes.new('NodeGroupInput')");
+        emit("group_input.location = (-400, 0)");
+        emit("_ng_go = nodes.new('NodeGroupOutput')");
+        emit("_ng_go.location = (2000, 0)");
+        emit("_cg.interface.new_socket(name='Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')");
+    }
+
     emit("start_y = y_pos");
     emit("last_geo = children_geo");
+    if (isCacheable) {
+        emit("last_geo = None  # leaf module body does not use children_geo");
+    }
     emitBlank();
 
     // Two-phase emission for module-scoped helper functions:
@@ -1193,7 +1505,72 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
 
     emitBlank();
     emit("_module_depth['" + node.name() + "'] -= 1");
-    emit("return last_geo, y_pos");
+    if (isCacheable) {
+        // Finalize: evaluate temp node group and bake to hidden mesh object
+        emit("# Finalize: evaluate temp node group and bake to hidden mesh object");
+        emit("if last_geo is None:");
+        indent_++;
+        emit("# Body produced no geometry (conditional skipped) — clean up and return None");
+        emit("bpy.data.node_groups.remove(_cg)");
+        emit("nodes = _parent_nodes");
+        emit("links = _parent_links");
+        emit("group_input = _parent_gi");
+        emit("_module_ng_cache.setdefault('" + node.name() + "', {})[_cache_key] = '__empty__'");
+        emit("return None, y_pos");
+        indent_--;
+        emit("link_nodes(links, last_geo, 'Geometry', _ng_go, 'Geometry')");
+        emit("# Create temp object, apply modifier, evaluate");
+        emit("_bake_mesh = bpy.data.meshes.new('_bm_" + node.name() + "')");
+        emit("_bake_obj = bpy.data.objects.new('_baked_" + node.name() + "', _bake_mesh)");
+        emit("bpy.context.collection.objects.link(_bake_obj)");
+        emit("_bake_mod = _bake_obj.modifiers.new('GN', 'NODES')");
+        emit("_bake_mod.node_group = _cg");
+        emit("try:");
+        indent_++;
+        emit("_dg = bpy.context.evaluated_depsgraph_get()");
+        emit("_eval_obj = _bake_obj.evaluated_get(_dg)");
+        emit("_final_mesh = bpy.data.meshes.new_from_object(_eval_obj)");
+        indent_--;
+        emit("except Exception:");
+        indent_++;
+        emit("_final_mesh = None");
+        indent_--;
+        emit("if _final_mesh is None or len(_final_mesh.vertices) == 0:");
+        indent_++;
+        emit("# Bake produced empty/failed mesh — clean up and return no geometry");
+        emit("if _final_mesh: bpy.data.meshes.remove(_final_mesh)");
+        emit("bpy.context.collection.objects.unlink(_bake_obj)");
+        emit("bpy.data.objects.remove(_bake_obj)");
+        emit("bpy.data.meshes.remove(_bake_mesh)");
+        emit("bpy.data.node_groups.remove(_cg)");
+        emit("nodes = _parent_nodes");
+        emit("links = _parent_links");
+        emit("group_input = _parent_gi");
+        emit("_module_ng_cache.setdefault('" + node.name() + "', {})[_cache_key] = '__empty__'");
+        emit("return None, y_pos");
+        indent_--;
+        emit("_bake_obj.data = _final_mesh");
+        emit("bpy.data.meshes.remove(_bake_mesh)");
+        emit("_bake_obj.modifiers.clear()");
+        emit("bpy.data.node_groups.remove(_cg)");
+        emit("_bake_obj.hide_set(True)");
+        emit("_bake_obj.hide_render = True");
+        emit("# Cache the baked object");
+        emit("_module_ng_cache.setdefault('" + node.name() + "', {})[_cache_key] = _bake_obj");
+        emit("# Restore parent context and create ObjectInfo reference");
+        emit("nodes = _parent_nodes");
+        emit("links = _parent_links");
+        emit("group_input = _parent_gi");
+        emit("_oi = nodes.new('GeometryNodeObjectInfo')");
+        emit("_oi.inputs['Object'].default_value = _bake_obj");
+        emit("_oi.transform_space = 'RELATIVE'");
+        emit("_oi.location = (x_pos, y_pos)");
+        emit("x_pos += 200");
+        emit("last_geo = _oi");
+        emit("return last_geo, y_pos");
+    } else {
+        emit("return last_geo, y_pos");
+    }
     indent_--;
     emitBlank();
 
@@ -2879,8 +3256,17 @@ void BlenderGenerator::emitFooter() {
     emit("bpy.context.collection.objects.link(obj)");
     emitBlank();
     emit("# Create geometry nodes");
-    emit("node_group, modifier = create_geometry_nodes_modifier(obj)");
-    emit("build_geometry(node_group)");
+    if (!cacheable_modules_.empty()) {
+        // Deferred modifier assignment: create node_group first, build, then attach
+        // This prevents intermediate depsgraph evaluations from re-evaluating the main object
+        emit("node_group = bpy.data.node_groups.new(name='GeometryNodes', type='GeometryNodeTree')");
+        emit("build_geometry(node_group)");
+        emit("modifier = obj.modifiers.new(name='GeometryNodes', type='NODES')");
+        emit("modifier.node_group = node_group");
+    } else {
+        emit("node_group, modifier = create_geometry_nodes_modifier(obj)");
+        emit("build_geometry(node_group)");
+    }
     emitBlank();
     emit("# Set modifier input values from socket defaults");
     emit("for item in node_group.interface.items_tree:");
@@ -2928,7 +3314,7 @@ void BlenderGenerator::emitFooter() {
     emit("# Clean up temporary boolean objects");
     emit("for _o in list(bpy.data.objects):");
     indent_++;
-    emit("if _o.name.startswith('_diff_') or _o.name.startswith('_dxf_') or _o.name.startswith('_surf_') or _o.name.startswith('grid_data_'):");
+    emit("if _o.name.startswith('_diff_') or _o.name.startswith('_dxf_') or _o.name.startswith('_surf_') or _o.name.startswith('grid_data_') or _o.name.startswith('_baked_'):");
     indent_++;
     emit("_mesh = _o.data");
     emit("bpy.data.objects.remove(_o, do_unlink=True)");
@@ -11369,6 +11755,76 @@ void BlenderGenerator::collectModulesRecursive(ASTNode* node) {
     if (node->type() == ASTNode::Type::Module) {
         if (!parent_module_params_stack_.empty()) {
             parent_module_params_stack_.pop_back();
+        }
+    }
+}
+
+void BlenderGenerator::countModuleCalls(ASTNode* root) {
+    if (!root) return;
+    // Count how many times each module is called in the AST
+    std::function<void(ASTNode*)> walk = [&](ASTNode* node) {
+        if (!node) return;
+        if (node->type() == ASTNode::Type::ModuleCall) {
+            auto* call = dynamic_cast<ModuleCallNode*>(node);
+            if (call) {
+                module_call_counts_[call->name()]++;
+            }
+        }
+        for (auto& child : node->children()) {
+            walk(child.get());
+        }
+    };
+    walk(root);
+
+    // Collect which modules call which other modules (from AST module bodies)
+    std::map<std::string, std::set<std::string>> module_callees;
+    std::function<void(ASTNode*, const std::string&)> collectCallees = [&](ASTNode* node, const std::string& currentModule) {
+        if (!node) return;
+        if (node->type() == ASTNode::Type::Module) {
+            auto* mod = dynamic_cast<ModuleNode*>(node);
+            if (mod) {
+                for (auto& child : mod->children())
+                    collectCallees(child.get(), mod->name());
+                return;
+            }
+        }
+        if (node->type() == ASTNode::Type::ModuleCall) {
+            auto* call = dynamic_cast<ModuleCallNode*>(node);
+            if (call && !currentModule.empty()) {
+                module_callees[currentModule].insert(call->name());
+            }
+        }
+        for (auto& child : node->children())
+            collectCallees(child.get(), currentModule);
+    };
+    collectCallees(root, "");
+
+    // First pass: identify candidates (called ≥ 2 times, geometric, non-recursive)
+    // Leaf caching is the default — any repeated module call benefits from ObjectInfo baking
+    std::set<std::string> candidates;
+    for (const auto& [name, count] : module_call_counts_) {
+        if (count >= 2 && defined_modules_.count(name) &&
+            !non_geometric_modules_.count(name) &&
+            !recursive_modules_.count(name)) {
+            candidates.insert(name);
+        }
+    }
+
+    // Only cache LEAF modules (those that don't call other candidate modules)
+    // Non-leaf caching causes Blender depsgraph hangs with nested ObjectInfo bakes
+    for (const auto& name : candidates) {
+        bool callsOtherCandidate = false;
+        auto it = module_callees.find(name);
+        if (it != module_callees.end()) {
+            for (const auto& callee : it->second) {
+                if (candidates.count(callee)) {
+                    callsOtherCandidate = true;
+                    break;
+                }
+            }
+        }
+        if (!callsOtherCandidate) {
+            cacheable_modules_.insert(name);
         }
     }
 }

@@ -10,6 +10,7 @@
 #include <sstream>
 #include <set>
 #include <map>
+#include <array>
 #include <unordered_map>
 #include "ast.h"
 
@@ -34,6 +35,8 @@ public:
 
     void setSourceDir(const std::string& dir) { source_dir_ = dir; }
     void setMainFileVars(const std::set<std::string>& vars) { main_file_vars_ = vars; }
+    void setMainFileModules(const std::set<std::string>& mods) { main_file_modules_ = mods; }
+    void setBlenderPath(const std::string& path) { blender_path_ = path; }
 
     /**
      * @brief Generate Python code from the AST
@@ -41,6 +44,13 @@ public:
      * @return Complete Python script for Blender
      */
     std::string generate(ASTNodePtr root);
+
+    /**
+     * @brief Write companion .mesh binary file for prebaked scripts
+     * @param meshPath Path to write the .mesh file
+     * @return true if a mesh file was written (prebake was active)
+     */
+    bool writeBakedMeshFile(const std::string& meshPath);
 
     // Visitor implementations
     void visit(RootNode& node) override;
@@ -83,22 +93,45 @@ private:
     std::map<std::string, std::string> module_param_to_gi_socket_;  // active module's param → group_input socket
     std::map<std::string, std::map<std::string, std::string>> module_gi_maps_;  // per-module gi maps
     std::set<std::string> for_loop_range_vars_; // Variables used as for-loop range bounds
+    std::set<std::string> emitted_modules_;        // Modules already emitted (dedup)
     std::set<std::string> non_geometric_modules_; // Modules that produce no geometry
     std::set<std::string> python_helper_functions_; // Recursive functions needing Python helpers
     std::map<std::string, std::string> function_owner_module_; // funcName → owning module name (for module-scoped functions)
+    std::set<std::string> emitted_module_scoped_helpers_; // Functions actually emitted as module-scoped closures
     std::set<std::string> recursive_modules_;  // Self-calling modules → fallback to old Python path
     std::set<std::string> param_loop_modules_;  // Modules with for-loops whose bounds depend on params
     std::set<std::string> param_grid_modules_;  // Param-loop modules convertible to IoP
     std::set<std::string> iop_ancestor_modules_; // Modules that transitively call param_grid modules
+    std::set<std::string> loop_called_modules_;  // Modules called from inside for-loops → emit as node groups
     std::string current_ng_module_name_;          // Name of module currently being emitted as node group
+    std::map<std::string, int> module_call_counts_;  // module name → number of call sites in AST
+    std::set<std::string> cacheable_modules_;     // Modules called ≥4 times → emit with node group caching
     std::map<std::string, EmitResult> loop_var_node_map_;  // loop var → Index-derived node (for IoP)
     bool emitting_node_group_ = false;         // True inside node-group module body emission
+    int next_bool_tool_idx_ = 0;              // Counter for _bool_tool_N objects (modifier-stack booleans)
+    bool emitting_tool_tree_ = false;         // True when building tool GN tree (prevents nesting)
     std::vector<std::set<std::string>> parent_module_params_stack_; // Stack of parent module param names
     std::map<std::string, std::vector<std::string>> captured_parent_params_; // module_name -> captured parent params
+    std::map<std::string, std::set<std::string>> promoted_module_params_;  // module_name -> promoted param names
     std::map<std::string, ModuleNode*> module_nodes_;  // module name -> AST node pointer
     std::map<std::string, std::map<std::string, double>> module_call_site_defaults_;  // module -> param -> value from call site
     std::string source_dir_;  // Directory of the source .scad file for resolving relative paths
     std::set<std::string> main_file_vars_;  // Variables defined in the main .scad file (not includes)
+    std::set<std::string> main_file_modules_;  // Modules defined in the main .scad file
+    std::string blender_path_;  // Path to Blender binary (empty = skip prebaking)
+
+    // Pre-baked mesh data from Blender subprocess evaluation
+    struct BakedMesh {
+        std::vector<std::array<double,3>> vertices;
+        std::vector<std::vector<int>> faces;
+    };
+    std::map<std::string, BakedMesh> baked_meshes_;  // module_name -> pre-baked mesh
+    BakedMesh full_baked_mesh_;  // Full geometry bake (entire model)
+
+    // Pre-baking methods
+    void prebakeModules(const std::string& bakingScript);
+    void prebakeFullGeometry(const std::string& pass2Script);
+    BakedMesh parseMeshOutput(FILE* pipe, const std::string& moduleName);
 
     // User-defined function table (collected from AST FunctionNode nodes)
     struct FuncDef {
@@ -117,6 +150,7 @@ private:
     void emitHeader();
     void emitHelperFunctions();
     void emitVariables();
+    void emitBakedMeshObjects();  // Emit top-level shared hidden objects for pre-baked modules
     void emitModuleFunction(ModuleNode& node);
     void emitBuildGeometry(RootNode& node);
     void emitFooter();
@@ -149,6 +183,11 @@ private:
 
     // Boolean generators
     void emitBooleanOp(BooleanNode& node);
+
+    // Child group wrapping: wraps geometry into a separate GeometryNodeGroup
+    std::string emitChildGroupWrapBegin(const std::string& label);
+    void emitChildGroupWrapEnd(const std::string& scopeId);
+    bool saved_emitting_ng_for_wrap_ = false;  // saved emitting_node_group_ during child wrap
 
     // Extrude generators
     void emitLinearExtrude(const Arguments& args);
@@ -194,6 +233,8 @@ private:
     void detectParamLoopModules(ASTNode* root);
     void detectParamGridModules(ASTNode* root);
     void computeIoPAncestors(ASTNode* root);
+    void detectLoopCalledModules(ASTNode* root);  // Find modules called from for-loops
+    void countModuleCalls(ASTNode* root);           // Count module call sites
     bool useManifoldSolver() const;  // True when current node group transitively uses IoP
     void emitModuleNodeGroupDecls(ASTNode* root);
     void collectFunctionsRecursive(ASTNode* node, const std::string& ownerModule = "");

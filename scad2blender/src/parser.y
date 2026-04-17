@@ -1635,6 +1635,14 @@ module_stmt:
             // Only store defaults for parameters that had explicit `= expr`
             if (g_params_with_explicit_default.count(param)) {
                 Value v = lookup_variable(param);
+                // If g_in_function_def was true (nested module), the parameter was stored
+                // as a VarRef expression. The actual default is under __fndef_default_ key.
+                if (v.isExpression()) {
+                    Value fndef_v = lookup_variable("__fndef_default_" + param);
+                    if (!fndef_v.isUndefined()) {
+                        v = fndef_v;
+                    }
+                }
                 if (!v.isUndefined()) {
                     g_module_param_defaults[param] = v;
                 }
@@ -1677,6 +1685,13 @@ module_stmt:
         for (const auto& param : *$4) {
             if (g_params_with_explicit_default.count(param)) {
                 Value v = lookup_variable(param);
+                // Handle nested module case: VarRef → look up __fndef_default_ key
+                if (v.isExpression()) {
+                    Value fndef_v = lookup_variable("__fndef_default_" + param);
+                    if (!fndef_v.isUndefined()) {
+                        v = fndef_v;
+                    }
+                }
                 if (!v.isUndefined()) {
                     node->setParameterDefault(param, v);
                 }
