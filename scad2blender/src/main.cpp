@@ -436,13 +436,9 @@ static std::string filterLibrary(const std::string& libContent,
             needed.insert(id);
         }
     }
-    // Also add longer identifiers (len>=3) that appear anywhere in main file
-    // These are likely intentional references (e.g., variable names matching lib functions)
-    for (const auto& id : mainAllIds) {
-        if (id.size() >= 3 && defByName.count(id) && !needed.count(id)) {
-            needed.insert(id);
-        }
-    }
+    // Non-call identifiers (parameter names, variable names) are NOT used for
+    // initial selection — they cause too many false positives (e.g., "center",
+    // "grad", "size" matching library definitions that are never actually called).
 
     // Transitive closure: for each needed definition, scan its body for more references
     // Use call-position matching for the body too
@@ -474,13 +470,9 @@ static std::string filterLibrary(const std::string& libContent,
                     changed = true;
                 }
             }
-            // Add longer identifier matches (variable references to lib functions)
-            for (const auto& id : bodyAllIds) {
-                if (id.size() >= 3 && defByName.count(id) && !needed.count(id)) {
-                    needed.insert(id);
-                    changed = true;
-                }
-            }
+            // Only follow call-position matches (identifier followed by '(')
+            // Non-call identifiers in definition bodies (parameter names, etc.)
+            // should NOT pull in more library definitions.
         }
     }
 

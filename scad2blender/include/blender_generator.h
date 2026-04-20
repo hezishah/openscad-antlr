@@ -78,7 +78,6 @@ private:
     bool in_module_ = false;
     bool in_hull_ = false;
     bool in_extrude_ = false;
-    bool in_difference_ = false;
     bool has_3d_geometry_ = false;  // Set when any 3D primitive or extrusion is emitted
     int eval_steps_ = 0;
     int eval_call_count_ = 0;
@@ -89,6 +88,7 @@ private:
     std::set<std::string> local_assigned_vars_;        // Variables assigned in current module body (Python build-time scope)
     std::map<std::string, std::string> local_expr_to_var_;  // Maps expression string → Python var name for locally assigned runtime vars
     std::set<std::string> group_input_vars_;  // Variables with group_input sockets
+    std::set<std::string> group_input_bool_vars_;  // Boolean group_input variables (control Python flow, not node graph)
     std::set<std::string> top_level_vars_;     // Variables from top-level assignments only
     std::map<std::string, std::string> module_param_to_gi_socket_;  // active module's param → group_input socket
     std::map<std::string, std::map<std::string, std::string>> module_gi_maps_;  // per-module gi maps
@@ -235,7 +235,6 @@ private:
     void computeIoPAncestors(ASTNode* root);
     void detectLoopCalledModules(ASTNode* root);  // Find modules called from for-loops
     void countModuleCalls(ASTNode* root);           // Count module call sites
-    bool useManifoldSolver() const;  // True when current node group transitively uses IoP
     void emitModuleNodeGroupDecls(ASTNode* root);
     void collectFunctionsRecursive(ASTNode* node, const std::string& ownerModule = "");
     void collectForLoopRangeVars(ASTNode* node);

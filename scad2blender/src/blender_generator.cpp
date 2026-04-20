@@ -141,6 +141,9 @@ std::string BlenderGenerator::generate(ASTNodePtr root) {
             (value.isVector() && value.size() == 3)) {
             if (main_file_vars_.empty() || main_file_vars_.count(name)) {
                 group_input_vars_.insert(name);
+                if (value.isBool()) {
+                    group_input_bool_vars_.insert(name);
+                }
             }
         }
     }
@@ -626,6 +629,39 @@ void BlenderGenerator::emitHelperFunctions() {
     indent_--;
     emitBlank();
 
+    // Runtime boolean solver selection: MANIFOLD for known-manifold inputs, EXACT otherwise
+    emit("def pick_bool_solver(node_a, node_b):");
+    indent_++;
+    emit("\"\"\"Pick MANIFOLD when both inputs are known-manifold primitives, EXACT otherwise.\"\"\"");
+    emit("_manifold = {'GeometryNodeMeshCube', 'GeometryNodeMeshCylinder',");
+    emit("             'GeometryNodeMeshCone', 'GeometryNodeMeshUVSphere',");
+    emit("             'GeometryNodeMeshIcoSphere', 'GeometryNodeMeshGrid',");
+    emit("             'GeometryNodeConvexHull'}");
+    emit("_pass = {'GeometryNodeTransform', 'GeometryNodeSetPosition',");
+    emit("         'GeometryNodeMergeByDistance', 'GeometryNodeRealizeInstances',");
+    emit("         'GeometryNodeFlipFaces'}");
+    emit("def _trace(n):");
+    indent_++;
+    emit("if n is None: return False");
+    emit("s = n");
+    emit("for _ in range(20):");
+    indent_++;
+    emit("if s.bl_idname in _manifold: return True");
+    emit("if s.bl_idname == 'GeometryNodeMeshBoolean': return True");
+    emit("if s.bl_idname in _pass:");
+    indent_++;
+    emit("gi = s.inputs.get('Geometry') or s.inputs.get('Mesh')");
+    emit("if gi and gi.links: s = gi.links[0].from_node; continue");
+    indent_--;
+    emit("return False");
+    indent_--;
+    emit("return False");
+    indent_--;
+    emit("if _trace(node_a) and _trace(node_b): return 'MANIFOLD'");
+    emit("return 'EXACT'");
+    indent_--;
+    emitBlank();
+
     // OpenSCAD search() helper
     emit("def _scad_search(match, table, num_returns=1):");
     indent_++;
@@ -1024,9 +1060,12 @@ bool BlenderGenerator::exprTreeHasOnlyGroupInputVars(const ExprNodePtr& tree) {
         case ExprNode::Kind::Literal:
             return true;
         case ExprNode::Kind::VarRef:
-            return group_input_vars_.find(tree->var_name) != group_input_vars_.end() ||
+            // Boolean group_input vars can't be linked as Math nodes — they control Python flow
+            if (group_input_bool_vars_.count(tree->var_name) > 0)
+                return false;
+            return (group_input_vars_.find(tree->var_name) != group_input_vars_.end() ||
                    module_param_to_gi_socket_.count(tree->var_name) > 0 ||
-                   module_param_to_gi_socket_.count(pyName(tree->var_name)) > 0;
+                   module_param_to_gi_socket_.count(pyName(tree->var_name)) > 0);
         case ExprNode::Kind::UnaryOp:
             return exprTreeHasOnlyGroupInputVars(tree->left);
         case ExprNode::Kind::BinaryOp:
@@ -1462,6 +1501,11 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
         emit("_ng_go = nodes.new('NodeGroupOutput')");
         emit("_ng_go.location = (2000, 0)");
         emit("_cg.interface.new_socket(name='Geometry', in_out='OUTPUT', socket_type='NodeSocketGeometry')");
+        // Cacheable modules build into a temporary node group that has NO group_input
+        // sockets for module parameters — only a Geometry output.  Clear the gi_map so
+        // emitExpressionNodeTree() falls back to Python-level parameter values instead of
+        // trying to link to non-existent group_input sockets.
+        module_param_to_gi_socket_.clear();
     }
 
     emit("start_y = y_pos");
@@ -1553,6 +1597,21 @@ void BlenderGenerator::emitModuleFunction(ModuleNode& node) {
         emit("bpy.data.meshes.remove(_bake_mesh)");
         emit("_bake_obj.modifiers.clear()");
         emit("bpy.data.node_groups.remove(_cg)");
+        // Fix material slots: remove NULL slots and remap face indices
+        // Without this, baked objects get [NULL, Color] slots with faces at index 1.
+        // Boolean operations then mismap material indices across different ObjectInfo sources.
+        emit("_null_slots = [i for i, ms in enumerate(_bake_obj.data.materials) if ms is None]");
+        emit("if _null_slots:");
+        indent_++;
+        emit("for _p in _bake_obj.data.polygons:");
+        indent_++;
+        emit("_p.material_index -= sum(1 for _ns in _null_slots if _ns < _p.material_index)");
+        indent_--;
+        emit("for _ns_i in reversed(_null_slots):");
+        indent_++;
+        emit("_bake_obj.data.materials.pop(index=_ns_i)");
+        indent_--;
+        indent_--;
         emit("_bake_obj.hide_set(True)");
         emit("_bake_obj.hide_render = True");
         emit("# Cache the baked object");
@@ -1736,7 +1795,7 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emit("height = float(l) if l is not None else float(h)");
         emit("cyl = nodes.new('GeometryNodeMeshCylinder')");
         emit("cyl.location = (x_pos, y_pos)");
-        emit("cyl.fill_type = 'TRIANGLE_FAN'");
+        emit("cyl.fill_type = 'NGON'");
         emit("cyl.inputs['Radius'].default_value = radius");
         emit("cyl.inputs['Depth'].default_value = height");
         emit("cyl.inputs['Vertices'].default_value = 32");
@@ -2047,7 +2106,7 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emit("if _h <= 0: _h = max(abs(_d1), abs(_d2), 1) / 2");
         emit("cone = nodes.new('GeometryNodeMeshCone')");
         emit("cone.location = (x_pos, y_pos)");
-        emit("cone.fill_type = 'TRIANGLE_FAN'");
+        emit("cone.fill_type = 'NGON'");
         emit("cone.inputs['Radius Top'].default_value = abs(_d2) / 2");
         emit("cone.inputs['Radius Bottom'].default_value = abs(_d1) / 2");
         emit("cone.inputs['Depth'].default_value = _h");
@@ -2296,6 +2355,78 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emitBlank();
     }
 
+    // Helper: SBogen polygon point generator for extrude mode
+    if (defined_modules_.count("SBogen") || defined_modules_.count("Anschluss")) {
+        emitBlank();
+        emit("def _sbogen_poly_pts(extrude_val, dist_val, l1_val, l2_val, rad1, rad2, center_val, grad_deg, grad2, x0_val, lRef_val, fn_val):");
+        indent_++;
+        emit("\"\"\"Compute SBogen polygon points for extrude mode (S-curve cross-section profile)\"\"\"");
+        emit("import math");
+        emit("_grad_r = math.radians(grad_deg)");
+        emit("_dist_abs = abs(dist_val)");
+        emit("_extrude_v = extrude_val * (1 if dist_val >= 0 else -1)");
+        emit("if grad_deg > 0.001 and abs(math.sin(_grad_r)) > 1e-10:");
+        indent_++;
+        emit("_y = _dist_abs / math.tan(_grad_r) + rad1 * math.tan(_grad_r / 2) + rad2 * math.tan(_grad_r / 2)");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("_y = 0");
+        indent_--;
+        emit("_yRef = 0");
+        emit("if abs(lRef_val) > 0.001:");
+        indent_++;
+        emit("if lRef_val > 0: _yRef = (0 if lRef_val > 2 else math.tan((_grad_r - (math.radians(grad2[1]) if lRef_val > 1 else 0)) / 2) * rad2) - _y / 2");
+        emit("else: _yRef = (0 if lRef_val < -2 else -math.tan((_grad_r - (math.radians(grad2[0]) if lRef_val < -1 else 0)) / 2) * rad1) + _y / 2");
+        indent_--;
+        emit("_g2Y = [-l1_val + _y / 2 - _yRef + rad1 * math.sin(math.radians(grad2[0])), l2_val - _y / 2 - _yRef - rad2 * math.sin(math.radians(grad2[1]))]");
+        emit("_g2X = [rad1 - rad1 * math.cos(math.radians(grad2[0])) - (math.tan(math.radians(grad2[0])) * _g2Y[0] if abs(grad2[0]) > 0.001 else 0),");
+        emit("       -rad2 + rad2 * math.cos(math.radians(grad2[1])) - (math.tan(math.radians(grad2[1])) * _g2Y[1] if abs(grad2[1]) > 0.001 else 0)]");
+        emit("_n = max(4, fn_val // 2)");
+        emit("_sd = 1 if dist_val >= 0 else -1");
+        emit("def _arc(r, ad, rd, tx, ty):");
+        indent_++;
+        emit("pts = []");
+        emit("rv = abs(r)");
+        emit("for i in range(_n + 1):");
+        indent_++;
+        emit("a = math.radians(rd + ad * i / _n)");
+        emit("pts.append([rv * math.cos(a) + tx, rv * math.sin(a) + ty])");
+        indent_--;
+        emit("return pts");
+        indent_--;
+        emit("if center_val == 1:");
+        indent_++;
+        emit("pts = [[x0_val * _sd, l2_val], [_extrude_v + _dist_abs / 2 + _g2X[1], l2_val]]");
+        emit("pts.extend(_arc(rad2, grad_deg + grad2[1], -90 - grad2[1], _dist_abs / 2 + _extrude_v - rad2, _y / 2 + _yRef))");
+        emit("pts.extend(_arc(rad1, -grad_deg - grad2[0], 90 + grad_deg, -_dist_abs / 2 + _extrude_v + rad1, -_y / 2 + _yRef))");
+        emit("pts.extend([[_extrude_v - _dist_abs / 2 + _g2X[0], -l1_val], [x0_val * _sd, -l1_val]])");
+        indent_--;
+        emit("elif center_val < 0 or center_val > 1:");
+        indent_++;
+        emit("pts = [[x0_val * _sd, 0], [_extrude_v + _g2X[1], 0]]");
+        emit("pts.extend(_arc(rad2, grad_deg + grad2[1], -90 - grad2[1], _extrude_v - rad2, _y / 2 - l2_val + _yRef))");
+        emit("pts.extend(_arc(rad1, -grad_deg - grad2[0], 90 + grad_deg, _extrude_v + rad1 - _dist_abs, -_y / 2 - l2_val + _yRef))");
+        emit("pts.extend([[_extrude_v - _dist_abs + _g2X[0], -l2_val - l1_val], [x0_val * _sd, -l2_val - l1_val]])");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("pts = [[x0_val * _sd, l2_val + l1_val], [_extrude_v + _dist_abs + _g2X[1], l2_val + l1_val]]");
+        emit("pts.extend(_arc(rad2, grad_deg + grad2[1], -90 - grad2[1], _dist_abs + _extrude_v - rad2, _y / 2 + l1_val + _yRef))");
+        emit("pts.extend(_arc(rad1, -grad_deg - grad2[0], 90 + grad_deg, _extrude_v + rad1, -_y / 2 + l1_val + _yRef))");
+        emit("pts.extend([[_extrude_v + _g2X[0], 0], [x0_val * _sd, 0]])");
+        indent_--;
+        emit("if dist_val < 0: pts = [[-p[0], p[1]] for p in pts]");
+        emit("clean = [pts[0]]");
+        emit("for p in pts[1:]:");
+        indent_++;
+        emit("if abs(p[0] - clean[-1][0]) > 0.001 or abs(p[1] - clean[-1][1]) > 0.001: clean.append(p)");
+        indent_--;
+        emit("return clean");
+        indent_--;
+        emitBlank();
+    }
+
     // Simplified SBogen → S-curve connector replacement
     if (defined_modules_.count("SBogen")) {
         emitBlank();
@@ -2310,6 +2441,33 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emit("_l1 = float(_s(l1))");
         emit("_l2 = float(_s(l2)) if l2 is not None else _l1");
         emit("_fn = max(8, int(_s(fn))) if fn is not None else 16");
+        emit("_r2 = float(_s(r2)) if r2 is not None else _r1");
+        emit("if extrude and extrude is not True:");
+        indent_++;
+        emit("# SBogen extrude mode: generate 2D polygon (S-curve cross-section profile)");
+        emit("_grad_deg = abs(float(_s(grad)))");
+        emit("_center_v = 1 if center is True else (0 if center is False else int(float(_s(center))))");
+        emit("_grad2v = list(grad2) if isinstance(grad2, (list, tuple)) else [float(_s(grad2))] * 2");
+        emit("_grad2v = [float(_s(g)) for g in _grad2v]");
+        emit("_pts = _sbogen_poly_pts(float(_s(extrude)), _dist, _l1, _l2, _r1, _r2, _center_v, _grad_deg, _grad2v, float(_s(x0)), float(_s(lRef)), _fn)");
+        emit("if len(_pts) >= 3:");
+        indent_++;
+        emit("_cd = bpy.data.curves.new('sbogen_ext', 'CURVE')");
+        emit("_cd.dimensions = '2D'");
+        emit("_sp = _cd.splines.new('POLY')");
+        emit("_sp.points.add(len(_pts) - 1)");
+        emit("for i, p in enumerate(_pts): _sp.points[i].co = (p[0], p[1], 0, 1)");
+        emit("_sp.use_cyclic_u = True");
+        emit("_obj = bpy.data.objects.new('sbogen_ext', _cd)");
+        emit("bpy.context.collection.objects.link(_obj)");
+        emit("_oi = nodes.new('GeometryNodeObjectInfo')");
+        emit("_oi.location = (x_pos, y_pos)");
+        emit("_oi.inputs['Object'].default_value = _obj");
+        emit("_oi.transform_space = 'RELATIVE'");
+        emit("return _oi, y_pos");
+        indent_--;
+        emit("return children_geo, y_pos");
+        indent_--;
         emit("# Build S-curve path using GeoNodes CurveArc + CurveLine");
         emit("_n = max(4, _fn // 2)");
         emit("# First arc: circular arc from (0,0,_l1) sweeping _grad radians");
@@ -2367,6 +2525,229 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         indent_--;
         emit("last_geo = _ctm");
         emit("x_pos += 600");
+        emit("return last_geo, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
+    // Simplified Anschluss → walled S-curve tube replacement
+    if (defined_modules_.count("Anschluss")) {
+        emitBlank();
+        emit("# Simplified Anschluss → walled S-curve tube replacement");
+        emit("def module_Anschluss(nodes, links, group_input, x_pos, y_pos, h=10, d1=10, d2=15, rad=5, rad2=None, grad=30, r1=None, r2=None, center=True, fn=0, fs=0, fa=0, fn2=0, grad2=0, x0=0, wand=None, use2D=False, name=None, help=None, old=False, dicke=None, hRef=0, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified Anschluss: walled S-curve connector tube via rotate-extrude\"\"\"");
+        emit("import math");
+        emit("_wand = float(_s(dicke)) if dicke is not None else (float(_s(wand)) if wand is not None else 0)");
+        emit("_ctr = 1 if center is True else (0 if center is False else int(float(_s(center))))");
+        emit("_rad1 = float(_s(rad[0])) if isinstance(rad, (list, tuple)) else float(_s(rad))");
+        emit("_rad2v = float(_s(rad2)) if rad2 is not None else (float(_s(rad[1])) if isinstance(rad, (list, tuple)) and len(rad) > 1 else _rad1)");
+        emit("_r1 = float(_s(r1)) if r1 is not None else float(_s(d1)) / 2");
+        emit("_r2 = float(_s(r2)) if r2 is not None else float(_s(d2)) / 2");
+        emit("_hv = h");
+        emit("_l1 = float(_s(_hv[0])) if isinstance(_hv, (list, tuple)) else float(_s(_hv)) / 2");
+        emit("_l2 = float(_s(_hv[1])) if isinstance(_hv, (list, tuple)) and len(_hv) > 1 else float(_s(_hv)) / 2");
+        emit("_grad_deg = abs(float(_s(grad)))");
+        emit("_fn2v = max(8, int(_s(fn2))) if fn2 and float(_s(fn2)) > 0 else 16");
+        emit("_fnv = max(8, int(_s(fn))) if fn and float(_s(fn)) > 0 else 32");
+        emit("_g2 = list(grad2) if isinstance(grad2, (list, tuple)) else [float(_s(grad2))] * 2");
+        emit("_g2 = [float(_s(g)) for g in _g2]");
+        emit("_x0 = float(_s(x0))");
+        emit("_hRef = float(_s(hRef))");
+        emit("_dist = _r2 - _r1");
+        emit("# Compute extrude base from center mode");
+        emit("if _ctr > 0: _eb = (_r1 + _r2) / 2");
+        emit("elif _ctr < 0: _eb = _r2");
+        emit("else: _eb = _r1");
+        emit("# Build profile curve");
+        emit("def _subdiv_poly(pts, max_edge=2.0):");
+        indent_++;
+        emit("\"\"\"Subdivide polygon edges longer than max_edge\"\"\"");
+        emit("result = []");
+        emit("n = len(pts)");
+        emit("for i in range(n):");
+        indent_++;
+        emit("p0 = pts[i]");
+        emit("p1 = pts[(i + 1) % n]");
+        emit("result.append(p0)");
+        emit("dx, dy = p1[0] - p0[0], p1[1] - p0[1]");
+        emit("d = (dx*dx + dy*dy) ** 0.5");
+        emit("if d > max_edge:");
+        indent_++;
+        emit("nseg = int(d / max_edge) + 1");
+        emit("for j in range(1, nseg):");
+        indent_++;
+        emit("t = j / nseg");
+        emit("result.append([p0[0] + dx*t, p0[1] + dy*t])");
+        indent_--;
+        indent_--;
+        indent_--;
+        emit("return result");
+        indent_--;
+        emit("_cd = bpy.data.curves.new('anschl_prof', 'CURVE')");
+        emit("_cd.dimensions = '2D'");
+        emit("if _wand == 0:");
+        indent_++;
+        emit("# No wall: single SBogen profile surface");
+        emit("pts = _sbogen_poly_pts(_eb, _dist, _l1, _l2, _rad1, _rad2v, _ctr, _grad_deg, _g2, _x0, _hRef, _fn2v)");
+        emit("pts = _subdiv_poly(pts)");
+        emit("if len(pts) >= 3:");
+        indent_++;
+        emit("sp = _cd.splines.new('POLY')");
+        emit("sp.points.add(len(pts) - 1)");
+        emit("for i, p in enumerate(pts): sp.points[i].co = (p[0], p[1], 0, 1)");
+        emit("sp.use_cyclic_u = True");
+        indent_--;
+        indent_--;
+        emit("elif _wand != 0:");
+        indent_++;
+        emit("# Wall mode: build ring from S-curve paths with vertical straight sections");
+        emit("_aw = abs(_wand)");
+        emit("# Determine outer and inner radii at bottom and top");
+        emit("if _wand < 0:");
+        indent_++;
+        emit("_r_bot_o = _r1 + _aw  # outer bottom radius");
+        emit("_r_top_o = _r2 + _aw  # outer top radius");
+        emit("_r_bot_i = _r1  # inner bottom radius");
+        emit("_r_top_i = _r2  # inner top radius");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("_r_bot_o = _r1  # outer bottom radius");
+        emit("_r_top_o = _r2  # outer top radius");
+        emit("_r_bot_i = _r1 - _aw  # inner bottom radius");
+        emit("_r_top_i = _r2 - _aw  # inner top radius");
+        indent_--;
+        emit("# Build S-curve path: vertical straight + arcs + vertical straight");
+        emit("def _scurve_path(r_bot, r_top, rad_val, rad2_val, n_arc):");
+        indent_++;
+        emit("\"\"\"Generate S-curve path from (r_bot, 0) to (r_top, total_h) with vertical straights\"\"\"");
+        emit("_gr = math.radians(_grad_deg)");
+        emit("_dr = abs(r_bot - r_top)  # total radial change");
+        emit("# Arc tangent offsets");
+        emit("_tan_half = math.tan(_gr / 2) if _grad_deg > 0.1 else 0");
+        emit("_sin_g = math.sin(_gr) if _grad_deg > 0.1 else 0");
+        emit("_cos_g = math.cos(_gr) if _grad_deg > 0.1 else 1");
+        emit("# Height consumed by arcs: rad1*(1-cos) + connecting tangent + rad2*(1-cos)");
+        emit("# Radial change from arcs: rad1*sin + tangent_dr + rad2*sin");
+        emit("_arc_r1 = rad_val * _sin_g  # radial change from bottom arc");
+        emit("_arc_r2 = rad2_val * _sin_g  # radial change from top arc");
+        emit("_arc_h1 = rad_val * (1 - _cos_g)  # height from bottom arc");
+        emit("_arc_h2 = rad2_val * (1 - _cos_g)  # height from top arc");
+        emit("# Tangent line between arcs");
+        emit("_tang_r = _dr - _arc_r1 - _arc_r2  # remaining radial change for tangent");
+        emit("_tang_h = _tang_r / math.tan(_gr) if _grad_deg > 0.1 and abs(math.tan(_gr)) > 1e-10 else 0");
+        emit("# Total arc region height");
+        emit("_arc_total_h = _arc_h1 + abs(_tang_h) + _arc_h2");
+        emit("# Straight section heights (split remaining height)");
+        emit("_total_h = _l1 + _l2");
+        emit("_h_bot_straight = _l1 - _arc_total_h / 2  # bottom straight");
+        emit("_h_top_straight = _l2 - _arc_total_h / 2  # top straight");
+        emit("if _h_bot_straight < 0: _h_bot_straight = 0");
+        emit("if _h_top_straight < 0: _h_top_straight = 0");
+        emit("# Direction: 1 if r decreases (inward), -1 if r increases");
+        emit("_sgn = -1 if r_bot > r_top else 1");
+        emit("pts = []");
+        emit("y_cur = 0");
+        emit("# Bottom straight section (constant radius)");
+        emit("pts.append([r_bot, y_cur])");
+        emit("y_cur += _h_bot_straight");
+        emit("if _h_bot_straight > 0.01: pts.append([r_bot, y_cur])");
+        emit("# Bottom arc: from vertical to angled");
+        emit("_cx1 = r_bot + _sgn * rad_val  # arc center X (inward from wall)");
+        emit("_cy1 = y_cur  # arc center Y");
+        emit("for i in range(1, n_arc + 1):");
+        indent_++;
+        emit("a = i * _gr / n_arc");
+        emit("px = _cx1 - _sgn * rad_val * math.cos(a)");
+        emit("py = _cy1 + rad_val * math.sin(a)");
+        emit("pts.append([px, py])");
+        indent_--;
+        emit("# Tangent line between arcs (if needed)");
+        emit("if abs(_tang_r) > 0.01:");
+        indent_++;
+        emit("_tx = pts[-1][0] + _sgn * _tang_r");
+        emit("_ty = pts[-1][1] + abs(_tang_h)");
+        emit("pts.append([_tx, _ty])");
+        indent_--;
+        emit("# Top arc: from angled back to vertical");
+        emit("_cx2 = r_top - _sgn * rad2_val  # arc center X");
+        emit("_cy2 = y_cur + _arc_h1 + abs(_tang_h) + _arc_h2  # arc center Y at top of arc region");
+        emit("for i in range(n_arc - 1, -1, -1):");
+        indent_++;
+        emit("a = i * _gr / n_arc");
+        emit("px = _cx2 + _sgn * rad2_val * math.cos(a)");
+        emit("py = _cy2 - rad2_val * math.sin(a) + rad2_val");
+        emit("pts.append([px, py])");
+        indent_--;
+        emit("# Top straight section (constant radius)");
+        emit("y_top = _total_h");
+        emit("if _h_top_straight > 0.01: pts.append([r_top, y_top - 0.001])");
+        emit("pts.append([r_top, y_top])");
+        emit("return pts");
+        indent_--;
+        emit("_narc = max(4, _fn2v // 2)");
+        emit("path_o = _scurve_path(_r_bot_o, _r_top_o, _rad1, _rad2v, _narc)");
+        emit("path_i = _scurve_path(_r_bot_i, _r_top_i, _rad1, _rad2v, _narc)");
+        emit("# Ring: outer path (bottom to top) + reversed inner path (top to bottom)");
+        emit("ring = path_o + path_i[::-1]");
+        emit("ring = _subdiv_poly(ring)");
+        emit("if len(ring) >= 3:");
+        indent_++;
+        emit("sp = _cd.splines.new('POLY')");
+        emit("sp.points.add(len(ring) - 1)");
+        emit("for i, p in enumerate(ring): sp.points[i].co = (p[0], p[1], 0, 1)");
+        emit("sp.use_cyclic_u = True");
+        indent_--;
+        indent_--;
+        emit("if not _cd.splines:");
+        indent_++;
+        emit("return children_geo, y_pos");
+        indent_--;
+        emit("# Build revolved mesh directly via bmesh (avoids boolean face dissolution)");
+        emit("import bmesh as _bm_mod");
+        emit("_prof = []");
+        emit("for pt in _cd.splines[0].points: _prof.append((pt.co.x, pt.co.y))");
+        emit("_nprof = len(_prof)");
+        emit("_bm = _bm_mod.new()");
+        emit("# Create vertex rings: one ring per revolution step, one vertex per profile point");
+        emit("for ri in range(_fnv):");
+        indent_++;
+        emit("_a = 2 * math.pi * ri / _fnv");
+        emit("_ca, _sa = math.cos(_a), math.sin(_a)");
+        emit("for pi in range(_nprof):");
+        indent_++;
+        emit("_rx, _zy = _prof[pi]");
+        emit("_bm.verts.new((_rx * _ca, _rx * _sa, _zy))");
+        indent_--;
+        indent_--;
+        emit("_bm.verts.ensure_lookup_table()");
+        emit("# Create quad faces connecting adjacent rings");
+        emit("for ri in range(_fnv):");
+        indent_++;
+        emit("_ri2 = (ri + 1) % _fnv");
+        emit("for pi in range(_nprof):");
+        indent_++;
+        emit("_pi2 = (pi + 1) % _nprof");
+        emit("_v0 = _bm.verts[ri * _nprof + pi]");
+        emit("_v1 = _bm.verts[ri * _nprof + _pi2]");
+        emit("_v2 = _bm.verts[_ri2 * _nprof + _pi2]");
+        emit("_v3 = _bm.verts[_ri2 * _nprof + pi]");
+        emit("try: _bm.faces.new((_v0, _v1, _v2, _v3))");
+        emit("except: pass");
+        indent_--;
+        indent_--;
+        emit("_me = bpy.data.meshes.new('anschl_mesh')");
+        emit("_bm.to_mesh(_me)");
+        emit("_bm.free()");
+        emit("_obj = bpy.data.objects.new('anschl_mesh', _me)");
+        emit("bpy.context.collection.objects.link(_obj)");
+        emit("_oi = nodes.new('GeometryNodeObjectInfo')");
+        emit("_oi.location = (x_pos, y_pos)");
+        emit("_oi.inputs['Object'].default_value = _obj");
+        emit("_oi.transform_space = 'RELATIVE'");
+        emit("last_geo = _oi");
+        emit("x_pos += 200");
         emit("return last_geo, y_pos");
         indent_--;
         emitBlank();
@@ -2895,6 +3276,255 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
         emitBlank();
     }
 
+    // Simplified Quad → rounded quadrilateral as CURVE outline (no FillCurve)
+    // The parsed Quad uses polygon → FillCurve → mesh, which CurveToMesh silently drops.
+    // This replacement outputs a POLY spline curve directly.
+    if (defined_modules_.count("Quad")) {
+        emitBlank();
+        emit("# Simplified Quad → rounded quadrilateral curve replacement");
+        emit("def module_Quad(nodes, links, group_input, x_pos, y_pos, x=20, y=0, r=None, r1=None, r2=None, r3=None, r4=None, grad=90, grad2=90, fn=None, center=True, messpunkt=False, basisX=0, trueX=False, centerX=None, tangent=True, rad=None, fs=0, name=None, help=None, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified Quad: rounded quadrilateral as curve outline\"\"\"");
+        emit("import math");
+        emit("# Parse dimensions");
+        emit("_w = float(_s(x[0])) if isinstance(x, (list, tuple)) else float(_s(x))");
+        emit("_h = float(_s(x[1])) if isinstance(x, (list, tuple)) and len(x) > 1 else (float(_s(y)) if isinstance(y, (int, float)) and float(_s(y)) != 0 else _w)");
+        emit("# Parse angles");
+        emit("_g1 = float(_s(grad[0])) if isinstance(grad, (list, tuple)) else float(_s(grad))");
+        emit("_g2 = float(_s(grad[1])) if isinstance(grad, (list, tuple)) and len(grad) > 1 else float(_s(grad2))");
+        emit("# Parse corner radii: ub.scad convention [r1=TL, r2=TR, r3=BL, r4=BR]");
+        emit("if rad is not None: r = rad");
+        emit("_r = [0.0]*4");
+        emit("if r is not None:");
+        indent_++;
+        emit("if isinstance(r, (int, float)):");
+        indent_++;
+        emit("_rv = float(_s(r)); _r = [_rv]*4");
+        indent_--;
+        emit("elif isinstance(r, (list, tuple)):");
+        indent_++;
+        emit("_r = [float(_s(r[i])) if i < len(r) else 0.0 for i in range(4)]");
+        indent_--;
+        indent_--;
+        emit("if r1 is not None and isinstance(r1, (int, float)): _r[0] = float(_s(r1))");
+        emit("if r2 is not None and isinstance(r2, (int, float)): _r[1] = float(_s(r2))");
+        emit("if r3 is not None and isinstance(r3, (int, float)): _r[2] = float(_s(r3))");
+        emit("if r4 is not None and isinstance(r4, (int, float)): _r[3] = float(_s(r4))");
+        emit("# Radii clamped per-corner in _fillet_arc based on actual edge lengths");
+        emit("# Segments per corner arc");
+        emit("_seg = max(2, int(_s(fn) // 4)) if fn is not None else 6");
+        emit("# Compute 4 sharp corner positions");
+        emit("# Edge directions: bottom=0°, left=grad°, right=(180-grad2)° from BR going up");
+        emit("_g1r = math.radians(_g1)");
+        emit("_g2r = math.radians(_g2)");
+        emit("# For centered quad, corners before centering offset:");
+        emit("_bl = (0.0, 0.0)");
+        emit("_br = (_w, 0.0)");
+        emit("# Left edge from BL at angle _g1 reaches y=_h");
+        emit("_tl_dx = math.cos(_g1r) * _h / math.sin(_g1r) if abs(math.sin(_g1r)) > 1e-10 else 0");
+        emit("_tl = (_tl_dx, _h)");
+        emit("# Right edge from BR at angle (180-grad2) reaches y=_h");
+        emit("_tr_dx = _w - math.cos(_g2r) * _h / math.sin(_g2r) if abs(math.sin(_g2r)) > 1e-10 else _w");
+        emit("_tr = (_tr_dx, _h)");
+        emit("# Apply centering");
+        emit("if isinstance(center, (list, tuple)):");
+        indent_++;
+        emit("_cx = float(_s(center[0])); _cy = float(_s(center[1]))");
+        indent_--;
+        emit("elif isinstance(center, bool):");
+        indent_++;
+        emit("_cx = -1.0 if center else 1.0; _cy = -1.0 if center else 1.0");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("_cv = float(_s(center)); _cx = _cv; _cy = _cv");
+        indent_--;
+        emit("if _cx == -1.0:  # centered");
+        indent_++;
+        emit("_ox = -(_bl[0] + _br[0] + _tl[0] + _tr[0]) / 4.0");
+        indent_--;
+        emit("elif _cx == 1.0:  # not centered (origin at BL)");
+        indent_++;
+        emit("_ox = 0.0");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("_ox = 0.0");
+        indent_--;
+        emit("if _cy == -1.0:");
+        indent_++;
+        emit("_oy = -_h / 2.0");
+        indent_--;
+        emit("elif _cy == 1.0:");
+        indent_++;
+        emit("_oy = 0.0");
+        indent_--;
+        emit("else:");
+        indent_++;
+        emit("_oy = 0.0");
+        indent_--;
+        emit("# Apply offset to all corners");
+        emit("_corners = [(_bl[0]+_ox, _bl[1]+_oy), (_br[0]+_ox, _br[1]+_oy), (_tr[0]+_ox, _tr[1]+_oy), (_tl[0]+_ox, _tl[1]+_oy)]");
+        emit("# Corner radii in polygon order: BL, BR, TR, TL → _r indices: 2, 3, 1, 0");
+        emit("_cr = [_r[2], _r[3], _r[1], _r[0]]");
+        emit("# Generate polygon points with fillet arcs");
+        emit("def _fillet_arc(corner, prev_corner, next_corner, radius, n_seg):");
+        indent_++;
+        emit("\"\"\"Compute fillet arc points at a corner.\"\"\"");
+        emit("if radius <= 1e-6 or n_seg < 1: return [corner]");
+        emit("# Direction vectors");
+        emit("d_in_x = corner[0] - prev_corner[0]; d_in_y = corner[1] - prev_corner[1]");
+        emit("d_in_l = math.sqrt(d_in_x**2 + d_in_y**2)");
+        emit("if d_in_l < 1e-10: return [corner]");
+        emit("d_in_x /= d_in_l; d_in_y /= d_in_l");
+        emit("d_out_x = next_corner[0] - corner[0]; d_out_y = next_corner[1] - corner[1]");
+        emit("d_out_l = math.sqrt(d_out_x**2 + d_out_y**2)");
+        emit("if d_out_l < 1e-10: return [corner]");
+        emit("d_out_x /= d_out_l; d_out_y /= d_out_l");
+        emit("# Bisector pointing inward (for CCW polygon)");
+        emit("bx = -d_in_x + d_out_x; by = -d_in_y + d_out_y");
+        emit("bl = math.sqrt(bx**2 + by**2)");
+        emit("if bl < 1e-10: return [corner]");
+        emit("bx /= bl; by /= bl");
+        emit("# Half-angle between edges");
+        emit("dot_val = (-d_in_x)*d_out_x + (-d_in_y)*d_out_y");
+        emit("dot_val = max(-1.0, min(1.0, dot_val))");
+        emit("half_angle = math.acos(dot_val) / 2.0");
+        emit("if abs(math.sin(half_angle)) < 1e-10: return [corner]");
+        emit("# Clamp radius to avoid overshooting edges");
+        emit("max_r = min(d_in_l, d_out_l) * math.sin(half_angle) / (1.0 + math.cos(half_angle)) if abs(1.0 + math.cos(half_angle)) > 1e-10 else radius");
+        emit("radius = min(radius, max_r * 0.999)");
+        emit("# Arc center");
+        emit("d = radius / math.sin(half_angle)");
+        emit("acx = corner[0] + d * bx; acy = corner[1] + d * by");
+        emit("# Tangent points via perpendicular projection");
+        emit("t1 = (acx - corner[0]) * d_in_x + (acy - corner[1]) * d_in_y");
+        emit("tp1 = (corner[0] + t1*d_in_x, corner[1] + t1*d_in_y)");
+        emit("t2 = (acx - corner[0]) * d_out_x + (acy - corner[1]) * d_out_y");
+        emit("tp2 = (corner[0] + t2*d_out_x, corner[1] + t2*d_out_y)");
+        emit("# Arc angles from center to tangent points");
+        emit("a1 = math.atan2(tp1[1] - acy, tp1[0] - acx)");
+        emit("a2 = math.atan2(tp2[1] - acy, tp2[0] - acx)");
+        emit("# Ensure CCW traversal (short arc for convex corners)");
+        emit("da = a2 - a1");
+        emit("while da < -math.pi: da += 2*math.pi");
+        emit("while da > math.pi: da -= 2*math.pi");
+        emit("pts = []");
+        emit("for i in range(n_seg + 1):");
+        indent_++;
+        emit("t = i / n_seg");
+        emit("a = a1 + t * da");
+        emit("pts.append((acx + radius * math.cos(a), acy + radius * math.sin(a)))");
+        indent_--;
+        emit("return pts");
+        indent_--;
+        emit("# Build polygon points going CCW: BL → BR → TR → TL");
+        emit("_all_pts = []");
+        emit("_nc = len(_corners)");
+        emit("for ci in range(_nc):");
+        indent_++;
+        emit("prev_c = _corners[(ci - 1) % _nc]");
+        emit("curr_c = _corners[ci]");
+        emit("next_c = _corners[(ci + 1) % _nc]");
+        emit("arc_pts = _fillet_arc(curr_c, prev_c, next_c, _cr[ci], _seg)");
+        emit("_all_pts.extend(arc_pts)");
+        indent_--;
+        emit("# Deduplicate consecutive points");
+        emit("_pts = [_all_pts[0]]");
+        emit("for p in _all_pts[1:]:");
+        indent_++;
+        emit("if abs(p[0] - _pts[-1][0]) > 1e-6 or abs(p[1] - _pts[-1][1]) > 1e-6:");
+        indent_++;
+        emit("_pts.append(p)");
+        indent_--;
+        indent_--;
+        emit("# Remove last point if same as first (cyclic will close it)");
+        emit("if len(_pts) > 1 and abs(_pts[-1][0] - _pts[0][0]) < 1e-6 and abs(_pts[-1][1] - _pts[0][1]) < 1e-6:");
+        indent_++;
+        emit("_pts.pop()");
+        indent_--;
+        emit("if len(_pts) < 3:");
+        indent_++;
+        emit("return children_geo, y_pos");
+        indent_--;
+        emit("# Create POLY spline (curve, not mesh)");
+        emit("_cd = bpy.data.curves.new('quad_curve', 'CURVE')");
+        emit("_cd.dimensions = '2D'");
+        emit("_sp = _cd.splines.new('POLY')");
+        emit("_sp.points.add(len(_pts) - 1)");
+        emit("for i, p in enumerate(_pts):");
+        indent_++;
+        emit("_sp.points[i].co = (p[0], p[1], 0, 1)");
+        indent_--;
+        emit("_sp.use_cyclic_u = True");
+        emit("_pobj = bpy.data.objects.new('quad_curve', _cd)");
+        emit("bpy.context.collection.objects.link(_pobj)");
+        emit("_info = nodes.new('GeometryNodeObjectInfo')");
+        emit("_info.location = (x_pos, y_pos)");
+        emit("_info.inputs['Object'].default_value = _pobj");
+        emit("_info.transform_space = 'RELATIVE'");
+        emit("x_pos += 200");
+        emit("return _info, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
+    // Simplified Cut → clip geometry at Z=0 (print-bed cutting plane)
+    // ub.scad Cut with default cut=[1,1,1] clips Z<0 only (keeps geometry above bed).
+    // X/Y cutting only activates when cut values are negative (e.g., cut=[-1,1,1] clips X>0).
+    if (defined_modules_.count("Cut")) {
+        emitBlank();
+        emit("# Simplified Cut → Z-plane clip replacement");
+        emit("def module_Cut(nodes, links, group_input, x_pos, y_pos, on=1, cut=(1,1,1), t=(0,0,0.01), rot=0, z=0, size=500, color=None, ghost=False, help=None, children_geo=None, **kwargs):");
+        indent_++;
+        emit("\"\"\"Simplified Cut: clip geometry below Z=t[2] (3D printing bed cut)\"\"\"");
+        emit("if children_geo is None: return None, y_pos");
+        emit("if not on: return children_geo, y_pos");
+        emit("t = _scad_v3(t)");
+        emit("cut = _scad_v3(cut)");
+        emit("sz = float(size) if isinstance(size, (int, float)) else 500.0");
+        emit("# Determine which axes need cutting (negative cut values clip positive side, positive only clips Z)");
+        emit("_need_cut = False");
+        emit("for i in range(3):");
+        indent_++;
+        emit("if float(cut[i]) < 0: _need_cut = True");
+        indent_--;
+        emit("if float(cut[2]) > 0: _need_cut = True  # Z positive = clip below bed");
+        emit("if not _need_cut: return children_geo, y_pos");
+        emit("# Create large cube for intersection");
+        emit("_cube = nodes.new('GeometryNodeMeshCube')");
+        emit("_cube.location = (x_pos, y_pos - 300)");
+        emit("_cube.inputs['Size'].default_value = (sz, sz, sz)");
+        emit("x_pos += 200");
+        emit("# Position cube: centered on X/Y (no cut), shifted in Z to keep Z >= t[2]");
+        emit("_tz = (sz/2 + float(t[2]) + float(z)) if float(cut[2]) > 0 else 0");
+        emit("_tx = (-sz/2 + float(t[0])) if float(cut[0]) < 0 else 0");
+        emit("_ty = (-sz/2 + float(t[1])) if float(cut[1]) < 0 else 0");
+        emit("_xf = nodes.new('GeometryNodeTransform')");
+        emit("_xf.location = (x_pos, y_pos - 300)");
+        emit("_xf.inputs['Translation'].default_value = (_tx, _ty, _tz)");
+        emit("links.new(_cube.outputs['Mesh'], _xf.inputs['Geometry'])");
+        emit("x_pos += 200");
+        emit("# Intersect children with clip cube");
+        emit("_bool = nodes.new('GeometryNodeMeshBoolean')");
+        emit("_bool.location = (x_pos, y_pos)");
+        emit("_bool.operation = 'INTERSECT'");
+        emit("_bool.solver = 'EXACT'");
+        emit("links.new(geo_out(children_geo), _bool.inputs[1])");
+        emit("links.new(geo_out(_xf), _bool.inputs[1])");
+        emit("x_pos += 200");
+        emit("# MergeByDistance cleanup");
+        emit("_mbd = nodes.new('GeometryNodeMergeByDistance')");
+        emit("_mbd.location = (x_pos, y_pos)");
+        emit("_mbd.inputs['Distance'].default_value = 0.001");
+        emit("links.new(geo_out(_bool), _mbd.inputs['Geometry'])");
+        emit("last_geo = _mbd");
+        emit("x_pos += 200");
+        emit("return last_geo, y_pos");
+        indent_--;
+        emitBlank();
+    }
+
     emit("def build_geometry(node_group):");
     indent_++;
     emit("\"\"\"Build the geometry nodes graph\"\"\"");
@@ -2923,6 +3553,7 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
             // Determine socket type based on value type
             if (value.isBool()) {
                 emit("add_input_socket(node_group, '" + socketName + "', 'NodeSocketBool', " + value.toPython() + ")");
+                group_input_bool_vars_.insert(name);
             } else if (value.isNumber()) {
                 // Use integer socket for variables used as for-loop range bounds
                 if (for_loop_range_vars_.count(name) > 0) {
@@ -3015,9 +3646,26 @@ void BlenderGenerator::emitBuildGeometry(RootNode& node) {
             else if (name == "$t") emit(varName + " = 0");
             else emit(varName + " = 0  # OpenSCAD special var default");
         }
+        // Sub-pass 2a: emit non-$ expression variables first (they may be referenced by $ vars)
         for (const auto& [name, value] : varSnapshot) {
             if (top_level_vars_.find(name) == top_level_vars_.end()) continue;
             if (!value.isExpression()) continue;
+            if (name[0] == '$') continue;  // defer $ vars to sub-pass 2b
+
+            std::string varName = pyName(name);
+            ExprNodePtr tree = resolveExprTree(value);
+            if (tree && tree->hasVariableRefs()) {
+                emit(varName + " = " + exprTreeToPython(tree));
+            } else {
+                double v = evaluateExpr(value);
+                emit(varName + " = " + pyDouble(v));
+            }
+        }
+        // Sub-pass 2b: emit $ expression variables (e.g., $messpunkt = messpunkt)
+        for (const auto& [name, value] : varSnapshot) {
+            if (top_level_vars_.find(name) == top_level_vars_.end()) continue;
+            if (!value.isExpression()) continue;
+            if (name[0] != '$') continue;  // already emitted in sub-pass 2a
 
             std::string varName = pyName(name);
             ExprNodePtr tree = resolveExprTree(value);
@@ -6041,7 +6689,7 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
         emit("# Cylinder");
         emit(nodeId + " = nodes.new('GeometryNodeMeshCylinder')");
         emit(nodeId + ".location = (x_pos, y_pos)");
-        emit(nodeId + ".fill_type = 'TRIANGLE_FAN'");
+        emit(nodeId + ".fill_type = 'NGON'");
         emitSetInputOrLink(nodeId, "Depth", h, std::to_string(hVal));
         emitSetInputOrLink(nodeId, "Radius", radiusTop, radiusTopPython);
         {
@@ -6054,7 +6702,7 @@ void BlenderGenerator::emitCylinder(const Arguments& args) {
         emit("# Cylinder (cone for different radii)");
         emit(nodeId + " = nodes.new('GeometryNodeMeshCone')");
         emit(nodeId + ".location = (x_pos, y_pos)");
-        emit(nodeId + ".fill_type = 'TRIANGLE_FAN'");
+        emit(nodeId + ".fill_type = 'NGON'");
         emitSetInputOrLink(nodeId, "Depth", h, std::to_string(hVal));
         emitSetInputOrLink(nodeId, "Radius Top", radiusTop, radiusTopPython);
         emitSetInputOrLink(nodeId, "Radius Bottom", radiusBottom, radiusBottomPython);
@@ -6268,14 +6916,30 @@ void BlenderGenerator::emitSquare(const Arguments& args) {
         emit("links.new(group_input.outputs['" + socketName + "'], " + nodeId + ".inputs['Width'])");
         emit("links.new(group_input.outputs['" + socketName + "'], " + nodeId + ".inputs['Height'])");
     } else if (size.isVector() && size.size() >= 2) {
-        double width = size[0].toNumber();
-        double height = size[1].toNumber();
-        emit(nodeId + ".inputs['Width'].default_value = " + std::to_string(width));
-        emit(nodeId + ".inputs['Height'].default_value = " + pyDouble(height));
-    } else if (size.isNumber()) {
-        double s = size.toNumber();
-        emit(nodeId + ".inputs['Width'].default_value = " + pyDouble(s));
-        emit(nodeId + ".inputs['Height'].default_value = " + pyDouble(s));
+        // Handle each dimension — check if it's an expression with module params
+        for (int dim = 0; dim < 2; dim++) {
+            const Value& dimVal = size[dim];
+            std::string socketName = (dim == 0) ? "Width" : "Height";
+            ExprNodePtr tree = resolveExprTree(dimVal);
+            if (tree && tree->hasVariableRefs()) {
+                std::string pyExpr = exprTreeToPython(tree);
+                emit(nodeId + ".inputs['" + socketName + "'].default_value = abs(_s(" + pyExpr + "))");
+            } else {
+                double v = dimVal.toNumber();
+                emit(nodeId + ".inputs['" + socketName + "'].default_value = " + pyDouble(v));
+            }
+        }
+    } else if (size.isNumber() || size.isExpression()) {
+        ExprNodePtr tree = resolveExprTree(size);
+        if (tree && tree->hasVariableRefs()) {
+            std::string pyExpr = exprTreeToPython(tree);
+            emit(nodeId + ".inputs['Width'].default_value = abs(_s(" + pyExpr + "))");
+            emit(nodeId + ".inputs['Height'].default_value = abs(_s(" + pyExpr + "))");
+        } else {
+            double s = size.toNumber();
+            emit(nodeId + ".inputs['Width'].default_value = " + pyDouble(s));
+            emit(nodeId + ".inputs['Height'].default_value = " + pyDouble(s));
+        }
     }
 
     emit("last_geo = " + nodeId);
@@ -6331,8 +6995,28 @@ void BlenderGenerator::emitText(const Arguments& args) {
     // Set character spacing - handle expression
     emitSetInputOrLink(nodeId, "Character Spacing", spacing, pyDouble(spacing.toNumber()));
 
-    // Set alignment to center
-    emit(nodeId + ".inputs[3].default_value = 'Center'");
+    // Set horizontal alignment (node property, not socket)
+    std::string ha = halign.toString();
+    if (ha == "center") {
+        emit(nodeId + ".align_x = 'CENTER'");
+    } else if (ha == "right") {
+        emit(nodeId + ".align_x = 'RIGHT'");
+    } else {
+        emit(nodeId + ".align_x = 'LEFT'");
+    }
+
+    // Set vertical alignment (node property, not socket)
+    std::string va = valign.toString();
+    if (va == "center") {
+        emit(nodeId + ".align_y = 'MIDDLE'");
+    } else if (va == "top") {
+        emit(nodeId + ".align_y = 'TOP'");
+    } else if (va == "bottom") {
+        emit(nodeId + ".align_y = 'BOTTOM'");
+    } else {
+        // "baseline" (OpenSCAD default)
+        emit(nodeId + ".align_y = 'BOTTOM_BASELINE'");
+    }
 
     emit("last_geo = " + nodeId);
     emit("x_pos += 200");
@@ -8295,14 +8979,21 @@ void BlenderGenerator::emitColor(const Arguments& args) {
                           std::to_string(int(g*255)) + "_" + std::to_string(int(b*255));
 
     // Emit material creation
+    std::string colorTuple = "(" + pyDouble(r) + ", " + pyDouble(g) + ", " +
+                             pyDouble(b) + ", " + pyDouble(a) + ")";
     emit("_mat_name = '" + matName + "'");
     emit("_mat = bpy.data.materials.get(_mat_name)");
     emit("if _mat is None:");
     indent_++;
     emit("_mat = bpy.data.materials.new(name=_mat_name)");
     indent_--;
-    emit("_mat.diffuse_color = (" + pyDouble(r) + ", " + pyDouble(g) + ", " +
-         pyDouble(b) + ", " + pyDouble(a) + ")");
+    emit("_mat.diffuse_color = " + colorTuple);
+    // Set Principled BSDF Base Color for Material Preview / rendered mode
+    emit("if _mat.node_tree:");
+    indent_++;
+    emit("_bsdf = next((n for n in _mat.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)");
+    emit("if _bsdf: _bsdf.inputs['Base Color'].default_value = " + colorTuple);
+    indent_--;
 
     // SetMaterial node
     std::string nodeId = newNodeId();
@@ -8889,23 +9580,45 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         bool is2D = in_extrude_ || is2DGeometry(actualChildren[0]);
 
         if (is2D) {
-            // 2D path: use curve reverse + join approach (keeps curves as curves)
-            std::string isCurveHelper = "is_curve_" + std::to_string(boolScopeId);
-            emit("def " + isCurveHelper + "(geo_node):");
+            // 2D path: FillCurve → MeshBoolean DIFFERENCE (FLOAT solver) → MeshToCurve
+            // The old reverse+join approach only works when tool is fully inside base.
+            // FLOAT solver works on flat (zero-thickness) FillCurve meshes.
+            // MeshToCurve extracts boundary edges — works correctly in the node pipeline.
+
+            // Helper: ensure geometry is a filled mesh for 2D boolean
+            std::string fillHelper = "ensure_fill_" + std::to_string(boolScopeId);
+            emit("def " + fillHelper + "(geo_node):");
             indent_++;
-            emit("if geo_node is None: return False");
-            emit("curve_types = {'GeometryNodeCurvePrimitiveCircle', 'GeometryNodeCurvePrimitiveQuadrilateral',");
-            emit("               'GeometryNodeCurvePrimitiveLine', 'GeometryNodeCurvePrimitiveStar',");
-            emit("               'GeometryNodeFilletCurve', 'GeometryNodeSetPosition',");
-            emit("               'GeometryNodeStringToCurves', 'GeometryNodeCurveToPoints',");
-            emit("               'GeometryNodeCurvePrimitiveArc', 'GeometryNodeCurvePrimitiveBezierSegment',");
-            emit("               'GeometryNodeSubdivideCurve', 'GeometryNodeReverseCurve',");
-            emit("               'GeometryNodeJoinGeometry'}");
-            emit("return geo_node.bl_idname in curve_types");
+            emit("nonlocal x_pos, y_pos");
+            emit("if geo_node is None: return geo_node");
+            emit("src = geo_node");
+            emit("mesh_types = {'GeometryNodeMeshBoolean', 'GeometryNodeFillCurve',");
+            emit("              'GeometryNodeMeshCube', 'GeometryNodeMeshCylinder',");
+            emit("              'GeometryNodeMeshCone', 'GeometryNodeMeshGrid',");
+            emit("              'GeometryNodeExtrudeMesh', 'GeometryNodeCurveToMesh',");
+            emit("              'GeometryNodeMergeByDistance'}");
+            emit("for _ in range(20):");
+            indent_++;
+            emit("if src.bl_idname in mesh_types: return geo_node");
+            emit("if src.bl_idname in ('GeometryNodeJoinGeometry', 'GeometryNodeTransform',");
+            emit("                     'GeometryNodeSetPosition', 'GeometryNodeSwitch'):");
+            indent_++;
+            emit("gi = src.inputs.get('Geometry') or src.inputs.get('Curve') or src.inputs.get('Mesh')");
+            emit("if gi and gi.links: src = gi.links[0].from_node; continue");
+            indent_--;
+            emit("break");
+            indent_--;
+            emit("if src.bl_idname in mesh_types: return geo_node");
+            emit("fill = nodes.new('GeometryNodeFillCurve')");
+            emit("fill.location = (x_pos, y_pos)");
+            emit("links.new(geo_out(geo_node), fill.inputs['Curve'])");
+            emit("x_pos += 200");
+            emit("return fill");
             indent_--;
 
-            // Process first child normally
+            // Process first child (base)
             actualChildren[0]->accept(*this);
+            emit("last_geo = " + fillHelper + "(last_geo)");
             emit(firstGeo + " = last_geo");
 
             for (size_t i = 1; i < actualChildren.size(); ++i) {
@@ -8913,30 +9626,42 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
 
                 emit("if last_geo is not None and last_geo is not " + firstGeo + ":");
                 indent_++;
+                emit("last_geo = " + fillHelper + "(last_geo)");
+
                 emit("if " + firstGeo + " is None:");
                 indent_++;
                 emit(firstGeo + " = last_geo");
                 indent_--;
                 emit("else:");
                 indent_++;
-                // Reverse the subtracted curve so FillCurve treats it as a hole
-                std::string revId = newNodeId();
-                emit(revId + " = nodes.new('GeometryNodeReverseCurve')");
-                emit(revId + ".location = (x_pos, y_pos)");
-                emit("link_nodes(links, last_geo, 'Curve', " + revId + ", 'Curve')");
-                std::string joinId = newNodeId();
-                emit(joinId + " = nodes.new('GeometryNodeJoinGeometry')");
-                emit(joinId + ".location = (x_pos, y_pos)");
-                emit("link_nodes(links, " + firstGeo + ", 'Curve', " + joinId + ", 'Geometry')");
-                emit("link_nodes(links, " + revId + ", 'Curve', " + joinId + ", 'Geometry')");
-                emit(firstGeo + " = " + joinId);
+
+                std::string boolId = newNodeId();
+                emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
+                emit(boolId + ".location = (x_pos, y_pos)");
+                emit(boolId + ".operation = 'DIFFERENCE'");
+                emit(boolId + ".solver = 'FLOAT'");
+                // FLOAT solver works on flat (zero-thickness) meshes; EXACT does not
+                emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[0])");
+                emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
+                emit(firstGeo + " = " + boolId);
                 emit("x_pos += 200");
                 indent_--;
                 indent_--;
                 emit("y_pos -= 50");
 
-                // Reset last_geo so skipped conditionals don't re-subtract old geometry
+                // Reset last_geo
                 emit("last_geo = " + firstGeo);
+            }
+
+            // Convert mesh result back to curve for extrude compatibility
+            if (in_extrude_) {
+                std::string m2cId = newNodeId();
+                emit(m2cId + " = nodes.new('GeometryNodeMeshToCurve')");
+                emit(m2cId + ".location = (x_pos, y_pos)");
+                emit("links.new(geo_out(" + firstGeo + "), " + m2cId + ".inputs['Mesh'])");
+                emit(firstGeo + " = " + m2cId);
+                emit("last_geo = " + firstGeo);
+                emit("x_pos += 200");
             }
         } else {
             // 3D path: use in-graph GeometryNodeMeshBoolean with DIFFERENCE operation.
@@ -9028,8 +9753,14 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 emit(unionId + ".operation = 'UNION'");
                 emit(unionId + ".solver = 'EXACT'");
                 emit("links.new(geo_out(last_geo), " + unionId + ".inputs[1])");
-                emit("last_geo = " + unionId);
-                emit("x_pos += 200");
+                // MergeByDistance to clean pre-merged tool geometry
+                std::string preMergeId = newNodeId();
+                emit(preMergeId + " = nodes.new('GeometryNodeMergeByDistance')");
+                emit(preMergeId + ".location = (x_pos + 200, y_pos)");
+                emit(preMergeId + ".inputs['Distance'].default_value = 0.0001");
+                emit("links.new(geo_out(" + unionId + "), " + preMergeId + ".inputs['Geometry'])");
+                emit("last_geo = " + preMergeId);
+                emit("x_pos += 400");
                 indent_--;
 
                 // DIFFERENCE: chain (base - tool)
@@ -9042,8 +9773,32 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
                 // DIFFERENCE: base -> inputs[0], tool -> inputs[1]
                 emit("links.new(geo_out(" + firstGeo + "), " + boolId + ".inputs[0])");
                 emit("links.new(geo_out(last_geo), " + boolId + ".inputs[1])");
-                emit(firstGeo + " = " + boolId);
-                emit("x_pos += 200");
+
+                // Empty-tool guard: EXACT solver produces garbage when tool has 0 vertices.
+                // DomainSize → Compare(point_count > 0) → Switch(true=diff, false=base)
+                std::string dsId = newNodeId();
+                emit("# Empty-tool guard");
+                emit(dsId + " = nodes.new('GeometryNodeAttributeDomainSize')");
+                emit(dsId + ".location = (x_pos + 200, y_pos - 100)");
+                emit(dsId + ".component = 'MESH'");
+                emit("links.new(geo_out(last_geo), " + dsId + ".inputs['Geometry'])");
+                std::string cmpId = newNodeId();
+                emit(cmpId + " = nodes.new('FunctionNodeCompare')");
+                emit(cmpId + ".data_type = 'INT'");
+                emit(cmpId + ".operation = 'GREATER_THAN'");
+                emit(cmpId + ".location = (x_pos + 400, y_pos - 100)");
+                emit("links.new(" + dsId + ".outputs['Point Count'], " + cmpId + ".inputs[2])");
+                emit(cmpId + ".inputs[3].default_value = 0");
+                std::string swId = newNodeId();
+                emit(swId + " = nodes.new('GeometryNodeSwitch')");
+                emit(swId + ".input_type = 'GEOMETRY'");
+                emit(swId + ".location = (x_pos + 600, y_pos)");
+                emit("links.new(" + cmpId + ".outputs['Result'], " + swId + ".inputs['Switch'])");
+                emit("links.new(geo_out(" + firstGeo + "), " + swId + ".inputs['False'])");
+                emit("links.new(geo_out(" + boolId + "), " + swId + ".inputs['True'])");
+
+                emit(firstGeo + " = " + swId);
+                emit("x_pos += 800");
                 emit("y_pos -= 50");
                 indent_--;  // end else
                 indent_--;  // end if last_geo is not None
@@ -9338,14 +10093,32 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
             // Ensure first_geo is mesh before boolean (may still be curve if single-child skip)
             emit(firstGeo + " = " + fillHelper + "(" + firstGeo + ")");
 
+            // If an operand is JoinGeometry (e.g., from a for-loop), pre-merge
+            // overlapping parts with UNION to avoid EXACT solver failures on
+            // non-manifold self-overlapping inputs.
+            std::string preMergeUnionId = newNodeId();
+            emit("if last_geo.bl_idname == 'GeometryNodeJoinGeometry':");
+            indent_++;
+            emit(preMergeUnionId + " = nodes.new('GeometryNodeMeshBoolean')");
+            emit(preMergeUnionId + ".location = (x_pos, y_pos)");
+            emit(preMergeUnionId + ".operation = 'UNION'");
+            emit(preMergeUnionId + ".solver = 'EXACT'");
+            emit("links.new(geo_out(last_geo), " + preMergeUnionId + ".inputs[1])");
+            std::string preMergeId = newNodeId();
+            emit(preMergeId + " = nodes.new('GeometryNodeMergeByDistance')");
+            emit(preMergeId + ".location = (x_pos + 200, y_pos)");
+            emit(preMergeId + ".inputs['Distance'].default_value = 0.0001");
+            emit("links.new(geo_out(" + preMergeUnionId + "), " + preMergeId + ".inputs['Geometry'])");
+            emit("last_geo = " + preMergeId);
+            emit("x_pos += 400");
+            indent_--;
+
             std::string boolId = newNodeId();
             emit(boolId + " = nodes.new('GeometryNodeMeshBoolean')");
             emit(boolId + ".location = (x_pos, y_pos)");
             emit(boolId + ".operation = '" + blenderOp + "'");
-            // Use EXACT solver for all boolean operations.
-            // MANIFOLD is faster but requires manifold inputs, which isn't
-            // always guaranteed (CurveToMesh, JoinGeometry of overlapping parts, etc.).
-            emit(boolId + ".solver = 'EXACT'");
+            // Use MANIFOLD when both inputs are known-manifold primitives, EXACT otherwise
+            emit(boolId + ".solver = pick_bool_solver(" + firstGeo + ", last_geo)");
 
             // In Blender 5.1+, UNION/INTERSECT use inputs[1] as multi-input
             // (inputs[0] is disabled). Both operands go to inputs[1].
@@ -9365,13 +10138,14 @@ void BlenderGenerator::emitBooleanOp(BooleanNode& node) {
         } // end else (3D path)
 
         // MergeByDistance to clean up boolean artifacts
-        // Skip for UNION — MANIFOLD solver produces clean geometry
-        if (blenderOp != "UNION") {
+        // Use tighter threshold for UNION (only colocated vertices), wider for DIFF/INTERSECT
+        {
             std::string mergeId = newNodeId();
             emit("# MergeByDistance to clean up boolean artifacts");
             emit(mergeId + " = nodes.new('GeometryNodeMergeByDistance')");
             emit(mergeId + ".location = (x_pos, y_pos)");
-            emit(mergeId + ".inputs['Distance'].default_value = 0.001");
+            std::string dist = (blenderOp == "UNION") ? "0.0001" : "0.001";
+            emit(mergeId + ".inputs['Distance'].default_value = " + dist);
             emit("if " + firstGeo + " is not None:");
             indent_++;
             emit("links.new(geo_out(" + firstGeo + "), " + mergeId + ".inputs['Geometry'])");
@@ -9912,6 +10686,11 @@ void BlenderGenerator::emitRotateExtrude(const Arguments& args) {
     Value fn = resolveFn(args);
 
     double angleVal = angle.isExpression() ? evaluateExpr(angle) : angle.toNumber();
+    // If angle evaluated to 0.0 from an unresolvable expression (module param),
+    // default to 360.0 (full revolution) — a 0-degree extrusion is meaningless
+    if (std::abs(angleVal) < 0.001 && angle.isExpression()) {
+        angleVal = 360.0;
+    }
     int fnVal = static_cast<int>(evaluateExpr(fn));
     if (fnVal < 3) fnVal = 32;  // Sensible default
 
@@ -9935,6 +10714,7 @@ void BlenderGenerator::emitRotateExtrude(const Arguments& args) {
     emit("_profile_geo = " + flipId);
     emit("for _ in range(10):");
     indent_++;
+    emit("if _profile_geo.bl_idname == 'GeometryNodeMeshToCurve': break  # Already converts mesh→curve");
     emit("gi = _profile_geo.inputs.get('Geometry') or _profile_geo.inputs.get('Curve') or _profile_geo.inputs.get('Mesh')");
     emit("if gi and gi.links: _profile_geo = gi.links[0].from_node");
     emit("else: break");
@@ -11509,9 +12289,11 @@ void BlenderGenerator::emitPythonHelperFunctions() {
         changed = false;
         for (const auto& fn : python_helper_functions_) {
             if (emitted.count(fn)) continue;
-            // Skip module-scoped functions — they'll be emitted as closures
-            // inside their owning module function by emitModuleScopedHelpers()
-            if (function_owner_module_.count(fn)) continue;
+            // Module-scoped functions are also emitted as closures inside their
+            // owning module by emitModuleScopedHelpers().  We still emit them
+            // at the top level so callers outside the module (e.g. top-level
+            // variable initializers) have a definition available.  The module-
+            // local closure shadows this when called from within the module.
             auto fit = functions_.find(fn);
             if (fit == functions_.end() || !fit->second.body) continue;
             emitted.insert(fn);
@@ -12128,8 +12910,11 @@ void BlenderGenerator::buildModuleGiMaps(ASTNodePtr& root) {
                                 }
                             }
                         }
-                        param_sources[call->name()][paramName].insert(giSocket);
-                        param_sources[call->name()][pyName(paramName)].insert(giSocket);
+                        if (giSocket != "__COMPUTED__" &&
+                            group_input_bool_vars_.find(giSocket) == group_input_bool_vars_.end()) {
+                            param_sources[call->name()][paramName].insert(giSocket);
+                            param_sources[call->name()][pyName(paramName)].insert(giSocket);
+                        }
                     }
                 }
             }
@@ -12161,6 +12946,7 @@ void BlenderGenerator::buildModuleGiMaps(ASTNodePtr& root) {
             }
         }
     }
+
 }
 
 void BlenderGenerator::propagateGiMaps(const std::string& /*moduleName*/,
